@@ -60,17 +60,9 @@ function installCreateTaskFallback(): void {
   const existing = (console as ConsoleWithCreateTask).createTask;
   if (typeof existing !== "function") return;
 
-  let usable = true;
   try {
-    const probe = (existing as (name: string) => { run: (fn: () => void) => void })(
-      "vinext:createTask-probe",
-    );
-    probe.run(() => {});
+    (existing as (name: string) => ConsoleTaskLike)("vinext:createTask-probe").run(() => {});
   } catch {
-    usable = false;
-  }
-
-  if (!usable) {
     (console as ConsoleWithCreateTask).createTask = (name: string): ConsoleTaskLike => ({
       name,
       run: (fn) => fn(),
