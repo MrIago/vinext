@@ -226,6 +226,18 @@ describe("console.createTask fallback", () => {
     expect((console as unknown as { createTask?: unknown }).createTask).toBeUndefined();
   });
 
+  it("removes a task implementation that does not run the callback", () => {
+    Object.defineProperty(console, "createTask", {
+      configurable: true,
+      writable: true,
+      value: () => ({ run: () => undefined }),
+    });
+
+    installServerGlobals();
+
+    expect((console as unknown as { createTask?: unknown }).createTask).toBeUndefined();
+  });
+
   it("removes a throwing accessor", () => {
     Object.defineProperty(console, "createTask", {
       configurable: true,

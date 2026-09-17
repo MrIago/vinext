@@ -79,7 +79,11 @@ function disableInertCreateTask(): void {
   }
 
   try {
-    (existing as (name: string) => ConsoleTaskLike)("vinext:createTask-probe").run(() => {});
+    const marker = {};
+    const result = (existing as (name: string) => ConsoleTaskLike)("vinext:createTask-probe").run(
+      () => marker,
+    );
+    if (result !== marker) clearCreateTask(runtimeConsole);
   } catch {
     clearCreateTask(runtimeConsole);
   }
