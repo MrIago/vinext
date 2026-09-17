@@ -166,7 +166,7 @@ describe("edge runtime globals", () => {
   });
 });
 
-type TaskLike = { name: string; run: <T>(fn: () => T) => T };
+type TaskLike = { run: <T>(fn: () => T) => T };
 
 describe("console.createTask fallback", () => {
   const originalDescriptor = Object.getOwnPropertyDescriptor(console, "createTask");
@@ -174,10 +174,12 @@ describe("console.createTask fallback", () => {
   afterEach(() => {
     if (originalDescriptor) {
       Object.defineProperty(console, "createTask", originalDescriptor);
+    } else {
+      Reflect.deleteProperty(console, "createTask");
     }
   });
 
-  it("replaces a createTask implementation that throws when called", () => {
+  it("removes a createTask implementation that throws when called", () => {
     // workerd exposes console.createTask but throws "not implemented" on call.
     Object.defineProperty(console, "createTask", {
       configurable: true,
@@ -189,15 +191,18 @@ describe("console.createTask fallback", () => {
 
     installServerGlobals();
 
-    const createTask = (console as unknown as { createTask: (name: string) => TaskLike })
-      .createTask;
-    const task = createTask("render");
-    expect(task.name).toBe("render");
-    expect(task.run(() => 42)).toBe(42);
+    expect((console as unknown as { createTask?: unknown }).createTask).toBeUndefined();
+    // React uses this truthiness check and its own no-op fallback.
+    const createTask = console.createTask ? console.createTask : () => null;
+    expect(createTask("render")).toBeNull();
+
+    // Reinstalling globals must not add the unsupported API back.
+    installServerGlobals();
+    expect((console as unknown as { createTask?: unknown }).createTask).toBeUndefined();
   });
 
   it("leaves a working createTask implementation untouched", () => {
-    const working = (name: string): TaskLike => ({ name, run: (fn) => fn() });
+    const working = (): TaskLike => ({ run: (fn) => fn() });
     Object.defineProperty(console, "createTask", {
       configurable: true,
       writable: true,
@@ -207,6 +212,31 @@ describe("console.createTask fallback", () => {
     installServerGlobals();
 
     expect((console as { createTask: unknown }).createTask).toBe(working);
+  });
+
+  it("removes a truthy non-function that would fool React's feature check", () => {
+    Object.defineProperty(console, "createTask", {
+      configurable: true,
+      writable: true,
+      value: {},
+    });
+
+    installServerGlobals();
+
+    expect((console as unknown as { createTask?: unknown }).createTask).toBeUndefined();
+  });
+
+  it("removes a throwing accessor", () => {
+    Object.defineProperty(console, "createTask", {
+      configurable: true,
+      get() {
+        throw new Error("not implemented");
+      },
+    });
+
+    installServerGlobals();
+
+    expect((console as unknown as { createTask?: unknown }).createTask).toBeUndefined();
   });
 
   it("does not add createTask when the runtime does not expose it", () => {

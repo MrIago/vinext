@@ -8,6 +8,7 @@
  * body would run after static user imports have already evaluated.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import serverConsole from "node:console";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
 
 const CACHEABILITY_REQUEST_STATE = Symbol.for("vinext.cacheabilityRequestState");
@@ -15,7 +16,7 @@ const PHASE_PRODUCTION_BUILD = "phase-production-build";
 
 type BrowserGlobalName = "window" | "document";
 
-type ConsoleTaskLike = { name: string; run: <T>(fn: () => T) => T };
+type ConsoleTaskLike = { run: <T>(fn: () => T) => T };
 
 type ConsoleWithCreateTask = typeof console & {
   createTask?: unknown;
@@ -47,26 +48,57 @@ function clearBrowserGlobal(name: BrowserGlobalName): void {
 }
 
 /**
- * Fall back to a synchronous passthrough when `console.createTask` is inert.
+ * Remove `console.createTask` when the runtime implementation is inert.
  *
  * workerd's console exposes `createTask` but throws "not implemented" when it
  * is called, and React's development builds call it at module initialization
- * and during rendering (scheduler task tracing). The combination crashes every
- * server environment on Workers, so probe the runtime implementation once and
- * replace it with a passthrough when it cannot execute. A working
+ * and during rendering (scheduler task tracing). Importing `node:console`
+ * above ensures workerd installs the method before we probe it. React already
+ * falls back to no task tracing when the method is absent, while a working
  * implementation (Node's task tracer) is left untouched.
  */
-function installCreateTaskFallback(): void {
-  const existing = (console as ConsoleWithCreateTask).createTask;
-  if (typeof existing !== "function") return;
+function disableInertCreateTask(): void {
+  // Some hosts replace the global console after loading `node:console`.
+  const runtimeConsole = (
+    serverConsole === console ? serverConsole : console
+  ) as ConsoleWithCreateTask;
+  let existing: unknown;
+
+  try {
+    existing = runtimeConsole.createTask;
+  } catch {
+    clearCreateTask(runtimeConsole);
+    return;
+  }
+
+  // React uses a truthiness check before calling the method.
+  if (!existing) return;
+  if (typeof existing !== "function") {
+    clearCreateTask(runtimeConsole);
+    return;
+  }
 
   try {
     (existing as (name: string) => ConsoleTaskLike)("vinext:createTask-probe").run(() => {});
   } catch {
-    (console as ConsoleWithCreateTask).createTask = (name: string): ConsoleTaskLike => ({
-      name,
-      run: (fn) => fn(),
-    });
+    clearCreateTask(runtimeConsole);
+  }
+}
+
+function clearCreateTask(runtimeConsole: ConsoleWithCreateTask): void {
+  const descriptor = Object.getOwnPropertyDescriptor(runtimeConsole, "createTask");
+  const cleared = descriptor
+    ? descriptor.configurable
+      ? Reflect.deleteProperty(runtimeConsole, "createTask")
+      : Reflect.defineProperty(runtimeConsole, "createTask", { value: undefined })
+    : Reflect.defineProperty(runtimeConsole, "createTask", {
+        configurable: true,
+        value: undefined,
+        writable: true,
+      });
+
+  if (!cleared) {
+    throw new Error("[vinext] The server runtime exposes an unusable console.createTask method.");
   }
 }
 
@@ -85,7 +117,7 @@ export function installServerGlobals(): void {
     });
   }
 
-  installCreateTaskFallback();
+  disableInertCreateTask();
 
   const nextPhaseDescriptor = Object.getOwnPropertyDescriptor(globalThis, "__VINEXT_NEXT_PHASE");
   if (!nextPhaseDescriptor || nextPhaseDescriptor.configurable) {
