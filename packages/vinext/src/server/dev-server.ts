@@ -46,7 +46,6 @@ import { getScriptNonceFromNodeHeaderSources } from "./csp.js";
 import { mergeRouteParamsIntoQuery, parseQueryString as parseQuery } from "../utils/query.js";
 import { stripViteModuleQuery } from "../utils/path.js";
 import React from "react";
-import { renderToReadableStream } from "react-dom/server";
 import { logRequest, now } from "./request-log.js";
 import {
   createValidFileMatcher,
@@ -108,6 +107,21 @@ import {
   traceFindPageComponents,
 } from "./pages-execution-tracing.js";
 import { logRequestError } from "./request-error-log.js";
+
+type ReactDomServer = typeof import("react-dom/server");
+let reactDomServer: Promise<ReactDomServer> | undefined;
+
+// vite.config.ts imports vinext, which imports this module. A static import
+// would load react-dom/server while Vite loads the config, and React below
+// 19.3 fails there with a bare "Named export 'renderToReadableStream' not
+// found" before the build's React version check can name the fix. Load it on
+// the first Pages Router render instead.
+function renderToReadableStream(
+  ...args: Parameters<ReactDomServer["renderToReadableStream"]>
+): ReturnType<ReactDomServer["renderToReadableStream"]> {
+  reactDomServer ??= import("react-dom/server");
+  return reactDomServer.then((server) => server.renderToReadableStream(...args));
+}
 
 /**
  * Render a React element to a string using renderToReadableStream.
