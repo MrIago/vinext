@@ -10,6 +10,7 @@
 import type { RenderRequestApiKind } from "../../server/cache-proof.js";
 import type { HeadersContext } from "../headers.js";
 import { getOrCreateAls } from "./als-registry.js";
+import { createRequestApiInCacheScopeError } from "./cache-scope-messages.js";
 import {
   ensureRenderDynamicLatch,
   getRequestContext,
@@ -260,11 +261,7 @@ export function isInsideAnyCacheScope(): boolean {
 
 /** The error a dynamic request API throws inside a public "use cache". */
 export function createUseCacheAccessError(apiName: string): Error {
-  return new Error(
-    `\`${apiName}\` cannot be called inside "use cache". ` +
-      `If you need this data inside a cached function, call \`${apiName}\` ` +
-      "outside and pass the required data as an argument.",
-  );
+  return createRequestApiInCacheScopeError(apiName, "use cache");
 }
 
 /**
@@ -294,11 +291,7 @@ export function throwIfInsideCacheScope(apiName: string): void {
     throw error;
   }
   if (_isInsideUnstableCache()) {
-    const error = new Error(
-      `\`${apiName}\` cannot be called inside a function cached with \`unstable_cache()\`. ` +
-        `If you need this data inside a cached function, call \`${apiName}\` ` +
-        "outside and pass the required data as an argument.",
-    );
+    const error = createRequestApiInCacheScopeError(apiName, "unstable_cache");
     try {
       const ctx = getRequestContext();
       if (ctx) ctx.invalidDynamicUsageError = error;

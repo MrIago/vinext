@@ -1183,7 +1183,7 @@ test.describe("unstable_cache data cache (OpenNext compat)", () => {
         bytes: "ok",
       });
       expect(reads.cookies.message).toContain(
-        "`request.cookies` cannot be called inside a function cached with `unstable_cache()`",
+        "`request.cookies` can't be read inside `unstable_cache()`",
       );
     }
 
