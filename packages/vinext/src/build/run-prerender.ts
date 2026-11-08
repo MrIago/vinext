@@ -38,6 +38,7 @@ import { rememberCurrentServerEntryImportMtime, startProdServer } from "../serve
 import { enterPrerenderPhase } from "./prerender-phase.js";
 import { PHASE_PRODUCTION_BUILD } from "vinext/shims/constants";
 import { resolveBuiltPagesEntryPath, resolveBuiltRscEntryPath } from "./server-entry.js";
+import { VINEXT_CLIENT_ENTRY_MANIFEST } from "../utils/client-entry-manifest.js";
 import type { VinextRouteRootConfig } from "../config/prerender.js";
 import { registerPrerenderCloudflareLoader } from "./prerender-cloudflare-loader.js";
 
@@ -154,6 +155,56 @@ export function assertNoFatalPrerenderRoutes(routes: readonly PrerenderRouteResu
   throw new Error(
     `Prerender failed: ${fatalRoutes.length} route${fatalRoutes.length !== 1 ? "s" : ""} errored during static generation.\n${fatalList}`,
   );
+}
+
+/** Build metadata in the client output directory that is not part of the site. */
+function isClientBuildMetadata(relativePath: string): boolean {
+  return (
+    relativePath === ".vite" ||
+    relativePath.startsWith(".vite/") ||
+    relativePath === VINEXT_CLIENT_ENTRY_MANIFEST ||
+    relativePath === ".assetsignore"
+  );
+}
+
+/**
+ * With `output: "export"`, a custom `distDir` names the export destination,
+ * like Next.js' `hasCustomExportOutput()` (packages/next/src/export/utils.ts):
+ * the build itself still writes to its intermediate directory (`.next` there,
+ * `dist/` here), and the finished site is copied to `distDir`. The default
+ * `.next` keeps vinext's export in the client output directory.
+ *
+ * The destination is replaced, like Next.js clearing its export `outDir`, so
+ * it must not overlap the project root or the build output it is copied from.
+ */
+export function copyStaticExportToDistDir(options: {
+  root: string;
+  exportDir: string;
+  buildOutDir: string;
+  distDir: string;
+}): void {
+  const { root, exportDir, buildOutDir, distDir } = options;
+  if (distDir === ".next") return;
+  const destination = path.resolve(root, distDir);
+  const overlaps = (a: string, b: string) => {
+    const relative = path.relative(a, b);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  };
+  if (
+    overlaps(destination, root) ||
+    overlaps(destination, buildOutDir) ||
+    overlaps(buildOutDir, destination) ||
+    overlaps(exportDir, destination)
+  ) {
+    throw new Error(
+      `distDir "${distDir}" cannot be used as the static export destination: it overlaps the project root or vinext's build output (${path.relative(root, buildOutDir) || "."}/). Choose a separate directory, such as "out".`,
+    );
+  }
+  fs.rmSync(destination, { recursive: true, force: true });
+  fs.cpSync(exportDir, destination, {
+    recursive: true,
+    filter: (source) => !isClientBuildMetadata(path.relative(exportDir, source)),
+  });
 }
 
 /**
@@ -404,6 +455,10 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
         `Remove server-side data fetching (getServerSideProps, force-dynamic, revalidate) from these routes, ` +
         `or remove \`output: "export"\` from next.config.js.`,
     );
+  }
+
+  if (mode === "export") {
+    copyStaticExportToDistDir({ root, exportDir: outDir, buildOutDir, distDir: config.distDir });
   }
 
   injectPregeneratedConcretePaths(root, rscBundlePath, manifestDir, [configuredRscServerDir]);
