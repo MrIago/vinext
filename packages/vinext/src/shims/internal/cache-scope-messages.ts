@@ -15,18 +15,21 @@
 const NEXT_REQUEST_IN_USE_CACHE = "https://nextjs.org/docs/messages/next-request-in-use-cache";
 const UNSTABLE_CACHE_API_DOCS =
   "https://nextjs.org/docs/app/api-reference/functions/unstable_cache";
+const USE_CACHE_PRIVATE_API_DOCS =
+  "https://nextjs.org/docs/app/api-reference/directives/use-cache-private";
 const USE_CACHE_PRIVATE_COMPOSITION =
   "https://nextjs.org/docs/messages/use-cache-private-composition";
 const NESTED_USE_CACHE_NO_EXPLICIT_CACHELIFE =
   "https://nextjs.org/docs/messages/nested-use-cache-no-explicit-cachelife";
 
-export type CacheScope = "use cache" | "unstable_cache";
+export type CacheScope = "use cache" | "use cache: private" | "unstable_cache";
 
 function routePrefix(route: string | undefined): string {
   return route === undefined ? "" : `Route "${route}": `;
 }
 
 function scopeLabel(scope: CacheScope): string {
+  // Next.js names a private cache `"use cache"` in the draft mode error.
   return scope === "unstable_cache" ? "`unstable_cache()`" : '`"use cache"`';
 }
 
@@ -47,6 +50,11 @@ export function createRequestApiInCacheScopeError(
 ): Error {
   const prefix = routePrefix(route);
   if (apiName === "connection()") {
+    if (scope === "use cache: private") {
+      return new Error(
+        `${prefix}\`connection()\` can't be called inside \`"use cache: private"\` because private cached functions may run during prefetching, without a navigation request. Call it outside the cached function.\nLearn more: ${USE_CACHE_PRIVATE_API_DOCS}`,
+      );
+    }
     return new Error(
       `${prefix}\`connection()\` can't be called inside ${scopeLabel(scope)} because cached functions may run during prerendering, without an incoming request. Call it outside the cached function.\nLearn more: ${learnMore(scope)}`,
     );

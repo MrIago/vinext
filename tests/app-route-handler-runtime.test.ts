@@ -210,6 +210,41 @@ describe("app route handler runtime helpers", () => {
     expect(reason).toBe(host.signal.reason);
   });
 
+  // Ported from Next.js: trackDynamic() in
+  // packages/next/src/server/route-modules/app-route/module.ts, which rejects
+  // the route handler's request in a `private-cache` work unit like in a
+  // public one, although cookies() and headers() stay readable there.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/route-modules/app-route/module.ts
+  it('rejects request reads inside "use cache: private"', async () => {
+    const { cacheContextStorage } = await import("../packages/vinext/src/shims/cache-runtime.js");
+    const tracked = createTrackedAppRouteRequest(
+      new Request("https://example.com/demo?id=1", { headers: { cookie: "a=b" } }),
+    );
+    const read = (variant: string, readValue: () => unknown) =>
+      cacheContextStorage.run(
+        {
+          tags: [],
+          lifeConfigs: [],
+          nestedLifeConfigs: [],
+          variant,
+          hasExplicitRevalidate: false,
+          hasExplicitExpire: false,
+          dynamicNestedCacheError: undefined,
+        },
+        readValue,
+      );
+
+    expect(() => read("private", () => tracked.request.url)).toThrow(
+      '`request.url` can\'t be read inside `"use cache"`. Read it outside the cached function and pass what you need as an argument.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache',
+    );
+    expect(() => read("private", () => tracked.request.cookies)).toThrow(
+      "`request.cookies` can't be read inside",
+    );
+    expect(() => read("default", () => tracked.request.headers)).toThrow(
+      "`request.headers` can't be read inside",
+    );
+  });
+
   it("tracks request.url access for query parsing", () => {
     const accesses: string[] = [];
     const tracked = createTrackedAppRouteRequest(

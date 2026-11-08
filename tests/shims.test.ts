@@ -33254,11 +33254,11 @@ describe("cache scope diagnostics match Next.js", () => {
     dynamicNestedCacheError: undefined,
   };
 
-  async function messageInUseCache(apiName: string): Promise<string> {
+  async function messageInUseCache(apiName: string, variant = "default"): Promise<string> {
     const { cacheContextStorage } = await import("../packages/vinext/src/shims/cache-runtime.js");
     const { throwIfInsideCacheScope } =
       await import("../packages/vinext/src/shims/internal/headers-state.js");
-    return cacheContextStorage.run(useCacheContext, () => {
+    return cacheContextStorage.run({ ...useCacheContext, variant }, () => {
       try {
         throwIfInsideCacheScope(apiName);
         return "no error";
@@ -33307,6 +33307,21 @@ describe("cache scope diagnostics match Next.js", () => {
     expect(await messageInUnstableCache("connection()")).toBe(
       "`connection()` can't be called inside `unstable_cache()` because cached functions may run during prerendering, without an incoming request. Call it outside the cached function.\nLearn more: https://nextjs.org/docs/app/api-reference/functions/unstable_cache",
     );
+  });
+
+  // Ported from Next.js: packages/next/src/server/request/connection.ts and
+  // packages/next/src/server/request/draft-mode.ts, which reject these in a
+  // `private-cache` work unit while cookies() and headers() stay readable.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/connection.ts
+  it('rejects connection() and draft mode toggles inside "use cache: private"', async () => {
+    expect(await messageInUseCache("connection()", "private")).toBe(
+      '`connection()` can\'t be called inside `"use cache: private"` because private cached functions may run during prefetching, without a navigation request. Call it outside the cached function.\nLearn more: https://nextjs.org/docs/app/api-reference/directives/use-cache-private',
+    );
+    expect(await messageInUseCache("draftMode().enable()", "private")).toBe(
+      '`draftMode().enable()` can\'t be called inside `"use cache"`. Draft mode can be read inside a cached function, but enabling or disabling it must happen outside.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache',
+    );
+    expect(await messageInUseCache("cookies()", "private")).toBe("no error");
+    expect(await messageInUseCache("headers()", "private")).toBe("no error");
   });
 
   it("reports a draft mode toggle inside a cache", async () => {
