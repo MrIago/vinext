@@ -46,6 +46,12 @@ import { getScriptNonceFromNodeHeaderSources } from "./csp.js";
 import { mergeRouteParamsIntoQuery, parseQueryString as parseQuery } from "../utils/query.js";
 import { stripViteModuleQuery } from "../utils/path.js";
 import React from "react";
+// Default import on purpose: vite.config.ts imports vinext, which imports this
+// module, so it loads while Vite loads the config. React below 19.3 has no
+// named `renderToReadableStream` in the Node build of react-dom/server, and a
+// named import fails to link there with a bare SyntaxError before the build's
+// React version check can name the fix. The CommonJS default always links.
+import ReactDOMServer from "react-dom/server";
 import { logRequest, now } from "./request-log.js";
 import {
   createValidFileMatcher,
@@ -108,21 +114,6 @@ import {
 } from "./pages-execution-tracing.js";
 import { logRequestError } from "./request-error-log.js";
 
-type ReactDomServer = typeof import("react-dom/server");
-let reactDomServer: Promise<ReactDomServer> | undefined;
-
-// vite.config.ts imports vinext, which imports this module. A static import
-// would load react-dom/server while Vite loads the config, and React below
-// 19.3 fails there with a bare "Named export 'renderToReadableStream' not
-// found" before the build's React version check can name the fix. Load it on
-// the first Pages Router render instead.
-function renderToReadableStream(
-  ...args: Parameters<ReactDomServer["renderToReadableStream"]>
-): ReturnType<ReactDomServer["renderToReadableStream"]> {
-  reactDomServer ??= import("react-dom/server");
-  return reactDomServer.then((server) => server.renderToReadableStream(...args));
-}
-
 /**
  * Render a React element to a string using renderToReadableStream.
  *
@@ -131,7 +122,7 @@ function renderToReadableStream(
  * Used for _document rendering and error pages (small, non-streaming).
  */
 async function renderToStringAsync(element: React.ReactElement): Promise<string> {
-  const stream = await renderToReadableStream(element);
+  const stream = await ReactDOMServer.renderToReadableStream(element);
   await stream.allReady;
   return new Response(stream).text();
 }
@@ -396,7 +387,7 @@ async function streamPageToResponseImpl(
     const documentRenderPage = await runDocumentRenderPage({
       DocumentComponent,
       enhancePageElement,
-      renderToReadableStream,
+      renderToReadableStream: ReactDOMServer.renderToReadableStream,
       renderStylesToString: renderToStringAsync,
       scriptNonce,
       context: documentContext,
@@ -415,7 +406,7 @@ async function streamPageToResponseImpl(
     } else {
       // Start the body render before collecting its head state, then let the
       // tracing adapter keep the span alive without delaying the response.
-      bodyStream = await renderToReadableStream(element);
+      bodyStream = await ReactDOMServer.renderToReadableStream(element);
     }
 
     if (documentRenderPage.status === "skipped") {
