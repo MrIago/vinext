@@ -221,9 +221,12 @@ function isPublicFileLoadError(error: unknown): boolean {
  */
 function isReferencedAsset(server: ViteDevServer, url: string | undefined): boolean {
   if (!url) return false;
-  const { pathname } = new URL(url, "http://localhost");
+  let pathname: string;
   let decodedPathname: string;
   try {
+    // A target that starts with `//` parses as a protocol-relative URL, so an
+    // invalid host after the slashes (`//`, `//:80`, `//%`) makes this throw.
+    ({ pathname } = new URL(url, "http://localhost"));
     decodedPathname = decodeURI(pathname);
   } catch {
     return false;
