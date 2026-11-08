@@ -59,5 +59,8 @@ export function kvDataAdapter(options?: KvDataAdapterOptions) {
       buildIdentity: "response-header" as const,
       warmup: "data-cache" as const,
     },
+    // The KV namespace exists only on the Workers runtime, so Node.js runs
+    // (build prerender, `vinext start`) keep the default handler.
+    requiresEnv: true,
   };
 }

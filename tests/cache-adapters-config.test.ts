@@ -11,7 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it, expect, expectTypeOf } from "vite-plus/test";
+import { describe, it, expect, expectTypeOf, vi } from "vite-plus/test";
 import {
   findVinextCacheConfigInPlugins,
   generateCdnCacheAdapterModule,
@@ -182,6 +182,53 @@ describe("generateCacheAdaptersModule", () => {
     expect(code).not.toContain('", error);');
   });
 
+  it("waits for a Workers env before registering an env-requiring data adapter", async () => {
+    // Node runs (`vinext build` prerender, `vinext start`) call the registrar
+    // without env. An adapter that needs a Workers binding cannot exist there,
+    // so it must be skipped silently, and still register once env arrives.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-cache-adapters-"));
+    try {
+      const stub = path.join(dir, "stub.mjs");
+      fs.writeFileSync(
+        stub,
+        [
+          "export const log = { data: [], cdn: 0 };",
+          "export default function factory() {}",
+          "export function instantiateCacheAdapter(_factory, { env }, slot) {",
+          "  if (slot === 'data' && env == null) throw new Error('missing binding');",
+          "  return env;",
+          "}",
+          "export function registerDataCacheHandler(create) { log.data.push(create()); }",
+          "export function registerCdnCacheAdapter(create) { create(); log.cdn++; }",
+        ].join("\n"),
+      );
+      const code = generateCacheAdaptersModule({
+        data: { adapter: stub, requiresEnv: true },
+        cdn: { adapter: stub },
+      }).replace(/"vinext\/shims\/[^"]+"/g, JSON.stringify(stub));
+      const registrar = path.join(dir, "registrar.mjs");
+      fs.writeFileSync(registrar, code);
+      const { registerConfiguredCacheAdapters: register } = await import(registrar);
+      const { log } = await import(stub);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        register();
+        register(undefined);
+        expect(log).toEqual({ data: [], cdn: 1 });
+
+        const env = { VINEXT_KV_CACHE: {} };
+        register(env);
+        register(env);
+        expect(log).toEqual({ data: [env], cdn: 1 });
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("escapes adapter specifiers so absolute paths are safe", () => {
     // require.resolve() yields an absolute path which may contain characters
     // that must not break the generated import statement.
@@ -266,6 +313,8 @@ describe("kvDataAdapter builder", () => {
       buildIdentity: "response-header",
       warmup: "data-cache",
     });
+    // The KV namespace only exists on the Workers runtime (#3132).
+    expect(descriptor.requiresEnv).toBe(true);
     expect(hasBuildIdentityResponseHeader({ data: descriptor })).toBe(true);
     expect(cacheWarmupStatusSource({ data: descriptor })).toBe("data-cache");
     expect(
