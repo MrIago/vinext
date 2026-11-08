@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vite-plus/test";
 import fs from "node:fs";
+import Module from "node:module";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync, type ChildProcess, type spawn } from "node:child_process";
@@ -1325,6 +1326,21 @@ describe("parseDeployArgs", () => {
 // ─── detectProject ──────────────────────────────────────────────────────────
 
 describe("detectProject", () => {
+  // pnpm's bin shims (including the `vp` one behind `pnpm test`) put the
+  // workspace's node_modules/.pnpm/node_modules on NODE_PATH. Wrangler lives
+  // there, so isPackageResolvable() would find it from any tmp project and the
+  // Wrangler presence tests would check the workspace instead of the fixture.
+  // Node reads NODE_PATH once at startup; re-run its path setup per test.
+  const originalNodePath = process.env.NODE_PATH;
+  function setNodePath(value: string | undefined): void {
+    if (value === undefined) delete process.env.NODE_PATH;
+    else process.env.NODE_PATH = value;
+    (Module as unknown as { _initPaths(): void })._initPaths();
+  }
+
+  beforeEach(() => setNodePath(undefined));
+  afterEach(() => setNodePath(originalNodePath));
+
   it("detects App Router when app/ exists", () => {
     mkdir(tmpDir, "app");
     writeFile(tmpDir, "app/page.tsx", "export default function Home() { return <div>hi</div> }");
