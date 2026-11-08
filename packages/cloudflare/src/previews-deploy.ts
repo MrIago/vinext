@@ -8,7 +8,7 @@ function validatePreviewName(name: string): string {
   return trimmed;
 }
 
-function validateMode(mode: string): string {
+export function validateMode(mode: string): string {
   const trimmed = mode.trim();
   // Match `cf previews deploy`, which rejects an empty mode instead of using the default.
   if (!trimmed) throw new Error("--mode requires a non-empty value.");

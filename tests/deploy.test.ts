@@ -578,6 +578,12 @@ describe("cf Build Output deployment", () => {
     expect(resolveViteBuildMode("wrangler", "staging")).toBe("production");
   });
 
+  it("builds Wrangler projects in the --mode Vite mode, independent of the Wrangler environment", () => {
+    expect(resolveViteBuildMode("wrangler", "staging", "staging")).toBe("staging");
+    expect(resolveViteBuildMode("wrangler", undefined, "qa")).toBe("qa");
+    expect(resolveViteBuildMode("wrangler", "staging", undefined)).toBe("production");
+  });
+
   it("selects cf for typed Cloudflare configs and Wrangler for legacy configs", () => {
     expect(resolveDeploymentTool(tmpDir)).toBe("wrangler");
     writeFile(tmpDir, "wrangler.jsonc", "{}");
@@ -1015,6 +1021,22 @@ describe("parseDeployArgs", () => {
     expect(parsed.skipBuild).toBe(true);
     expect(parsed.dryRun).toBe(true);
     expect(parsed.verbose).toBe(true);
+  });
+
+  it("parses --mode for Wrangler deploys and rejects an empty mode", () => {
+    expect(parseDeployArgs([]).mode).toBeUndefined();
+    expect(parseDeployArgs(["--env", "staging", "--mode", "staging"])).toMatchObject({
+      env: "staging",
+      mode: "staging",
+    });
+    expect(() => parseDeployArgs(["--mode="])).toThrow("--mode requires a non-empty value.");
+    expect(() => parseDeployArgs(["--mode", " "])).toThrow("--mode requires a non-empty value.");
+  });
+
+  it("documents --mode only for Wrangler config projects", () => {
+    expect(formatDeployHelp("wrangler")).toContain("--mode <mode>");
+    expect(formatDeployHelp("wrangler")).toContain("deploy --env staging --mode staging");
+    expect(formatDeployHelp("cf")).not.toContain("--mode");
   });
 
   it("offers the Wrangler-only --name and --config flags only for Wrangler config projects", () => {
