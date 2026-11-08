@@ -27,6 +27,7 @@ import { createPprFallbackShellSuspensePromise } from "./ppr-fallback-shell.js";
 import type { RenderRequestApiKind } from "../server/cache-proof.js";
 import type { ReadonlyRequestCookies } from "@vinext/types/next/upstream/dist/server/web/spec-extension/adapters/request-cookies";
 import type { ResponseCookie } from "@vinext/types/next/upstream/dist/compiled/@edge-runtime/cookies/index";
+import { headersProxyTarget } from "./internal/headers-proxy-target.js";
 import {
   createRenderDynamicLatch,
   getHeadersShimState as _getState,
@@ -672,16 +673,19 @@ function _decorateSuspendingRequestApiPromise<T extends object>(
 }
 
 function _sealHeaders(headers: Headers): Headers {
-  return new Proxy(headers, {
-    get(target, prop) {
-      if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
-        throw new ReadonlyHeadersError();
-      }
+  return new Proxy(
+    headersProxyTarget(() => headers),
+    {
+      get(_target, prop) {
+        if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
+          throw new ReadonlyHeadersError();
+        }
 
-      const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+        const value = Reflect.get(headers, prop, headers);
+        return typeof value === "function" ? value.bind(headers) : value;
+      },
     },
-  }) as Headers;
+  );
 }
 
 function _wrapMutableCookies(cookies: RequestCookies): RequestCookies {
@@ -784,28 +788,32 @@ export function headersContextFromRequest(
   // `_mutable` holds the materialised copy once a write is needed.
   let _mutable: Headers | null = null;
 
-  const headersProxy = new Proxy(request.headers, {
-    get(target, prop: string | symbol) {
-      // Route to the materialised copy if it exists.
-      const src = _mutable ?? target;
+  const target = request.headers;
+  const headersProxy = new Proxy(
+    headersProxyTarget(() => _mutable ?? target),
+    {
+      get(_target, prop: string | symbol) {
+        // Route to the materialised copy if it exists.
+        const src = _mutable ?? target;
 
-      // Intercept mutating methods: materialise on first write.
-      if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
-        return (...args: unknown[]) => {
-          if (!_mutable) {
-            _mutable = new Headers(target);
-          }
-          return (_mutable[prop as "set" | "delete" | "append"] as (...a: unknown[]) => unknown)(
-            ...args,
-          );
-        };
-      }
+        // Intercept mutating methods: materialise on first write.
+        if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
+          return (...args: unknown[]) => {
+            if (!_mutable) {
+              _mutable = new Headers(target);
+            }
+            return (_mutable[prop as "set" | "delete" | "append"] as (...a: unknown[]) => unknown)(
+              ...args,
+            );
+          };
+        }
 
-      // Non-mutating method or property: bind to current source.
-      const value = Reflect.get(src, prop, src);
-      return typeof value === "function" ? value.bind(src) : value;
+        // Non-mutating method or property: bind to current source.
+        const value = Reflect.get(src, prop, src);
+        return typeof value === "function" ? value.bind(src) : value;
+      },
     },
-  }) as Headers;
+  );
 
   // ---------------------------------------------------------------------------
   // Lazy cookie map
