@@ -25,11 +25,15 @@
  */
 
 import type { ESTree, Plugin } from "vite";
-import { parseProgram } from "./ast-utils.js";
+import {
+  getAstName,
+  LEADING_TRIVIA_RE,
+  parseProgram,
+  scriptParserLanguage,
+  walkAst,
+} from "./ast-utils.js";
 import path, { toSlash } from "pathslash";
 import fs from "node:fs";
-import { escapeRegExp } from "../utils/regex.js";
-import { lastSignificantChar } from "../utils/has-trailing-comma.js";
 import MagicString from "magic-string";
 import { magicStringTransformResult } from "./transform-result.js";
 import {
@@ -176,13 +180,6 @@ export function _rewriteCachedFontCssToServedUrls(
 const DEFAULT_ASSETS_DIR = ASSET_PREFIX_URL_DIR;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
-type GoogleFontNamedSpecifier = {
-  imported: string;
-  local: string;
-  isType: boolean;
-  raw: string;
-};
 
 // ── Helpers shared with index.ts ──────────────────────────────────────────────
 
@@ -352,84 +349,65 @@ export function generateGoogleFontsVirtualModule(
   return lines.join("\n");
 }
 
-// ── Import clause parsers ─────────────────────────────────────────────────────
+/** Font file extensions `next/font/local` paths are promoted to asset imports for. */
+const LOCAL_FONT_FILE_RE = /\.(?:woff2?|ttf|otf|eot)$/;
 
-function parseGoogleFontNamedSpecifiers(
-  specifiersStr: string,
-  forceType = false,
-): GoogleFontNamedSpecifier[] {
-  return specifiersStr
-    .split(",")
-    .map((spec) => spec.trim())
-    .filter(Boolean)
-    .map((raw) => {
-      const isType = forceType || raw.startsWith("type ");
-      const valueSpec = isType ? raw.replace(/^type\s+/, "") : raw;
-      const asParts = valueSpec.split(/\s+as\s+/);
-      const imported = asParts[0]?.trim() ?? "";
-      const local = (asParts[1] || asParts[0] || "").trim();
-      return { imported, local, isType, raw };
-    })
-    .filter((spec) => spec.imported.length > 0 && spec.local.length > 0);
+// ── AST helpers ───────────────────────────────────────────────────────────────
+
+type CallExpressionNode = Extract<ESTree.Node, { type: "CallExpression" }>;
+type ObjectExpressionNode = Extract<ESTree.Node, { type: "ObjectExpression" }>;
+
+/**
+ * Parse a module for the font transforms, or `null` when it is not a script
+ * module or does not parse. Vite's own transform rejects the same syntax
+ * error, so skipping the rewrite only leaves that error to it.
+ */
+function parseFontModule(code: string, id: string): ESTree.Program | null {
+  const lang = scriptParserLanguage(id);
+  if (!lang) return null;
+  try {
+    return parseProgram(code, { lang });
+  } catch {
+    return null;
+  }
 }
 
-function parseGoogleFontImportClause(clause: string): {
-  defaultLocal: string | null;
-  namespaceLocal: string | null;
-  named: GoogleFontNamedSpecifier[];
-} {
-  const trimmed = clause.trim();
+/**
+ * The single object-literal argument of a font loader call, e.g. the
+ * `{ subsets: ["latin"] }` in `Inter({ subsets: ["latin"] })`. Calls with
+ * no argument, a non-literal argument, or extra arguments are not
+ * statically analyzable and are left alone.
+ */
+function soleObjectArgument(call: CallExpressionNode): ObjectExpressionNode | null {
+  if (call.arguments.length !== 1) return null;
+  const arg = call.arguments[0];
+  return arg.type === "ObjectExpression" ? arg : null;
+}
 
-  if (trimmed.startsWith("type ")) {
-    const braceStart = trimmed.indexOf("{");
-    const braceEnd = trimmed.lastIndexOf("}");
-    if (braceStart === -1 || braceEnd === -1) {
-      return { defaultLocal: null, namespaceLocal: null, named: [] };
-    }
-    return {
-      defaultLocal: null,
-      namespaceLocal: null,
-      named: parseGoogleFontNamedSpecifiers(trimmed.slice(braceStart + 1, braceEnd), true),
-    };
-  }
+/**
+ * Where and how to add one more property to an options object literal: just
+ * before its closing `}`, with a `, ` separator unless the object is empty or
+ * already ends in a trailing comma. The gap between the last property and the
+ * `}` holds only whitespace, comments, and that optional comma, so skipping
+ * the trivia finds the comma even behind a comment (`{ a: 1, /* note *\/ }`),
+ * and a `//` inside a string value is never in the gap to begin with.
+ */
+function propertyInsertion(
+  code: string,
+  object: ObjectExpressionNode,
+): { at: number; separator: string } {
+  const at = object.end - 1;
+  const last = object.properties.at(-1);
+  if (!last) return { at, separator: "" };
+  const gap = code.slice(last.end, at);
+  const triviaLength = LEADING_TRIVIA_RE.exec(gap)?.[0].length ?? 0;
+  return { at, separator: gap[triviaLength] === "," ? "" : ", " };
+}
 
-  const braceStart = trimmed.indexOf("{");
-  const braceEnd = trimmed.lastIndexOf("}");
-  if (braceStart !== -1 && braceEnd !== -1) {
-    const beforeNamed = trimmed.slice(0, braceStart).trim().replace(/,\s*$/, "").trim();
-    return {
-      defaultLocal: beforeNamed || null,
-      namespaceLocal: null,
-      named: parseGoogleFontNamedSpecifiers(trimmed.slice(braceStart + 1, braceEnd)),
-    };
-  }
-
-  const commaIndex = trimmed.indexOf(",");
-  if (commaIndex !== -1) {
-    const defaultLocal = trimmed.slice(0, commaIndex).trim() || null;
-    const rest = trimmed.slice(commaIndex + 1).trim();
-    if (rest.startsWith("* as ")) {
-      return {
-        defaultLocal,
-        namespaceLocal: rest.slice("* as ".length).trim() || null,
-        named: [],
-      };
-    }
-  }
-
-  if (trimmed.startsWith("* as ")) {
-    return {
-      defaultLocal: null,
-      namespaceLocal: trimmed.slice("* as ".length).trim() || null,
-      named: [],
-    };
-  }
-
-  return {
-    defaultLocal: trimmed || null,
-    namespaceLocal: null,
-    named: [],
-  };
+function hasPropertyNamed(object: ObjectExpressionNode, name: string): boolean {
+  return object.properties.some(
+    (prop) => prop.type === "Property" && !prop.computed && getAstName(prop.key) === name,
+  );
 }
 
 function propertyNameToGoogleFontFamily(prop: string): string {
@@ -582,137 +560,6 @@ async function downloadGoogleFont(
  *   files from transform (they contain `next/font/google` references that must
  *   not be rewritten).
  */
-
-/**
- * Scan `code` forward from `searchStart` for a `{...}` object literal that
- * may contain arbitrarily nested braces.  Returns `[objStart, objEnd]` where
- * `code[objStart] === '{'` and `code[objEnd - 1] === '}'`, or `null` if no
- * balanced object is found.
- *
- * String literals (single-quoted, double-quoted, and backtick template
- * literals including `${...}` interpolations) are fully skipped so that brace
- * characters inside string values do not affect the depth count.
- */
-export function _findBalancedObject(code: string, searchStart: number): [number, number] | null {
-  let i = searchStart;
-  // Skip leading whitespace before the opening brace
-  while (
-    i < code.length &&
-    (code[i] === " " || code[i] === "\t" || code[i] === "\n" || code[i] === "\r")
-  ) {
-    i++;
-  }
-  if (i >= code.length || code[i] !== "{") return null;
-  const objStart = i;
-  let depth = 0;
-  while (i < code.length) {
-    const ch = code[i];
-    if (ch === '"' || ch === "'") {
-      // Skip a single- or double-quoted string literal, respecting backslash escapes.
-      const quote = ch;
-      i++;
-      while (i < code.length) {
-        const sc = code[i];
-        if (sc === "\\") {
-          i += 2; // skip escaped character
-        } else if (sc === quote) {
-          i++;
-          break;
-        } else {
-          i++;
-        }
-      }
-    } else if (ch === "`") {
-      // Skip a template literal, including ${...} interpolation blocks.
-      // We need to track brace depth inside interpolations so that a `}`
-      // that closes an interpolation isn't mistaken for closing the object.
-      i++; // consume the opening backtick
-      while (i < code.length) {
-        const tc = code[i];
-        if (tc === "\\") {
-          i += 2; // skip escape sequence
-        } else if (tc === "`") {
-          i++; // end of template literal
-          break;
-        } else if (tc === "$" && code[i + 1] === "{") {
-          // Enter a ${...} interpolation: scan forward tracking nested braces.
-          i += 2; // consume '${'
-          let exprDepth = 1;
-          while (i < code.length && exprDepth > 0) {
-            const ec = code[i];
-            if (ec === "{") {
-              exprDepth++;
-              i++;
-            } else if (ec === "}") {
-              exprDepth--;
-              i++;
-            } else if (ec === '"' || ec === "'") {
-              // Quoted string inside interpolation — skip it
-              const q = ec;
-              i++;
-              while (i < code.length) {
-                if (code[i] === "\\") {
-                  i += 2;
-                } else if (code[i] === q) {
-                  i++;
-                  break;
-                } else {
-                  i++;
-                }
-              }
-            } else if (ec === "`") {
-              // Nested template literal inside interpolation — skip it
-              // (simple depth-1 skip; deeply nested templates are rare in font options)
-              i++;
-              while (i < code.length) {
-                if (code[i] === "\\") {
-                  i += 2;
-                } else if (code[i] === "`") {
-                  i++;
-                  break;
-                } else {
-                  i++;
-                }
-              }
-            } else {
-              i++;
-            }
-          }
-        } else {
-          i++;
-        }
-      }
-    } else if (ch === "{") {
-      depth++;
-      i++;
-    } else if (ch === "}") {
-      depth--;
-      i++;
-      if (depth === 0) return [objStart, i];
-    } else {
-      i++;
-    }
-  }
-  return null; // unbalanced
-}
-
-/**
- * Given the index just past the closing `}` of an options object, skip
- * optional whitespace and return the index after the closing `)`.
- * Returns `null` if the next non-whitespace character is not `)`.
- */
-export function _findCallEnd(code: string, objEnd: number): number | null {
-  let i = objEnd;
-  while (
-    i < code.length &&
-    (code[i] === " " || code[i] === "\t" || code[i] === "\n" || code[i] === "\r")
-  ) {
-    i++;
-  }
-  if (i >= code.length || code[i] !== ")") return null;
-  return i + 1;
-}
-
 export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: string): Plugin {
   // Vite does not bind `this` to the plugin object when calling hooks, so
   // plugin state must be held in closure variables rather than as properties.
@@ -797,122 +644,109 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
         // value through every font-loader call site it rewrites.
         const transformAssetsDir = this.environment?.config?.build?.assetsDir ?? DEFAULT_ASSETS_DIR;
 
+        const program = parseFontModule(code, id);
+        if (!program) return null;
+
         const s = new MagicString(code);
         let hasChanges = false;
         let proxyImportCounter = 0;
-        const overwrittenRanges: Array<[number, number]> = [];
         const fontLocals = new Map<string, string>();
         const proxyObjectLocals = new Set<string>();
 
-        // The clause is a sequence of either a brace block (`\{[^}]*?\}` —
-        // newlines allowed inside, but `[^}]` keeps it from spanning past
-        // the matching close brace) or a single non-`;` non-`\n` char.
-        // Effect: multi-line bracket imports (Prettier wraps past
-        // `printWidth`) match, but a preceding semicolon-less line
-        // (e.g. `import type { Metadata } from 'next'`) can't be swallowed
-        // into the clause via newline crossings. Both shapes used to fail
-        // silently — the rewrite was skipped because the resulting clause
-        // wasn't a valid single import.
-        const importRe =
-          /^[ \t]*import\s+((?:\{[^}]*?\}|[^;\n])+?)\s+from\s*(["'])next\/font\/google\2\s*;?/gm;
-        let importMatch;
-        while ((importMatch = importRe.exec(code)) !== null) {
-          const [fullMatch, clause] = importMatch;
-          const matchStart = importMatch.index;
-          const matchEnd = matchStart + fullMatch.length;
-          const parsed = parseGoogleFontImportClause(clause);
-          const utilityImports = parsed.named.filter(
-            (spec) => !spec.isType && GOOGLE_FONT_UTILITY_EXPORTS.has(spec.imported),
-          );
-          const fontImports = parsed.named.filter(
-            (spec) => !spec.isType && !GOOGLE_FONT_UTILITY_EXPORTS.has(spec.imported),
-          );
+        // Imports and re-exports are read from the program's top-level
+        // declarations, so a `next/font/google` mention in a comment or a
+        // string is never mistaken for one, a preceding semicolon-less line
+        // can't be merged into the clause, and a multi-line (Prettier-wrapped)
+        // bracket import is just another declaration. Rewrites only swap the
+        // module specifier: the clause stays verbatim, type-only specifiers
+        // included, for TypeScript to erase.
+        for (const node of program.body) {
+          if (node.type === "ImportDeclaration") {
+            if (node.source.value !== "next/font/google" || node.importKind === "type") continue;
+            let defaultLocal: string | null = null;
+            let namespaceLocal: string | null = null;
+            const fontNames: string[] = [];
+            const utilityNames: string[] = [];
+            for (const spec of node.specifiers) {
+              if (spec.type === "ImportDefaultSpecifier") {
+                defaultLocal = spec.local.name;
+              } else if (spec.type === "ImportNamespaceSpecifier") {
+                namespaceLocal = spec.local.name;
+              } else if (spec.importKind !== "type") {
+                const imported = getAstName(spec.imported);
+                if (imported === "default") {
+                  defaultLocal = spec.local.name;
+                } else if (imported && GOOGLE_FONT_UTILITY_EXPORTS.has(imported)) {
+                  utilityNames.push(imported);
+                } else if (imported) {
+                  fontNames.push(imported);
+                  fontLocals.set(spec.local.name, imported);
+                }
+              }
+            }
+            if (defaultLocal) proxyObjectLocals.add(defaultLocal);
 
-          if (parsed.defaultLocal) {
-            proxyObjectLocals.add(parsed.defaultLocal);
-          }
-          for (const fontImport of fontImports) {
-            fontLocals.set(fontImport.local, fontImport.imported);
-          }
+            if (fontNames.length > 0) {
+              const virtualId = encodeGoogleFontsVirtualId({
+                hasDefault: Boolean(defaultLocal),
+                fonts: Array.from(new Set(fontNames)),
+                utilities: Array.from(new Set(utilityNames)),
+              });
+              s.overwrite(node.source.start, node.source.end, JSON.stringify(virtualId));
+              hasChanges = true;
+              continue;
+            }
 
-          if (fontImports.length > 0) {
-            const virtualId = encodeGoogleFontsVirtualId({
-              hasDefault: Boolean(parsed.defaultLocal),
-              fonts: Array.from(new Set(fontImports.map((spec) => spec.imported))),
-              utilities: Array.from(new Set(utilityImports.map((spec) => spec.imported))),
-            });
-            s.overwrite(
-              matchStart,
-              matchEnd,
-              `import ${clause} from ${JSON.stringify(virtualId)};`,
-            );
-            overwrittenRanges.push([matchStart, matchEnd]);
-            hasChanges = true;
+            if (namespaceLocal) {
+              const proxyImportName = `__vinext_google_fonts_proxy_${proxyImportCounter++}`;
+              const replacementLines = [
+                `import ${proxyImportName} from ${JSON.stringify(fontGoogleShimPath)};`,
+              ];
+              if (defaultLocal) {
+                replacementLines.push(`var ${defaultLocal} = ${proxyImportName};`);
+              }
+              replacementLines.push(`var ${namespaceLocal} = ${proxyImportName};`);
+              s.overwrite(node.start, node.end, replacementLines.join("\n"));
+              proxyObjectLocals.add(namespaceLocal);
+              hasChanges = true;
+            }
             continue;
           }
 
-          if (parsed.namespaceLocal) {
-            const proxyImportName = `__vinext_google_fonts_proxy_${proxyImportCounter++}`;
-            const replacementLines = [
-              `import ${proxyImportName} from ${JSON.stringify(fontGoogleShimPath)};`,
-            ];
-            if (parsed.defaultLocal) {
-              replacementLines.push(`var ${parsed.defaultLocal} = ${proxyImportName};`);
+          if (node.type === "ExportNamedDeclaration") {
+            if (node.source?.value !== "next/font/google" || node.exportKind === "type") continue;
+            let hasDefault = false;
+            const fontNames: string[] = [];
+            const utilityNames: string[] = [];
+            for (const spec of node.specifiers) {
+              if (spec.exportKind === "type") continue;
+              const exported = getAstName(spec.local);
+              if (exported === "default") {
+                hasDefault = true;
+              } else if (exported && GOOGLE_FONT_UTILITY_EXPORTS.has(exported)) {
+                utilityNames.push(exported);
+              } else if (exported) {
+                fontNames.push(exported);
+              }
             }
-            replacementLines.push(`var ${parsed.namespaceLocal} = ${proxyImportName};`);
-            s.overwrite(matchStart, matchEnd, replacementLines.join("\n"));
-            overwrittenRanges.push([matchStart, matchEnd]);
-            proxyObjectLocals.add(parsed.namespaceLocal);
+            if (fontNames.length === 0) continue;
+
+            const virtualId = encodeGoogleFontsVirtualId({
+              hasDefault,
+              fonts: Array.from(new Set(fontNames)),
+              utilities: Array.from(new Set(utilityNames)),
+            });
+            s.overwrite(node.source.start, node.source.end, JSON.stringify(virtualId));
             hasChanges = true;
           }
         }
 
-        const exportRe = /^[ \t]*export\s*\{([^}]+)\}\s*from\s*(["'])next\/font\/google\2\s*;?/gm;
-        let exportMatch;
-        while ((exportMatch = exportRe.exec(code)) !== null) {
-          const [fullMatch, specifiers] = exportMatch;
-          const matchStart = exportMatch.index;
-          const matchEnd = matchStart + fullMatch.length;
-          const namedExports = parseGoogleFontNamedSpecifiers(specifiers);
-          const utilityExports = namedExports.filter(
-            (spec) => !spec.isType && GOOGLE_FONT_UTILITY_EXPORTS.has(spec.imported),
-          );
-          const fontExports = namedExports.filter(
-            (spec) => !spec.isType && !GOOGLE_FONT_UTILITY_EXPORTS.has(spec.imported),
-          );
-          if (fontExports.length === 0) continue;
-
-          const virtualId = encodeGoogleFontsVirtualId({
-            hasDefault: false,
-            fonts: Array.from(new Set(fontExports.map((spec) => spec.imported))),
-            utilities: Array.from(new Set(utilityExports.map((spec) => spec.imported))),
-          });
-          s.overwrite(
-            matchStart,
-            matchEnd,
-            `export { ${specifiers.trim()} } from ${JSON.stringify(virtualId)};`,
-          );
-          overwrittenRanges.push([matchStart, matchEnd]);
-          hasChanges = true;
-        }
-
-        async function injectSelfHostedCss(
-          callStart: number,
-          callEnd: number,
-          optionsStr: string,
-          family: string,
-          calleeSource: string,
-        ) {
-          // Parse options safely via AST — no eval/new Function
-          // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-          let options: Record<string, any> = {};
-          try {
-            const parsed = parseStaticObjectLiteral(optionsStr);
-            if (!parsed) return; // Contains dynamic expressions, skip
-            options = parsed as Record<string, unknown>;
-          } catch {
-            return; // Can't parse options statically, skip
-          }
+        async function injectSelfHostedCss(options: ObjectExpressionNode, family: string) {
+          // Read the options straight off the AST — no eval/new Function.
+          // Anything dynamic (identifiers, calls, spreads...) makes the call
+          // not statically analyzable, so it is skipped.
+          const staticOptions = extractStaticValue(options);
+          if (staticOptions === undefined) return;
 
           // Validate the call against the bundled Google Fonts metadata
           // and resolve the actual axis values. This replaces an earlier
@@ -922,7 +756,7 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
           // See issue #885.
           let validated;
           try {
-            validated = validateGoogleFontOptions(family, options);
+            validated = validateGoogleFontOptions(family, staticOptions as Record<string, unknown>);
           } catch (err) {
             // Validation errors are programmer errors (unknown family,
             // missing required weight on a static font, etc.). Re-throw
@@ -1019,27 +853,11 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
           const injectedProperties = [
             `_vinext: { font: { ${internalFontProperties.join(", ")} } }`,
           ];
-          const closingBrace = optionsStr.lastIndexOf("}");
-          // Decide the separator from the last significant character before the
-          // closing brace. `lastSignificantChar` skips whitespace AND comments
-          // without being fooled by `//`/`/*` inside string literals (e.g. a URL
-          // or a path with a double slash), so a trailing comma hidden behind a
-          // comment is honoured and a `//` inside a value can never eat the real
-          // comma. Determine the separator to insert before the new property:
-          //   - Empty string if the object is empty ({ is the last significant char)
-          //   - Empty string if there's already a trailing comma (avoid double comma)
-          //   - ", " otherwise (before the new property)
-          const lastChar = lastSignificantChar(optionsStr.slice(0, closingBrace));
-          const separator = lastChar === "{" || lastChar === "," ? "" : ", ";
-          const optionsWithCSS =
-            optionsStr.slice(0, closingBrace) +
-            separator +
-            injectedProperties.join(", ") +
-            optionsStr.slice(closingBrace);
-
-          const replacement = `${calleeSource}(${optionsWithCSS})`;
-          s.overwrite(callStart, callEnd, replacement);
-          overwrittenRanges.push([callStart, callEnd]);
+          // Add the payload as one more property of the options object, right
+          // before its closing brace; see `propertyInsertion` for the
+          // separator.
+          const { at, separator } = propertyInsertion(code, options);
+          s.appendLeft(at, separator + injectedProperties.join(", "));
           hasChanges = true;
         }
 
@@ -1048,67 +866,38 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
         // directly from `.vinext/fonts/` so the rewritten URLs resolve
         // against the dev origin; in build, the `writeBundle` hook copies
         // them into the client output directory.
-
-        // Match: Identifier( — where the argument starts with {
-        // The regex intentionally does NOT capture the options object; we use
-        // _findBalancedObject() to handle nested braces correctly.
-        const namedCallRe = /\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(\s*(?=\{)/g;
-        let namedCallMatch;
-        while ((namedCallMatch = namedCallRe.exec(code)) !== null) {
-          const [fullMatch, localName] = namedCallMatch;
-          const importedName = fontLocals.get(localName);
-          if (!importedName) continue;
-
-          const callStart = namedCallMatch.index;
-          // The regex consumed up to (but not including) the '{' due to the
-          // lookahead — find the balanced object starting at the lookahead pos.
-          const openParenEnd = callStart + fullMatch.length;
-          const objRange = _findBalancedObject(code, openParenEnd);
-          if (!objRange) continue;
-          const optionsStr = code.slice(objRange[0], objRange[1]);
-          const callEnd = _findCallEnd(code, objRange[1]);
-          if (callEnd === null) continue;
-
-          if (overwrittenRanges.some(([start, end]) => callStart < end && callEnd > start)) {
-            continue;
+        //
+        // Font loader calls are `Inter({...})` for a named font import and
+        // `googleFonts.Inter({...})` for a default or namespace import. Being
+        // AST call expressions, commented-out calls and look-alikes inside
+        // strings are never rewritten.
+        const fontCalls: Array<{ options: ObjectExpressionNode; family: string }> = [];
+        walkAst(program, (node) => {
+          if (node.type !== "CallExpression") return;
+          const options = soleObjectArgument(node);
+          if (!options) return;
+          const callee = node.callee;
+          let family: string | null = null;
+          if (callee.type === "Identifier") {
+            const imported = fontLocals.get(callee.name);
+            if (imported) family = imported.replace(/_/g, " ");
+          } else if (
+            callee.type === "MemberExpression" &&
+            !callee.computed &&
+            callee.object.type === "Identifier" &&
+            proxyObjectLocals.has(callee.object.name) &&
+            callee.property.type === "Identifier"
+          ) {
+            family = propertyNameToGoogleFontFamily(callee.property.name);
           }
-
-          await injectSelfHostedCss(
-            callStart,
-            callEnd,
-            optionsStr,
-            importedName.replace(/_/g, " "),
-            localName,
-          );
-        }
-
-        // Match: Identifier.Identifier( — where the argument starts with {
-        const memberCallRe =
-          /\b([A-Za-z_$][A-Za-z0-9_$]*)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*\(\s*(?=\{)/g;
-        let memberCallMatch;
-        while ((memberCallMatch = memberCallRe.exec(code)) !== null) {
-          const [fullMatch, objectName, propName] = memberCallMatch;
-          if (!proxyObjectLocals.has(objectName)) continue;
-
-          const callStart = memberCallMatch.index;
-          const openParenEnd = callStart + fullMatch.length;
-          const objRange = _findBalancedObject(code, openParenEnd);
-          if (!objRange) continue;
-          const optionsStr = code.slice(objRange[0], objRange[1]);
-          const callEnd = _findCallEnd(code, objRange[1]);
-          if (callEnd === null) continue;
-
-          if (overwrittenRanges.some(([start, end]) => callStart < end && callEnd > start)) {
-            continue;
-          }
-
-          await injectSelfHostedCss(
-            callStart,
-            callEnd,
-            optionsStr,
-            propertyNameToGoogleFontFamily(propName),
-            `${objectName}.${propName}`,
-          );
+          if (!family) return;
+          fontCalls.push({ options, family });
+          // The options are static literals, so nothing below can be another
+          // font call.
+          return false;
+        });
+        for (const { options, family } of fontCalls) {
+          await injectSelfHostedCss(options, family);
         }
 
         if (!hasChanges) return null;
@@ -1230,70 +1019,67 @@ export function createLocalFontsPlugin(shimsDir: string): Plugin {
         // `font-local` are still transformed. Mirrors `createGoogleFontsPlugin`.
         if (id.startsWith(shimsDir)) return null;
 
-        // Verify there's actually a default import from next/font/local and
-        // remember its local binding so family payloads only attach to real
-        // localFont calls.
-        const importMatch =
-          /\bimport\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s*(['"])next\/font\/local\2/.exec(code);
-        if (!importMatch) return null;
-        const localFontIdentifier = importMatch[1];
+        // Find the default import from next/font/local and remember its local
+        // binding so family payloads only attach to real localFont calls.
+        const program = parseFontModule(code, id);
+        if (!program) return null;
+        let localFontIdentifier: string | null = null;
+        for (const node of program.body) {
+          if (node.type !== "ImportDeclaration" || node.source.value !== "next/font/local")
+            continue;
+          const defaultSpec = node.specifiers.find(
+            (spec) => spec.type === "ImportDefaultSpecifier",
+          );
+          if (defaultSpec) {
+            localFontIdentifier = defaultSpec.local.name;
+            break;
+          }
+        }
+        if (!localFontIdentifier) return null;
 
         const s = new MagicString(code);
         let hasChanges = false;
         let fontImportCounter = 0;
         const imports: string[] = [];
 
-        // Match font file paths in `path: "..."` or `src: "..."` properties.
-        // Captures: (1) property+colon prefix, (2) quote char, (3) the path.
-        const fontPathRe = /((?:path|src)\s*:\s*)(['"])([^'"]+\.(?:woff2?|ttf|otf|eot))\2/g;
+        walkAst(program, (node) => {
+          // `path: "./font.woff2"` / `src: "./font.woff2"` — anywhere in the
+          // module, so options declared in a variable and passed to
+          // localFont() are covered too. Only real properties count: a path in
+          // a comment or inside another string is not touched.
+          if (node.type === "Property") {
+            if (node.computed || node.value.type !== "Literal") return;
+            const key = getAstName(node.key);
+            const fontPath = node.value.value;
+            if (key !== "path" && key !== "src") return;
+            if (typeof fontPath !== "string" || !LOCAL_FONT_FILE_RE.test(fontPath)) return;
 
-        let match;
-        while ((match = fontPathRe.exec(code)) !== null) {
-          const [fullMatch, prefix, _quote, fontPath] = match;
-          const varName = `__vinext_local_font_${fontImportCounter++}`;
+            // Import the font file — Vite resolves it as a static asset and
+            // returns the correct URL for both dev and prod.
+            const varName = `__vinext_local_font_${fontImportCounter++}`;
+            imports.push(`import ${varName} from ${JSON.stringify(fontPath)};`);
+            // Replace: path: "./font.woff2" -> path: __vinext_local_font_0
+            s.overwrite(node.value.start, node.value.end, varName);
+            hasChanges = true;
+            return;
+          }
 
-          // Add an import for this font file — Vite resolves it as a static
-          // asset and returns the correct URL for both dev and prod.
-          imports.push(`import ${varName} from ${JSON.stringify(fontPath)};`);
+          // `const myFont = localFont({...})`: tell the runtime the binding
+          // name, which Next.js uses as the generated font family.
+          if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier") return;
+          if (node.init?.type !== "CallExpression") return;
+          const callee = node.init.callee;
+          if (callee.type !== "Identifier" || callee.name !== localFontIdentifier) return;
+          const options = soleObjectArgument(node.init);
+          if (!options || hasPropertyNamed(options, "_vinext")) return;
 
-          // Replace: path: "./font.woff2" -> path: __vinext_local_font_0
-          const matchStart = match.index;
-          const matchEnd = matchStart + fullMatch.length;
-          s.overwrite(matchStart, matchEnd, `${prefix}${varName}`);
-          hasChanges = true;
-        }
-
-        const localFontCallRe = new RegExp(
-          String.raw`(?:^|[;{}\n])\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*${escapeRegExp(localFontIdentifier)}\s*\(\s*(?=\{)`,
-          "g",
-        );
-        const familyPayloadInsertions = new Set<number>();
-        let localFontCallMatch;
-        while ((localFontCallMatch = localFontCallRe.exec(code)) !== null) {
-          const bindingName = localFontCallMatch[1];
-          const objRange = _findBalancedObject(code, localFontCallRe.lastIndex);
-          if (!objRange) continue;
-          if (_findCallEnd(code, objRange[1]) === null) continue;
-
-          const insertAt = objRange[1] - 1;
-          if (familyPayloadInsertions.has(insertAt)) continue;
-          const optionsStr = code.slice(objRange[0], objRange[1]);
-          if (/(?:^|[,{])\s*_vinext\s*:/.test(optionsStr)) continue;
-
-          // Decide the separator from the last significant character before the
-          // closing brace (see injectSelfHostedCss): comment- and
-          // string-literal-aware, so a trailing comma hidden behind a comment is
-          // honoured and a `//` inside a value (e.g. a path) is not mistaken for
-          // a comment that would swallow the real comma → double comma.
-          const lastChar = lastSignificantChar(optionsStr.slice(0, -1));
-          const separator = lastChar === "{" || lastChar === "," ? "" : ", ";
+          const { at, separator } = propertyInsertion(code, options);
           s.appendLeft(
-            insertAt,
-            `${separator}_vinext: { font: { family: ${JSON.stringify(bindingName)} } }`,
+            at,
+            `${separator}_vinext: { font: { family: ${JSON.stringify(node.id.name)} } }`,
           );
-          familyPayloadInsertions.add(insertAt);
           hasChanges = true;
-        }
+        });
 
         if (!hasChanges) return null;
 

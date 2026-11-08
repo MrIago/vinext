@@ -201,6 +201,39 @@ describe("vinext:local-fonts plugin", () => {
     expect(result.code).toContain(`_vinext: { font: { family: "myFont" } }`);
   });
 
+  it("passes the local binding name through when it is not the first declarator", () => {
+    const plugin = getLocalFontsPlugin();
+    const transform = unwrapHook(plugin.transform);
+    const code = [
+      `import localFont from 'next/font/local';`,
+      `const weight = 400, myFont = localFont({ src: "./font.woff2" });`,
+    ].join("\n");
+
+    const result = transform.call(plugin, code, "/app/layout.tsx");
+
+    expect(result).not.toBeNull();
+    expect(result.code).toContain(`_vinext: { font: { family: "myFont" } }`);
+  });
+
+  it("does not import font paths that only appear in comments", () => {
+    // A commented-out call is not a font source: importing its path would
+    // make Vite fail to resolve a file that may no longer exist.
+    const plugin = getLocalFontsPlugin();
+    const transform = unwrapHook(plugin.transform);
+    const code = [
+      `import localFont from 'next/font/local';`,
+      `// const oldFont = localFont({ src: "./old-font.woff2" });`,
+      `const myFont = localFont({ src: "./font.woff2" });`,
+    ].join("\n");
+
+    const result = transform.call(plugin, code, "/app/layout.tsx");
+
+    expect(result).not.toBeNull();
+    expectImported(result.code, "./font.woff2");
+    expect(result.code).not.toContain(`from "./old-font.woff2"`);
+    expect(result.code).toContain(`// const oldFont = localFont({ src: "./old-font.woff2" });`);
+  });
+
   it("does not produce double-comma when a trailing comma is hidden behind a block comment", () => {
     // Regression for #1973: `.trim()` strips whitespace but not comments, so a
     // trailing comma followed by a block comment escaped the trailing-comma
