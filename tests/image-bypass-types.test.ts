@@ -66,7 +66,8 @@ function riff(chunks: string): Uint8Array<ArrayBuffer> {
   ]);
 }
 const STATIC_WEBP = riff("VP8 \0\0\0\0");
-const ANIMATED_WEBP = riff("VP8X\0\0\0\0ANIM\0\0\0\0");
+// A VP8X chunk (10-byte payload) whose flags byte sets the animation bit.
+const ANIMATED_WEBP = riff("VP8X\x0a\0\0\0\x02\0\0\0\0\0\0\0\0\0ANIM\0\0\0\0");
 
 /** A stream of `bytes` in chunks of `chunkSize`, counting the chunks pulled. */
 function chunkedSource(bytes: Uint8Array, chunkSize: number) {
@@ -123,11 +124,15 @@ describe("isAnimatedImage", () => {
     expect(await isAnimated(new Uint8Array())).toBe(false);
   });
 
-  it("finds a WebP ANIM chunk split across reads", async () => {
-    const bytes = new Uint8Array(65_536 + 8);
-    bytes.set(STATIC_WEBP);
-    bytes.set([0x41, 0x4e, 0x49, 0x4d], 65_534);
-    expect(await isAnimated(bytes)).toBe(true);
+  // is-animated 3, vendored by https://github.com/vercel/next.js/pull/101173,
+  // reads the VP8X animation flag instead of searching a WebP for `ANIM`.
+  it("reads a WebP's VP8X animation flag, not ANIM bytes", async () => {
+    const stillWithAnimBytes = riff("VP8 \0\0\0\0ANIM\0\0\0\0\0\0\0\0\0\0");
+    expect(await isAnimated(stillWithAnimBytes)).toBe(false);
+    const stillVp8x = riff("VP8X\x0a\0\0\0\0\0\0\0\0\0\0\0\0\0ANIM\0\0\0\0");
+    expect(await isAnimated(stillVp8x)).toBe(false);
+    expect(await isAnimated(riff("VP8X\x0a\0\0\0\x02\0\0\0\0\0\0\0\0\0"))).toBe(true);
+    expect(await isAnimated(riff("VP8X\x0a\0\0\0\x02\0\0\0\0\0\0\0\0"))).toBe(false);
   });
 
   it("ends the scan at a truncated PNG chunk", async () => {
@@ -599,37 +604,49 @@ describe("handleImageOptimization animation detection memory", () => {
   });
 
   it("fetches a source again once detection has read more than it holds", async () => {
+    const animatedGif = new Uint8Array([...GIF_HEADER, ...LARGE_GIF_FRAME, ...GIF_FRAME, 0x3b]);
+    let fetches = 0;
+    let received: Uint8Array | null = null;
+    const response = await handleImageOptimization(imageRequest, {
+      fetchAsset: async () => {
+        fetches += 1;
+        return new Response(chunkedSource(animatedGif, 65_536).body, {
+          status: 200,
+          headers: { "Content-Type": "image/gif" },
+        });
+      },
+      transformImage: async (input) => {
+        received = new Uint8Array(await new Response(input).arrayBuffer());
+        return new Response("transformed", { headers: { "Content-Type": "image/webp" } });
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(fetches).toBe(2);
+    expect(received).toBeNull();
+    expect(sameBytes(new Uint8Array(await response.arrayBuffer()), animatedGif)).toBe(true);
+  });
+
+  it("streams a large still WebP to the optimizer from one fetch", async () => {
     const stillWebp = new Uint8Array(3_000_000);
     stillWebp.set(STATIC_WEBP);
-    const animatedGif = new Uint8Array([...GIF_HEADER, ...LARGE_GIF_FRAME, ...GIF_FRAME, 0x3b]);
-    for (const [bytes, contentType, animated] of [
-      [stillWebp, "image/webp", false],
-      [animatedGif, "image/gif", true],
-    ] as const) {
-      let fetches = 0;
-      let received: Uint8Array | null = null;
-      const response = await handleImageOptimization(imageRequest, {
-        fetchAsset: async () => {
-          fetches += 1;
-          return new Response(chunkedSource(bytes, 65_536).body, {
-            status: 200,
-            headers: { "Content-Type": contentType },
-          });
-        },
-        transformImage: async (input) => {
-          received = new Uint8Array(await new Response(input).arrayBuffer());
-          return new Response("transformed", { headers: { "Content-Type": "image/webp" } });
-        },
-      });
-      expect(response.status, contentType).toBe(200);
-      expect(fetches, contentType).toBe(2);
-      if (animated) {
-        expect(received, contentType).toBeNull();
-        expect(sameBytes(new Uint8Array(await response.arrayBuffer()), bytes)).toBe(true);
-      } else {
-        expect(sameBytes(received, bytes), contentType).toBe(true);
-      }
-    }
+    let fetches = 0;
+    let received: Uint8Array | null = null;
+    const response = await handleImageOptimization(imageRequest, {
+      fetchAsset: async () => {
+        fetches += 1;
+        return new Response(chunkedSource(stillWebp, 65_536).body, {
+          status: 200,
+          headers: { "Content-Type": "image/webp" },
+        });
+      },
+      transformImage: async (input) => {
+        received = new Uint8Array(await new Response(input).arrayBuffer());
+        return new Response("transformed", { headers: { "Content-Type": "image/webp" } });
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(fetches).toBe(1);
+    expect(sameBytes(received, stillWebp)).toBe(true);
   });
 });
 

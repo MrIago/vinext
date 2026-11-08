@@ -4,15 +4,21 @@
  * Next.js serves an animated GIF, PNG (APNG) or WebP unoptimized rather than
  * flattening it to its first frame. This is a port of the `is-animated`
  * package Next.js compiles in (next/dist/compiled/is-animated, MIT, Józef
- * Sokołowski), which `imageOptimizer` in
- * packages/next/src/server/image-optimizer.ts calls on the upstream bytes.
+ * Sokołowski, version 3 since https://github.com/vercel/next.js/pull/101173),
+ * which `imageOptimizerTransform` in
+ * packages/next/src/server/image-optimizer/transform.ts calls on the upstream
+ * bytes for GIF, PNG and WebP sources only. Its new AVIF detection therefore
+ * changes nothing there: Next.js still optimizes an animated AVIF.
  */
 
 import type { ImageSourceReader } from "./image-source-reader.js";
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const WEBP_FOURCC = [0x57, 0x45, 0x42, 0x50]; // "WEBP"
-const WEBP_ANIM_CHUNK = [0x41, 0x4e, 0x49, 0x4d]; // "ANIM"
+const WEBP_VP8X_CHUNK = [0x56, 0x50, 0x38, 0x58]; // "VP8X"
+const WEBP_ANIMATION_FLAG = 0x02;
+// RIFF header, then the VP8X chunk header and its 10-byte payload.
+const WEBP_VP8X_HEADER_LENGTH = 30;
 
 function bytesAt(bytes: Uint8Array, offset: number, expected: readonly number[]): boolean {
   return expected.every((byte, index) => bytes[offset + index] === byte);
@@ -97,21 +103,18 @@ async function isAnimatedPng(source: ImageSourceReader): Promise<boolean> {
   return hasAnimationControl && hasImageData && hasFrameData;
 }
 
-/** Bytes of a WebP source searched per read. */
-const WEBP_SCAN_STEP = 65_536;
-
-/** Like is-animated, any `ANIM` in a WebP source marks it animated. */
+/**
+ * Like is-animated 3, a WebP is animated when it opens with a `VP8X` chunk
+ * whose flags set the animation bit. is-animated 2 took any `ANIM` bytes
+ * anywhere in the file, so a still image's pixel data could match.
+ */
 async function isAnimatedWebp(source: ImageSourceReader): Promise<boolean> {
-  const first = WEBP_ANIM_CHUNK[0];
-  // Each read overlaps the next by all but one byte of `ANIM`.
-  const readLength = WEBP_SCAN_STEP + WEBP_ANIM_CHUNK.length - 1;
-  for (let start = 0; ; start += WEBP_SCAN_STEP) {
-    const bytes = await source.bytes(start, readLength);
-    for (let offset = 0; offset < bytes.length; offset++) {
-      if (bytes[offset] === first && bytesAt(bytes, offset, WEBP_ANIM_CHUNK)) return true;
-    }
-    if (bytes.length < readLength) return false;
-  }
+  const header = await source.bytes(0, WEBP_VP8X_HEADER_LENGTH);
+  return (
+    header.byteLength >= WEBP_VP8X_HEADER_LENGTH &&
+    bytesAt(header, 12, WEBP_VP8X_CHUNK) &&
+    (header[20] & WEBP_ANIMATION_FLAG) !== 0
+  );
 }
 
 /**
