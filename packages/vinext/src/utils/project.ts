@@ -292,6 +292,32 @@ export function formatMissingCloudflarePluginError(options: {
   );
 }
 
+/**
+ * Error for an App Router build whose cloudflare() plugin is not bound to the
+ * RSC environment. Without `viteEnvironment: { name: "rsc", ... }` the plugin
+ * creates its own Worker environment (named after the Wrangler worker), the
+ * RSC entry is bundled there without @vitejs/plugin-rsc, and Rolldown fails
+ * much later on `virtual:vite-rsc/encryption-key`.
+ */
+export function formatCloudflareViteEnvironmentError(options: {
+  workerEnvironments: readonly string[];
+  configFile?: string;
+}): string {
+  const configRef = options.configFile ? options.configFile : "your Vite config";
+  const where =
+    options.workerEnvironments.length > 0
+      ? `cloudflare() runs the Worker in the ${options.workerEnvironments.map((name) => `"${name}"`).join(", ")} environment, not "rsc".`
+      : 'cloudflare() is not running the "rsc" environment.';
+  return (
+    `[vinext] App Router on Cloudflare Workers needs cloudflare() bound to the RSC environment.\n\n` +
+    `  ${where}\n` +
+    `  Update the cloudflare() call in ${configRef}:\n\n` +
+    `    cloudflare({\n` +
+    `      viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },\n` +
+    `    })`
+  );
+}
+
 export type ProjectInfo = {
   root: string;
   isAppRouter: boolean;
