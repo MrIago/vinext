@@ -177,13 +177,19 @@ async function start() {
   console.log(`\n  vinext start  (port ${port})\n`);
 
   const { startProdServer } = (await import(/* @vite-ignore */ "./server/prod-server.js")) as {
-    startProdServer: (opts: { port: number; host: string; outDir: string }) => Promise<unknown>;
+    startProdServer: (opts: {
+      port: number;
+      host: string;
+      outDir: string;
+      gracefulShutdown: boolean;
+    }) => Promise<unknown>;
   };
 
   await startProdServer({
     port,
     host,
     outDir: path.resolve(process.cwd(), "dist"),
+    gracefulShutdown: true,
   });
 }
 

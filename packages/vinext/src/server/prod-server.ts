@@ -105,6 +105,7 @@ import {
   readTrustedPrerenderRouteParamsFromHeaders,
   serializePrerenderRouteParamsHeader,
 } from "./prerender-route-params.js";
+import { installGracefulShutdown } from "./graceful-shutdown.js";
 import { installSocketErrorBackstop } from "./socket-error-backstop.js";
 import {
   trustProxy,
@@ -324,6 +325,12 @@ export type ProdServerOptions = {
   purpose?: "prerender";
   /** Suppress the startup log for internal child-process servers. */
   silent?: boolean;
+  /**
+   * Close the server on SIGINT/SIGTERM and exit once in-flight requests
+   * finish, like `next start` (default: false). Set by `vinext start` and
+   * the standalone entry; left off for in-process callers (prerender, tests).
+   */
+  gracefulShutdown?: boolean;
 };
 
 /**
@@ -1507,6 +1514,7 @@ export async function startProdServer(options: ProdServerOptions = {}) {
     noCompression = false,
     purpose,
     silent = false,
+    gracefulShutdown = false,
   } = options;
 
   if (purpose === "prerender") {
@@ -1538,29 +1546,30 @@ export async function startProdServer(options: ProdServerOptions = {}) {
     process.exit(1);
   }
 
-  if (isAppRouter) {
-    return startAppRouterServer({
-      port,
-      host,
-      clientDir,
-      serverDir,
-      rscEntryPath,
-      compress,
-      purpose,
-      silent,
-    });
-  }
+  const started = isAppRouter
+    ? await startAppRouterServer({
+        port,
+        host,
+        clientDir,
+        serverDir,
+        rscEntryPath,
+        compress,
+        purpose,
+        silent,
+      })
+    : await startPagesRouterServer({
+        port,
+        host,
+        clientDir,
+        serverDir,
+        serverEntryPath,
+        compress,
+        purpose,
+        silent,
+      });
 
-  return startPagesRouterServer({
-    port,
-    host,
-    clientDir,
-    serverDir,
-    serverEntryPath,
-    compress,
-    purpose,
-    silent,
-  });
+  if (gracefulShutdown) installGracefulShutdown(started.server);
+  return started;
 }
 
 // ─── App Router Production Server ─────────────────────────────────────────────
