@@ -230,6 +230,11 @@ import {
   hasWranglerConfig,
 } from "./utils/project.js";
 import {
+  findWranglerConfigFile,
+  formatWeakRefCompatWarning,
+  readWranglerCompatibility,
+} from "./utils/wrangler-compat.js";
+import {
   hasReactCompilerPlugin,
   isReactCompilerPlugin,
   isReactCompilerRequested,
@@ -5003,6 +5008,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               configFile: config.configFile,
             }),
           );
+        }
+
+        // Warn early when the Wrangler compatibility_date predates WeakRef in
+        // workerd. React's flight client needs it, so otherwise every App
+        // Router request 500s with an opaque ReferenceError. (#1315)
+        if (hasCloudflarePlugin && hasAppDir) {
+          const compat = readWranglerCompatibility(root);
+          const warning =
+            compat && formatWeakRefCompatWarning(compat, findWranglerConfigFile(root));
+          if (warning) config.logger.warn(warning);
         }
       },
 
