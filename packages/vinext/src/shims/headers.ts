@@ -552,6 +552,31 @@ export function applyMiddlewareRequestHeaders(middlewareResponseHeaders: Headers
 /** Methods on `Headers` that mutate state. Hoisted to module scope — static. */
 const _HEADERS_MUTATING_METHODS = new Set(["set", "delete", "append"]);
 
+/**
+ * Build the target for a Proxy that stands in for a Headers object.
+ *
+ * Node's util.inspect unwraps a Proxy and calls the target's
+ * `[nodejs.util.inspect.custom]` with the *proxy* as `this`. With a real
+ * Headers as the target that is undici's method, whose `this.#headersList`
+ * brand check throws on the proxy. This is not hypothetical: inspecting any
+ * promise prints its AsyncLocalStorage store, so app code doing
+ * `console.log(new Promise(() => {}))` reaches the request context and the
+ * throw aborts module evaluation, failing every page.
+ *
+ * The target is therefore an empty object with the Headers prototype (so
+ * `instanceof Headers` still holds) and an own inspect hook that prints the
+ * real Headers the proxy currently reads from. The proxy's `get` trap must read
+ * from that source, never from this target.
+ */
+function _headersProxyTarget(getSource: () => Headers): Headers {
+  const target = Object.create(Headers.prototype) as Headers;
+  Object.defineProperty(target, Symbol.for("nodejs.util.inspect.custom"), {
+    value: (_depth: number, options: object, inspect: (value: unknown, opts: object) => string) =>
+      inspect(getSource(), options),
+  });
+  return target;
+}
+
 class ReadonlyHeadersError extends Error {
   constructor() {
     super(
@@ -672,16 +697,19 @@ function _decorateSuspendingRequestApiPromise<T extends object>(
 }
 
 function _sealHeaders(headers: Headers): Headers {
-  return new Proxy(headers, {
-    get(target, prop) {
-      if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
-        throw new ReadonlyHeadersError();
-      }
+  return new Proxy(
+    _headersProxyTarget(() => headers),
+    {
+      get(_target, prop) {
+        if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
+          throw new ReadonlyHeadersError();
+        }
 
-      const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+        const value = Reflect.get(headers, prop, headers);
+        return typeof value === "function" ? value.bind(headers) : value;
+      },
     },
-  }) as Headers;
+  );
 }
 
 function _wrapMutableCookies(cookies: RequestCookies): RequestCookies {
@@ -784,28 +812,32 @@ export function headersContextFromRequest(
   // `_mutable` holds the materialised copy once a write is needed.
   let _mutable: Headers | null = null;
 
-  const headersProxy = new Proxy(request.headers, {
-    get(target, prop: string | symbol) {
-      // Route to the materialised copy if it exists.
-      const src = _mutable ?? target;
+  const target = request.headers;
+  const headersProxy = new Proxy(
+    _headersProxyTarget(() => _mutable ?? target),
+    {
+      get(_target, prop: string | symbol) {
+        // Route to the materialised copy if it exists.
+        const src = _mutable ?? target;
 
-      // Intercept mutating methods: materialise on first write.
-      if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
-        return (...args: unknown[]) => {
-          if (!_mutable) {
-            _mutable = new Headers(target);
-          }
-          return (_mutable[prop as "set" | "delete" | "append"] as (...a: unknown[]) => unknown)(
-            ...args,
-          );
-        };
-      }
+        // Intercept mutating methods: materialise on first write.
+        if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
+          return (...args: unknown[]) => {
+            if (!_mutable) {
+              _mutable = new Headers(target);
+            }
+            return (_mutable[prop as "set" | "delete" | "append"] as (...a: unknown[]) => unknown)(
+              ...args,
+            );
+          };
+        }
 
-      // Non-mutating method or property: bind to current source.
-      const value = Reflect.get(src, prop, src);
-      return typeof value === "function" ? value.bind(src) : value;
+        // Non-mutating method or property: bind to current source.
+        const value = Reflect.get(src, prop, src);
+        return typeof value === "function" ? value.bind(src) : value;
+      },
     },
-  }) as Headers;
+  );
 
   // ---------------------------------------------------------------------------
   // Lazy cookie map
