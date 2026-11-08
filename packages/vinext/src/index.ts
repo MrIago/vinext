@@ -1661,6 +1661,18 @@ for (const [specifier, definition] of Object.entries(_publicNextShimMap)) {
 }
 _reactServerShims.set("next/dist/client/components/navigation", "navigation");
 
+// Next.js warns once when a Server Component imports next/head, which is a
+// noop in the App Router (next-flight-loader/index.ts). Only Server
+// Components resolve shims in the RSC environment.
+let _warnedNextHeadInServerComponent = false;
+function warnNextHeadInServerComponent(): void {
+  if (_warnedNextHeadInServerComponent) return;
+  _warnedNextHeadInServerComponent = true;
+  console.warn(
+    "Warning: You're using `next/head` inside the `app` directory, please migrate to the Metadata API. See https://nextjs.org/docs/app/building-your-application/upgrading/app-router-migration#step-3-migrating-nexthead for more details.",
+  );
+}
+
 const clientManualChunks = createClientManualChunks(_shimsDir);
 const clientCodeSplittingConfig = createClientCodeSplittingConfig(clientManualChunks);
 const appClientManualChunks = createClientManualChunks(_shimsDir, true);
@@ -5260,6 +5272,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           // See https://github.com/cloudflare/vinext/issues/834
           const reactServerShim = _reactServerShims.get(cleanId);
           if (reactServerShim !== undefined) {
+            if (reactServerShim === "head" && this.environment?.name === "rsc") {
+              warnNextHeadInServerComponent();
+            }
             const shimName =
               this.environment?.name === "rsc"
                 ? `${reactServerShim}.react-server`
