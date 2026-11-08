@@ -226,6 +226,7 @@ import { proxyExternalRequest } from "./config/config-matchers.js";
 import { encodeMiddlewareRequestHeaders } from "./utils/middleware-request-headers.js";
 import {
   detectPackageManager,
+  formatCloudflareViteEnvironmentError,
   formatMissingCloudflarePluginError,
   hasWranglerConfig,
 } from "./utils/project.js";
@@ -5024,6 +5025,33 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           const warning =
             compat && formatWeakRefCompatWarning(compat, findWranglerConfigFile(root));
           if (warning) config.logger.warn(warning);
+        }
+
+        // App Router needs cloudflare() to run the Worker in the "rsc"
+        // environment. A bare cloudflare() creates its own environment named
+        // after the Wrangler worker, so the RSC entry is bundled without
+        // @vitejs/plugin-rsc and Rolldown fails much later on
+        // `virtual:vite-rsc/encryption-key`. The plugin marks every Worker
+        // environment it owns with its `cloudflare:*` builtins; if it owns
+        // some but not "rsc", fail now with the exact fix. Skip when it owns
+        // none we can see, so an unfamiliar plugin version is never blocked.
+        if (
+          config.command === "build" &&
+          hasCloudflarePlugin &&
+          hasAppDir &&
+          !options.disableAppRouter
+        ) {
+          const workerEnvironments = Object.entries(config.environments)
+            .filter(([, env]) => env.resolve?.builtins?.includes("cloudflare:workers"))
+            .map(([name]) => name);
+          if (workerEnvironments.length > 0 && !workerEnvironments.includes("rsc")) {
+            throw new Error(
+              formatCloudflareViteEnvironmentError({
+                workerEnvironments,
+                configFile: config.configFile,
+              }),
+            );
+          }
         }
       },
 

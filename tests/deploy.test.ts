@@ -34,6 +34,7 @@ import {
   detectPackageManagerName,
   detectProject,
   findInNodeModules,
+  formatCloudflareViteEnvironmentError,
   formatMissingCloudflarePluginError,
   getMissingDeps,
   hasWranglerConfig,
@@ -3249,6 +3250,24 @@ describe("formatMissingCloudflarePluginError", () => {
   it("always starts with the [vinext] prefix", () => {
     const msg = formatMissingCloudflarePluginError({ isAppRouter: false });
     expect(msg).toMatch(/^\[vinext\] Missing @cloudflare\/vite-plugin/);
+  });
+});
+
+describe("formatCloudflareViteEnvironmentError", () => {
+  it("names the environment cloudflare() picked and the exact fix", () => {
+    const msg = formatCloudflareViteEnvironmentError({
+      workerEnvironments: ["my_app"],
+      configFile: "/project/vite.config.ts",
+    });
+    expect(msg).toMatch(/^\[vinext\] /);
+    expect(msg).toContain('"my_app" environment, not "rsc"');
+    expect(msg).toContain("/project/vite.config.ts");
+    expect(msg).toContain('viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] }');
+  });
+
+  it("falls back to 'your Vite config' without a configFile", () => {
+    const msg = formatCloudflareViteEnvironmentError({ workerEnvironments: [] });
+    expect(msg).toContain("your Vite config");
   });
 });
 
