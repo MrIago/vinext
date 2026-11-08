@@ -28,6 +28,7 @@ import {
 import { runPrerender } from "vinext/internal/build/run-prerender";
 import { printBuildReport } from "vinext/internal/build/report";
 import { loadDotenv } from "vinext/internal/config/dotenv";
+import { validateMode } from "./previews-deploy.js";
 import {
   findVinextNextConfigInPlugins,
   loadNextConfig,
@@ -125,6 +126,8 @@ export type DeployOptions = {
   target?: { type: "preview"; name?: string };
   /** Wrangler environment name from wrangler.jsonc env.<name> */
   env?: string;
+  /** Vite mode (and dotenv files) for Wrangler config projects; cf projects select it with env. */
+  mode?: string;
   /** Custom project name for the Worker */
   name?: string;
   /** Wrangler config path, relative to root unless absolute */
@@ -304,6 +307,7 @@ const deployArgOptions = {
   help: { type: "boolean", short: "h", default: false },
   preview: { type: "boolean", default: false },
   env: { type: "string" },
+  mode: { type: "string" },
   name: { type: "string" },
   config: { type: "string" },
   "vite-config": { type: "string" },
@@ -413,6 +417,7 @@ export function parseDeployArgs(args: string[]) {
     help: values.help,
     preview: values.preview,
     env: values.env?.trim() || undefined,
+    mode: values.mode === undefined ? undefined : validateMode(values.mode),
     name: values.name?.trim() || undefined,
     config: values.config?.trim() || undefined,
     viteConfig: values["vite-config"]?.trim() || undefined,
@@ -605,8 +610,11 @@ async function loadProjectWranglerApi(root: string): Promise<ProjectWranglerApi>
 export function resolveViteBuildMode(
   deploymentTool: DeploymentTool,
   env: string | undefined,
+  mode?: string,
 ): string {
-  return deploymentTool === "cf" ? (env ?? "production") : "production";
+  // cf treats the environment as the Vite mode. Wrangler environments are deploy
+  // targets only, so Wrangler projects pick the Vite mode separately with --mode.
+  return deploymentTool === "cf" ? (env ?? "production") : (mode ?? "production");
 }
 
 async function loadDeployViteConfigMetadata(
@@ -2217,7 +2225,12 @@ export async function deploy(options: DeployOptions): Promise<void> {
       "--config is not supported for cloudflare.config.ts projects. cf always uses cloudflare.config.ts in the project root; select a mode with --env instead.",
     );
   }
-  const viteMode = resolveViteBuildMode(deploymentTool, deployEnv);
+  if (deploymentTool === "cf" && options.mode !== undefined) {
+    throw new Error(
+      "--mode is not supported for cloudflare.config.ts projects. Select the mode with --env instead.",
+    );
+  }
+  const viteMode = resolveViteBuildMode(deploymentTool, deployEnv, options.mode);
   // Undefined keeps Vite's default vite.config.* lookup in the root.
   const viteConfigFile = options.viteConfig ? path.resolve(root, options.viteConfig) : undefined;
   const wranglerFallbackEnv = deploymentTool === "cf" ? undefined : deployEnv;

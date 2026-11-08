@@ -50,6 +50,7 @@ async function deployCommand(): Promise<void> {
     root: process.cwd(),
     preview: parsed.preview,
     env: parsed.env,
+    mode: parsed.mode,
     config: parsed.config,
     viteConfig: parsed.viteConfig,
     skipBuild: parsed.skipBuild,

@@ -4,12 +4,14 @@ export function formatDeployHelp(deploymentTool: DeploymentTool): string {
   // cloudflare.config.ts projects reject these Wrangler-only flags.
   const isWrangler = deploymentTool === "wrangler";
   const wranglerOptions = isWrangler
-    ? `    --name <name>            Custom Worker name
+    ? `    --mode <mode>            Vite mode and .env files to build with (default: production)
+    --name <name>            Custom Worker name
     --config <path>          Wrangler config path (default: wrangler.jsonc/json/toml)
 `
     : "";
   const wranglerExamples = isWrangler
-    ? `    vinext-cloudflare deploy --config dist/server/wrangler.json        Deploy using a generated Wrangler config
+    ? `    vinext-cloudflare deploy --env staging --mode staging              Deploy to Wrangler env staging with .env.staging
+    vinext-cloudflare deploy --config dist/server/wrangler.json        Deploy using a generated Wrangler config
     vinext-cloudflare deploy --name my-app                             Deploy with a custom Worker name
 `
     : "";
