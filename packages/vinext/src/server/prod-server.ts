@@ -1485,6 +1485,38 @@ function waitForNodeResponseCompletion(res: ServerResponse): Promise<void> {
  * Automatically detects whether the build is App Router (dist/server/index.js) or
  * Pages Router (dist/server/entry.js) and configures the appropriate handler.
  */
+/**
+ * Explain why `vinext start` found nothing to serve. A Cloudflare build emits
+ * the Worker to `<outDir>/<worker-name>/` beside a `wrangler.json`, which the
+ * Node server cannot run: it must run on workerd, so point at the commands that
+ * do that instead of asking for a build that already happened.
+ */
+export function describeMissingBuildOutput(resolvedOutDir: string, outDir: string): string[] {
+  let workerConfig: string | undefined;
+  try {
+    for (const entry of fs.readdirSync(resolvedOutDir, { withFileTypes: true })) {
+      if (
+        entry.isDirectory() &&
+        fs.existsSync(path.join(resolvedOutDir, entry.name, "wrangler.json"))
+      ) {
+        workerConfig = path.join(outDir, entry.name, "wrangler.json");
+        break;
+      }
+    }
+  } catch {
+    // No outDir at all: fall through to the plain message.
+  }
+  if (!workerConfig) {
+    return [`[vinext] No build output found in ${outDir}`, "Run `vite build` first."];
+  }
+  return [
+    `[vinext] ${outDir} holds a Cloudflare Workers build (${workerConfig}).`,
+    "`vinext start` runs the Node.js server and cannot serve it. Run the Worker on workerd instead:",
+    "  vite preview",
+    `  or: wrangler dev --config ${workerConfig}`,
+  ];
+}
+
 export async function startProdServer(options: ProdServerOptions = {}) {
   // Process-level error backstop. Listener install is idempotent via the
   // Symbol.for guard inside installSocketErrorBackstop, so index.ts may
@@ -1541,8 +1573,7 @@ export async function startProdServer(options: ProdServerOptions = {}) {
   const isAppRouter = fs.existsSync(rscEntryPath);
 
   if (!isAppRouter && !fs.existsSync(serverEntryPath)) {
-    console.error(`[vinext] No build output found in ${outDir}`);
-    console.error("Run `vite build` first.");
+    for (const line of describeMissingBuildOutput(resolvedOutDir, outDir)) console.error(line);
     process.exit(1);
   }
 
