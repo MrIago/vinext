@@ -1485,14 +1485,23 @@ export async function connection(): Promise<void> {
 
 /**
  * URLPattern re-export — used in middleware for route matching.
- * Available natively in Node 20+, Cloudflare Workers, Deno.
- * Falls back to urlpattern-polyfill if the global is not available.
+ *
+ * Like Next.js, this re-exports the runtime's global URLPattern. It is native
+ * in Cloudflare Workers, Deno and Node.js >= 23.8. On older Node (vinext
+ * supports Node 22) there is no global, so the fallback is a class whose
+ * constructor throws an actionable error. It must be a class: an arrow
+ * function fallback makes `new URLPattern()` fail with the opaque
+ * "URLPattern is not a constructor" before any message can be shown.
  */
-export const URLPattern: typeof globalThis.URLPattern =
-  globalThis.URLPattern ??
-  (() => {
+class MissingURLPattern {
+  constructor() {
     throw new Error(
-      "URLPattern is not available in this runtime. " +
-        "Install the `urlpattern-polyfill` package or upgrade to Node 20+.",
+      "URLPattern is not available in this runtime. It is built into Node.js >= 23.8 " +
+        "and Cloudflare Workers; on older Node.js, load a polyfill such as " +
+        "`urlpattern-polyfill` before your middleware runs.",
     );
-  });
+  }
+}
+
+export const URLPattern: typeof globalThis.URLPattern =
+  globalThis.URLPattern ?? (MissingURLPattern as unknown as typeof globalThis.URLPattern);
