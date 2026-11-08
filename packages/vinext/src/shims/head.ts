@@ -7,7 +7,7 @@
  * - On the client: reduces all mounted <Head> instances into one deduped
  *   document.head projection and applies it with DOM manipulation.
  */
-import React, { useEffect, useRef, Children, isValidElement } from "react";
+import React, { useContext, useEffect, useRef, Children, isValidElement } from "react";
 
 type HeadProps = {
   children?: React.ReactNode;
@@ -594,9 +594,27 @@ export function _syncClientHead(): void {
   }
 }
 
+// --- Head manager context ---
+// Mirrors Next.js `HeadManagerContext`. The App Router provides
+// `{ appDir: true }` (app-render.tsx and app-index.tsx in Next.js), which
+// leaves `<Head>` with nothing to register into, so it is a noop there: App
+// Router titles come from the Metadata API. Stored on globalThis so every
+// module instance shares one context.
+
+export type HeadManagerContextValue = { appDir?: boolean } | null;
+
+const _HEAD_MANAGER_CTX_KEY = Symbol.for("vinext.head.managerContext");
+const _headGlobal = globalThis as unknown as Record<PropertyKey, unknown>;
+export const HeadManagerContext = (_headGlobal[_HEAD_MANAGER_CTX_KEY] ??=
+  React.createContext<HeadManagerContextValue>(null)) as React.Context<HeadManagerContextValue>;
+
+/** Context value the App Router provides, matching Next.js. @internal */
+export const APP_DIR_HEAD_MANAGER: HeadManagerContextValue = { appDir: true };
+
 // --- Component ---
 
 function Head({ children }: HeadProps): React.ReactElement {
+  const isAppDir = useContext(HeadManagerContext)?.appDir === true;
   const headInstanceIdRef = useRef<symbol | null>(null);
   if (headInstanceIdRef.current === null) {
     headInstanceIdRef.current = Symbol("vinext-head");
@@ -604,24 +622,26 @@ function Head({ children }: HeadProps): React.ReactElement {
 
   // SSR path: collect elements for later injection
   if (typeof window === "undefined") {
-    _getSSRHeadChildren().push(children);
+    if (!isAppDir) _getSSRHeadChildren().push(children);
     return React.createElement(React.Fragment);
   }
 
   // Client path: update the shared head projection after hydration.
   // oxlint-disable-next-line react-hooks/rules-of-hooks
   useEffect(() => {
+    if (isAppDir) return;
     const instanceId = headInstanceIdRef.current!;
     return () => {
       _removeClientHeadInstance(instanceId);
     };
-  }, []);
+  }, [isAppDir]);
 
   // Keep updates separate from unmount cleanup. A children-dependent cleanup
   // would remove the old projection before every render, so even unchanged
   // tags would be recreated at the end of <head> during Fast Refresh.
   // oxlint-disable-next-line react-hooks/rules-of-hooks
   useEffect(() => {
+    if (isAppDir) return;
     const instanceId = headInstanceIdRef.current!;
     // Next.js removes the previous props.children registration and re-adds the
     // updated one, making the most recently updated Head instance win dedupe.

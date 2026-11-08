@@ -20,6 +20,7 @@ import Head, {
   _removeClientHeadInstance,
   _updateClientHeadInstance,
   isEqualHeadNode,
+  HeadManagerContext,
 } from "../packages/vinext/src/shims/head.js";
 
 // ─── SSR rendering (mirrors Next.js test/unit/next-head-rendering.test.ts) ──
@@ -49,6 +50,32 @@ describe("Rendering next/head", () => {
     );
     // Head always returns null — elements are collected, not rendered inline
     expect(html).toBe("");
+  });
+});
+
+// ─── App Router ignores next/head ───────────────────────────────────────
+
+describe("Head inside the App Router", () => {
+  beforeEach(() => {
+    resetSSRHead();
+  });
+
+  // Next.js aliases `next/head` to a noop component for every App Router
+  // layer and provides `HeadManagerContext` as `{ appDir: true }` (no
+  // `mountedInstances`), so `<Head>` never touches the document there.
+  // Titles in the App Router come from the Metadata API.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/create-compiler-aliases.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
+  it("does not collect elements when rendered under the App Router", () => {
+    const html = ReactDOMServer.renderToString(
+      React.createElement(
+        HeadManagerContext.Provider,
+        { value: { appDir: true } },
+        React.createElement(Head, null, React.createElement("title", null, "From next/head")),
+      ),
+    );
+    expect(html).toBe("");
+    expect(getSSRHeadHTML()).not.toContain("From next/head");
   });
 });
 

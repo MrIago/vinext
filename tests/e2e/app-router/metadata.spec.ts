@@ -156,3 +156,19 @@ test.describe("Metadata Routes", () => {
     expect(json).toHaveProperty("name");
   });
 });
+
+// Next.js aliases `next/head` to a noop in the App Router, so only the
+// Metadata API sets the title there.
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/build/create-compiler-aliases.ts
+test.describe("next/head in the App Router", () => {
+  test("is ignored in favor of metadata", async ({ page }) => {
+    await page.goto(`${BASE}/next-head-ignored`);
+    await expect(page.locator("#next-head-ignored")).toBeVisible();
+    // Give the client effects time to run after hydration.
+    await page.waitForFunction(() => document.readyState === "complete");
+    await page.waitForTimeout(300);
+
+    await expect(page).toHaveTitle("From metadata");
+    await expect(page.locator('meta[name="description"][content="from next/head"]')).toHaveCount(0);
+  });
+});
