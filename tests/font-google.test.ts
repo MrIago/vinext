@@ -7,8 +7,6 @@ import { server } from "./_msw/server.js";
 import vinext from "../packages/vinext/src/index.js";
 import {
   parseStaticObjectLiteral,
-  _findBalancedObject as findBalancedObject,
-  _findCallEnd as findCallEnd,
   _rewriteCachedFontCssToServedUrls as rewriteCachedFontCssToServedUrls,
 } from "../packages/vinext/src/plugins/fonts.js";
 import type { Plugin } from "vite-plus";
@@ -685,6 +683,26 @@ describe("vinext:google-fonts plugin", () => {
     expect(result.code).toContain("virtual:vinext-google-fonts?");
   });
 
+  it("leaves next/font/google import text inside a string untouched", async () => {
+    // A code sample held in a template literal (a docs page, a codegen
+    // template) is not an import. Only the real import may be rewritten.
+    const plugin = getGoogleFontsPlugin();
+    initPlugin(plugin, { command: "serve" });
+    const transform = unwrapHook(plugin.transform);
+    const sample = `import { Roboto } from 'next/font/google'`;
+    const code = [
+      `import { Inter } from 'next/font/google'`,
+      "export const snippet = `",
+      sample,
+      "`",
+      `export { Inter }`,
+    ].join("\n");
+    const result = await transform.call(plugin, code, "/app/layout.tsx");
+    expect(result).not.toBeNull();
+    expect(result.code).toContain("virtual:vinext-google-fonts?fonts=Inter");
+    expect(result.code).toContain(`export const snippet = \`\n${sample}\n\``);
+  });
+
   it("rewrites multi-line bracket re-exports", async () => {
     // Same wrap logic applies to `export { ... } from 'next/font/google'`
     // when the specifier list crosses printWidth. Less common in user code
@@ -1141,7 +1159,7 @@ describe("vinext:google-fonts plugin", () => {
   });
 
   it("self-hosts font calls whose string values contain brace characters", async () => {
-    // Ensures _findBalancedObject doesn't treat '}' inside a string value as
+    // Ensures a '}' inside a string value is not treated as
     // the end of the options object.
     const plugin = getGoogleFontsPlugin();
     const root = path.join(import.meta.dirname, ".test-font-root-brace-string");
@@ -1796,86 +1814,5 @@ describe("parseStaticObjectLiteral", () => {
   it("returns null for non-object expressions", () => {
     const result = parseStaticObjectLiteral(`"just a string"`);
     expect(result).toBeNull();
-  });
-});
-
-// ── _findBalancedObject / _findCallEnd unit tests ─────────────
-
-describe("_findBalancedObject", () => {
-  it("returns [start, end] for a simple flat object", () => {
-    const code = `{ a: 1 }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("handles nested objects", () => {
-    const code = `{ outer: { inner: 1 } }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("stops at the correct closing brace, ignoring braces in single-quoted strings", () => {
-    const code = `{ key: 'val }' }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("stops at the correct closing brace, ignoring braces in double-quoted strings", () => {
-    const code = `{ key: "font {bold}" }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("handles backslash escapes inside strings", () => {
-    const code = String.raw`{ key: "a \"quoted\" {value}" }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("ignores braces inside template literals", () => {
-    const code = "{ key: `val {x}` }";
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("ignores braces inside template literal ${...} interpolations", () => {
-    // The '}' inside ${nested} must not end the string scan prematurely
-    const val = "val ${nested}";
-    const code = "{ key: `" + val + "` }";
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("returns null when no opening brace is found", () => {
-    expect(findBalancedObject(`foo`, 0)).toBeNull();
-  });
-
-  it("returns null for an unbalanced object", () => {
-    expect(findBalancedObject(`{ a: 1`, 0)).toBeNull();
-  });
-
-  it("skips leading whitespace before the opening brace", () => {
-    const code = `   { a: 1 }`;
-    const result = findBalancedObject(code, 0);
-    expect(result).not.toBeNull();
-    expect(result![0]).toBe(3); // points to '{'
-    expect(result![1]).toBe(code.length);
-  });
-});
-
-describe("_findCallEnd", () => {
-  it("returns index after ')' when it immediately follows objEnd", () => {
-    const code = `foo({})`;
-    // '{}' spans indices 4-5; objEnd (just after '}') is 6; ')' is at 6
-    expect(findCallEnd(code, 6)).toBe(7);
-  });
-
-  it("skips whitespace before ')'", () => {
-    const code = `foo({}\n)`;
-    // objEnd is 6; whitespace at 6; ')' at 7
-    expect(findCallEnd(code, 6)).toBe(code.length);
-  });
-
-  it("returns null when next non-whitespace is not ')'", () => {
-    const code = `foo({}, extra)`;
-    // objEnd is 6; next non-whitespace is ',' not ')'
-    expect(findCallEnd(code, 6)).toBeNull();
-  });
-
-  it("returns null at end of string", () => {
-    expect(findCallEnd(`{`, 1)).toBeNull();
   });
 });
