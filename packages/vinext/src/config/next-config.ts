@@ -410,6 +410,12 @@ export type NextConfig = {
   reactStrictMode?: boolean | null;
   /** Build output mode: 'export' for full static export, 'standalone' for single server */
   output?: "export" | "standalone";
+  /**
+   * Next.js build directory (default `.next`). vinext builds into `dist/`, so
+   * the option only matters with `output: "export"`, where a custom value names
+   * the export destination, like Next.js.
+   */
+  distDir?: string;
   /** File extensions treated as routable pages/routes (Next.js pageExtensions) */
   pageExtensions?: string[];
   /** Turbopack-compatible module resolution options. */
@@ -571,6 +577,8 @@ export type ResolvedNextConfig = {
   skipProxyUrlNormalize: boolean;
   typescript: { tsconfigPath?: string };
   output: "" | "export" | "standalone";
+  /** Configured `distDir`, as written by the user (default `.next`). */
+  distDir: string;
   pageExtensions: string[];
   resolveExtensions: string[] | null;
   serverResolveExtensions: string[] | null;
@@ -2019,6 +2027,7 @@ export async function resolveNextConfig(
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",
+      distDir: ".next",
       pageExtensions: normalizePageExtensions(),
       resolveExtensions: null,
       serverResolveExtensions: null,
@@ -2457,6 +2466,7 @@ export async function resolveNextConfig(
         ? { tsconfigPath: config.typescript.tsconfigPath }
         : {},
     output: output === "export" || output === "standalone" ? output : "",
+    distDir: typeof config.distDir === "string" && config.distDir.trim() ? config.distDir : ".next",
     pageExtensions,
     resolveExtensions: resolveExtensions ?? webpackProbe.resolveExtensions,
     serverResolveExtensions: resolveExtensions ?? webpackProbe.serverResolveExtensions,

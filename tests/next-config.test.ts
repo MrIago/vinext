@@ -2836,6 +2836,7 @@ describe("detectNextIntlConfig", () => {
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",
+      distDir: ".next",
       pageExtensions: ["tsx", "ts", "jsx", "js"],
       resolveExtensions: null,
       serverResolveExtensions: null,
