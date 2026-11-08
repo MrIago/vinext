@@ -196,6 +196,51 @@ describe("CJS interop (Pages Router)", () => {
   });
 });
 
+describe("CJS interop (Pages Router node_modules)", () => {
+  let root: string;
+  let server: ViteDevServer;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    root = await mkdtemp(path.join(import.meta.dirname, ".pages-cjs-node-modules-"));
+    await Promise.all([
+      writeFixtureFile(root, "package.json", JSON.stringify({ private: true, type: "module" })),
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-node-package/package.json",
+        JSON.stringify({ name: "cjs-node-package", version: "1.0.0", main: "index.js" }),
+      ),
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-node-package/index.js",
+        `const core = require("./core.js");\nmodule.exports = { value: core.value };`,
+      ),
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-node-package/core.js",
+        `module.exports = { value: "from-cjs-package" };`,
+      ),
+      writeFixtureFile(
+        root,
+        "pages/index.tsx",
+        `import dep from "cjs-node-package";\nexport default function Page() { return <div data-testid="cjs-node-modules">{dep.value}</div>; }`,
+      ),
+    ]);
+    ({ server, baseUrl } = await startFixtureServer(root));
+  }, 60000);
+
+  afterAll(async () => {
+    await server?.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("renders a page that imports a CommonJS package from node_modules", async () => {
+    const { res, html } = await fetchHtml(baseUrl, "/");
+    expect(res.status).toBe(200);
+    expect(visibleTextByTestId(html, "cjs-node-modules")).toBe("from-cjs-package");
+  });
+});
+
 // Ported from Next.js: test/e2e/app-dir/client-module-with-package-type/index.test.ts
 // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/client-module-with-package-type/index.test.ts
 const CONDITIONAL_EXPORT_CASES = [
