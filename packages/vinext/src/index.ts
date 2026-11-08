@@ -5337,13 +5337,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           // See https://github.com/cloudflare/vinext/issues/834
           const reactServerShim = _reactServerShims.get(cleanId);
           if (reactServerShim !== undefined) {
-            if (reactServerShim === "head" && this.environment?.name === "rsc") {
+            // A Pages-only Workers build also names its server environment
+            // "rsc" and renders Pages there, so next/head must stay the real
+            // Pages shim unless the App Router is enabled.
+            const useReactServerShim =
+              this.environment?.name === "rsc" && (reactServerShim !== "head" || hasAppDir);
+            if (reactServerShim === "head" && useReactServerShim) {
               warnNextHeadInServerComponent();
             }
-            const shimName =
-              this.environment?.name === "rsc"
-                ? `${reactServerShim}.react-server`
-                : reactServerShim;
+            const shimName = useReactServerShim
+              ? `${reactServerShim}.react-server`
+              : reactServerShim;
             return this.resolve(resolveShimModulePath(_shimsDir, shimName), importer, {
               ...options,
               skipSelf: true,

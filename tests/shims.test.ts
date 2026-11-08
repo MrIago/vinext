@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -33517,7 +33517,16 @@ describe("vinext shim package-subpath resolution", () => {
   // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/create-compiler-aliases.ts
   // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/webpack/loaders/next-flight-loader/index.ts
   it("resolves next/head to a noop that warns once for Server Components", async () => {
-    const hook = getResolveIdHook();
+    // The noop only applies when the App Router is enabled: a Pages-only
+    // Workers build also renders Pages in the "rsc" environment.
+    const root = await mkdtemp(path.join(os.tmpdir(), "vinext-next-head-rsc-"));
+    await mkdir(path.join(root, "app"));
+    const plugins = vinext() as Plugin[];
+    const configPlugin = plugins.find((plugin) => plugin.name === "vinext:config");
+    const configHook = configPlugin?.config;
+    const configHandler = typeof configHook === "function" ? configHook : configHook?.handler;
+    await configHandler?.call({} as never, { root }, { command: "serve", mode: "development" });
+    const hook = configPlugin!.resolveId as ResolveIdHook;
     const resolve = viteResolve;
     const expectedHeadShim = toSlash(
       path.resolve(import.meta.dirname, "../packages/vinext/src/shims/head.ts"),
@@ -33542,7 +33551,13 @@ describe("vinext shim package-subpath resolution", () => {
       );
     } finally {
       warn.mockRestore();
+      await rm(root, { recursive: true, force: true });
     }
+
+    // Pages-only: the RSC-named server environment keeps the real shim.
+    await expect(
+      getResolveIdHook().handler.call({ environment: { name: "rsc" }, resolve }, "next/head"),
+    ).resolves.toEqual({ id: `${expectedHeadShim}?v=hash` });
 
     const { default: NoopHead } = await import("../packages/vinext/src/shims/head.react-server.js");
     expect(NoopHead()).toBeNull();
