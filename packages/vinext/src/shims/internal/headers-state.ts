@@ -10,6 +10,7 @@
 import type { RenderRequestApiKind } from "../../server/cache-proof.js";
 import type { HeadersContext } from "../headers.js";
 import { getOrCreateAls } from "./als-registry.js";
+import { createRequestApiInCacheScopeError } from "./cache-scope-messages.js";
 import {
   ensureRenderDynamicLatch,
   getRequestContext,
@@ -249,6 +250,22 @@ function _isInsidePublicUseCache(): boolean {
   return ctx !== null && ctx.variant !== "private";
 }
 
+/**
+ * Request APIs a private cache rejects although it may read cookies() and
+ * headers(): a private cache can run during a runtime prefetch, which isn't a
+ * navigation request, and it can't toggle draft mode.
+ * Ported from Next.js's `private-cache` cases in
+ * packages/next/src/server/request/connection.ts and draft-mode.ts.
+ */
+function _isRejectedInPrivateUseCache(apiName: string): boolean {
+  if (apiName !== "connection()" && !apiName.startsWith("draftMode().")) return false;
+  return _getUseCacheGuardContext()?.variant === "private";
+}
+
+function _isInsideAnyUseCache(): boolean {
+  return _getUseCacheGuardContext() !== null;
+}
+
 function _isInsideUnstableCache(): boolean {
   return _getGlobalCacheScopeStore(_UNSTABLE_CACHE_ALS_KEY) === true;
 }
@@ -260,11 +277,7 @@ export function isInsideAnyCacheScope(): boolean {
 
 /** The error a dynamic request API throws inside a public "use cache". */
 export function createUseCacheAccessError(apiName: string): Error {
-  return new Error(
-    `\`${apiName}\` cannot be called inside "use cache". ` +
-      `If you need this data inside a cached function, call \`${apiName}\` ` +
-      "outside and pass the required data as an argument.",
-  );
+  return createRequestApiInCacheScopeError(apiName, "use cache");
 }
 
 /**
@@ -274,9 +287,19 @@ export function createUseCacheAccessError(apiName: string): Error {
  *
  * @param apiName - The name of the API being called (e.g. "connection()")
  */
-export function throwIfInsideCacheScope(apiName: string): void {
-  if (_isInsidePublicUseCache()) {
-    const error = createUseCacheAccessError(apiName);
+export function throwIfInsideCacheScope(
+  apiName: string,
+  options?: { rejectInPrivateUseCache?: boolean },
+): void {
+  // A route handler's request is rejected in a private cache too, as in
+  // Next.js's trackDynamic() (app-route/module.ts).
+  const rejectedInPrivate = options?.rejectInPrivateUseCache
+    ? _isInsideAnyUseCache() && !_isInsidePublicUseCache()
+    : _isRejectedInPrivateUseCache(apiName);
+  if (_isInsidePublicUseCache() || rejectedInPrivate) {
+    const error = rejectedInPrivate
+      ? createRequestApiInCacheScopeError(apiName, "use cache: private")
+      : createUseCacheAccessError(apiName);
     // Record the error on the request context so it survives user try/catch
     // and can be forwarded to the dev overlay on client-side navigations.
     // Ported from Next.js: workStore.invalidDynamicUsageError assignment in
@@ -294,11 +317,7 @@ export function throwIfInsideCacheScope(apiName: string): void {
     throw error;
   }
   if (_isInsideUnstableCache()) {
-    const error = new Error(
-      `\`${apiName}\` cannot be called inside a function cached with \`unstable_cache()\`. ` +
-        `If you need this data inside a cached function, call \`${apiName}\` ` +
-        "outside and pass the required data as an argument.",
-    );
+    const error = createRequestApiInCacheScopeError(apiName, "unstable_cache");
     try {
       const ctx = getRequestContext();
       if (ctx) ctx.invalidDynamicUsageError = error;

@@ -6393,7 +6393,7 @@ describe("next/server shim", () => {
       releaseLateWork();
       await lateConnection;
       expect(consumeInvalidDynamicUsageError()).toMatchObject({
-        message: expect.stringContaining('cannot be called inside "use cache"'),
+        message: expect.stringContaining('inside `"use cache"`'),
       });
     });
   });
@@ -8981,7 +8981,7 @@ describe('"use cache" runtime', () => {
         const outer = registerCachedFunction(async () => inner(), "test:private-nested-outer", "");
 
         await expect(outer()).rejects.toThrow(
-          /"use cache: private" must not be used within "use cache"/,
+          /`"use cache: private"` can't be nested inside `"use cache"`/,
         );
       } finally {
         setHeadersContext(null);
@@ -9471,7 +9471,7 @@ describe('"use cache" runtime', () => {
     // with the `$$isPage` marker.
     await expect(
       cached(asPageInvocation({ params: makeThenableParams({ slug: "same" }) })),
-    ).rejects.toThrow(/`searchParams` cannot be called inside "use cache"/);
+    ).rejects.toThrow(/`searchParams` can't be read inside `"use cache"`/);
   });
 
   // Next.js: `makeErroringSearchParamsForUseCache` throws when `then` is read,
@@ -9500,7 +9500,7 @@ describe('"use cache" runtime', () => {
           searchParams: makeThenableParams({ q: "first" }),
         }),
       ),
-    ).rejects.toThrow(/`searchParams` cannot be called inside "use cache"/);
+    ).rejects.toThrow(/`searchParams` can't be read inside `"use cache"`/);
   });
 
   // Next.js: `makeErroringSearchParamsForUseCache` throws on every access, not
@@ -9550,14 +9550,14 @@ describe('"use cache" runtime', () => {
     } catch (error) {
       caught = error;
     }
-    expect(String(caught)).toMatch(/`searchParams` cannot be called inside "use cache"/);
+    expect(String(caught)).toMatch(/`searchParams` can't be read inside `"use cache"`/);
     // The caught access is still recorded on the request the value was made
     // for, like Next.js's `workStore.invalidDynamicUsageError`.
     await runWithRequestContext(requestContext, async () => {
       expect(consumeInvalidDynamicUsageError()).toBe(caught);
     });
     expect(() => Reflect.get(escaped!, "q")).toThrow(
-      /`searchParams` cannot be called inside "use cache"/,
+      /`searchParams` can't be read inside `"use cache"`/,
     );
 
     // Another "use cache" that catches the read still fails, so it can't
@@ -9573,7 +9573,7 @@ describe('"use cache" runtime', () => {
       "/fixture/app/cached/escape-fallback.tsx:default",
       "",
     );
-    await expect(fallsBack()).rejects.toThrow(/`searchParams` cannot be called inside "use cache"/);
+    await expect(fallsBack()).rejects.toThrow(/`searchParams` can't be read inside `"use cache"`/);
 
     // A read inside another cache scope fails with the same error.
     const { unstable_cache } = await import("../packages/vinext/src/shims/cache.js");
@@ -9582,7 +9582,7 @@ describe('"use cache" runtime', () => {
       ["escaped-search-params"],
     );
     await expect(readsEscaped()).rejects.toThrow(
-      /`searchParams` cannot be called inside "use cache"/,
+      /`searchParams` can't be read inside `"use cache"`/,
     );
   });
 
@@ -9716,7 +9716,7 @@ describe('"use cache" runtime', () => {
     );
     await expect(
       readsSearchParams({ params: makeThenableParams({ slug: "same" }), $$isPage: true }),
-    ).rejects.toThrow(/`searchParams` cannot be called inside "use cache"/);
+    ).rejects.toThrow(/`searchParams` can't be read inside `"use cache"`/);
   });
 
   // Ported from Next.js: resolve-metadata.ts `createSegmentProps` marks a
@@ -10037,7 +10037,7 @@ describe('"use cache" runtime', () => {
         envelope,
         asPageInvocation({ params: makeThenableParams({ slug: "same" }) }),
       ),
-    ).rejects.toThrow(/`searchParams` cannot be called inside "use cache"/);
+    ).rejects.toThrow(/`searchParams` can't be read inside `"use cache"`/);
   });
 
   it('rejects app page searchParams access inside page default "use cache"', async () => {
@@ -10071,7 +10071,7 @@ describe('"use cache" runtime', () => {
           searchParams: makeObservedAppPageSearchParamsThenable({ q: "first" }),
         }),
       ),
-    ).rejects.toThrow(/cannot be called inside "use cache"/);
+    ).rejects.toThrow(/can't be (read|called) inside `"use cache"`/);
     expect(callCount).toBe(1);
 
     await expect(
@@ -10081,7 +10081,7 @@ describe('"use cache" runtime', () => {
           searchParams: makeObservedAppPageSearchParamsThenable({ q: "second" }),
         }),
       ),
-    ).rejects.toThrow(/cannot be called inside "use cache"/);
+    ).rejects.toThrow(/can't be (read|called) inside `"use cache"`/);
     expect(callCount).toBe(2);
   });
 
@@ -10120,7 +10120,7 @@ describe('"use cache" runtime', () => {
           searchParams: makeObservedAppPageSearchParamsThenable({ q: "first" }),
         }),
       ),
-    ).rejects.toThrow(/cannot be called inside "use cache"/);
+    ).rejects.toThrow(/can't be (read|called) inside `"use cache"`/);
     expect(callCount).toBe(1);
 
     await expect(
@@ -10130,7 +10130,7 @@ describe('"use cache" runtime', () => {
           searchParams: makeObservedAppPageSearchParamsThenable({ q: "second" }),
         }),
       ),
-    ).rejects.toThrow(/cannot be called inside "use cache"/);
+    ).rejects.toThrow(/can't be (read|called) inside `"use cache"`/);
     expect(callCount).toBe(2);
   });
 
@@ -10259,9 +10259,9 @@ describe('"use cache" runtime', () => {
       }
 
       expect(thrown).toBeDefined();
-      expect(thrown!.message).toContain("revalidate");
-      expect(thrown!.message).toContain('"use cache"');
-      expect(thrown!.message).toContain("not allowed");
+      expect(thrown!.message).toBe(
+        'A nested `"use cache"` with `revalidate: 0` is inside an outer `"use cache"` that has no `cacheLife()`. Add `cacheLife()` to the outer one to choose whether to prerender it with a non-zero `revalidate` or keep it dynamic with `revalidate: 0`.\nLearn more: https://nextjs.org/docs/messages/nested-use-cache-no-explicit-cachelife',
+      );
       expect(thrown!.cause).toBeDefined();
       expect((thrown!.cause as Error).message).toContain("dynamic cache life");
       expect((thrown!.cause as Error).name).toContain("Nested dynamic");
@@ -10303,9 +10303,9 @@ describe('"use cache" runtime', () => {
         }
 
         expect(thrown).toBeDefined();
-        expect(thrown!.message).toContain("expire");
-        expect(thrown!.message).toContain('"use cache"');
-        expect(thrown!.message).toContain("not allowed");
+        expect(thrown!.message).toBe(
+          'A nested `"use cache"` with a short `expire` (under 5 minutes) is inside an outer `"use cache"` that has no `cacheLife()`. Add `cacheLife()` to the outer one to choose whether to prerender it with a longer `expire` or keep it dynamic with a short `expire`.\nLearn more: https://nextjs.org/docs/messages/nested-use-cache-no-explicit-cachelife',
+        );
         expect(thrown!.cause).toBeDefined();
         expect((thrown!.cause as Error).message).toContain("dynamic cache life");
       }
@@ -10393,10 +10393,8 @@ describe('"use cache" runtime', () => {
       }
 
       expect(thrown).toBeDefined();
-      expect(thrown!.message).toContain("revalidate");
-      // In dev, the message should say "in development", not
-      // "during prerendering", since no prerendering is happening.
-      expect(thrown!.message).toContain("in development");
+      // Like Next.js, the message names neither prerendering nor development.
+      expect(thrown!.message).toContain("with `revalidate: 0`");
       expect(thrown!.message).not.toContain("during prerendering");
     } finally {
       if (previousPrerender === undefined) delete env.VINEXT_PRERENDER;
@@ -10488,7 +10486,7 @@ describe('"use cache" runtime', () => {
         return await innerCached();
       }, "test:per-field-explicit-outer");
 
-      await expect(outerCached()).rejects.toThrow(/zero `revalidate`/);
+      await expect(outerCached()).rejects.toThrow(/A nested `"use cache"` with `revalidate: 0`/);
     });
   });
 
@@ -10511,7 +10509,7 @@ describe('"use cache" runtime', () => {
         "test:caught-dynamic-outer",
       );
 
-      await expect(outerCached()).rejects.toThrow(/zero `revalidate`/);
+      await expect(outerCached()).rejects.toThrow(/A nested `"use cache"` with `revalidate: 0`/);
     });
   });
 
@@ -32704,7 +32702,7 @@ describe("cache scope guards for dynamic APIs", () => {
         dynamicNestedCacheError: undefined,
       },
       async () => {
-        await expect(headers()).rejects.toThrow(/cannot be called inside "use cache"/);
+        await expect(headers()).rejects.toThrow(/can't be (read|called) inside `"use cache"`/);
       },
     );
 
@@ -32731,7 +32729,9 @@ describe("cache scope guards for dynamic APIs", () => {
         dynamicNestedCacheError: undefined,
       },
       async () => {
-        expect(() => headers().get("x-test")).toThrow(/cannot be called inside "use cache"/);
+        expect(() => headers().get("x-test")).toThrow(
+          /can't be (read|called) inside `"use cache"`/,
+        );
       },
     );
 
@@ -32755,7 +32755,7 @@ describe("cache scope guards for dynamic APIs", () => {
         dynamicNestedCacheError: undefined,
       },
       async () => {
-        await expect(cookies()).rejects.toThrow(/cannot be called inside "use cache"/);
+        await expect(cookies()).rejects.toThrow(/can't be (read|called) inside `"use cache"`/);
       },
     );
 
@@ -32847,7 +32847,9 @@ describe("cache scope guards for dynamic APIs", () => {
         dynamicNestedCacheError: undefined,
       },
       async () => {
-        expect(() => cookies().get("session")).toThrow(/cannot be called inside "use cache"/);
+        expect(() => cookies().get("session")).toThrow(
+          /can't be (read|called) inside `"use cache"`/,
+        );
       },
     );
 
@@ -32869,7 +32871,7 @@ describe("cache scope guards for dynamic APIs", () => {
         dynamicNestedCacheError: undefined,
       },
       async () => {
-        await expect(connection()).rejects.toThrow(/cannot be called inside "use cache"/);
+        await expect(connection()).rejects.toThrow(/can't be (read|called) inside `"use cache"`/);
       },
     );
   });
@@ -33070,8 +33072,8 @@ describe("cache scope guards for dynamic APIs", () => {
       },
       async () => {
         const dm = await draftMode();
-        expect(() => dm.enable()).toThrow(/cannot be called inside "use cache"/);
-        expect(() => dm.disable()).toThrow(/cannot be called inside "use cache"/);
+        expect(() => dm.enable()).toThrow(/can't be (read|called) inside `"use cache"`/);
+        expect(() => dm.disable()).toThrow(/can't be (read|called) inside `"use cache"`/);
       },
     );
 
@@ -33126,7 +33128,7 @@ describe("cache scope guards for dynamic APIs", () => {
         }, ["test-nested-scopes"]);
 
         // Either scope's guard triggers (the "use cache" check runs first)
-        await expect(cached()).rejects.toThrow(/cannot be called inside/);
+        await expect(cached()).rejects.toThrow(/can't be read inside/);
       },
     );
 
@@ -33201,7 +33203,7 @@ describe("cache scope guards for dynamic APIs", () => {
     });
 
     expect(recordedError).toBeInstanceOf(Error);
-    expect((recordedError as Error).message).toContain('cannot be called inside "use cache"');
+    expect((recordedError as Error).message).toContain('inside `"use cache"`');
 
     // After consumption, the error is cleared
     expect(consumeInvalidDynamicUsageError()).toBeNull();
@@ -33230,6 +33232,136 @@ describe("cache scope guards for dynamic APIs", () => {
       await import("../packages/vinext/src/shims/headers.js");
     // Should return null without throwing when no unified scope is active
     expect(consumeInvalidDynamicUsageError()).toBeNull();
+  });
+});
+
+// Ported from Next.js: packages/next/src/server/use-cache/use-cache-messages.ts
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/server/use-cache/use-cache-messages.ts
+// The templates asserted by
+// https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/cache-components-errors/use-cache.util.ts
+// and
+// https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache-private/use-cache-private.util.ts
+// (vercel/next.js#94300). vinext doesn't track the route at these throw
+// sites, so the `Route "<route>": ` prefix is left out.
+describe("cache scope diagnostics match Next.js", () => {
+  const useCacheContext = {
+    tags: [],
+    lifeConfigs: [],
+    nestedLifeConfigs: [],
+    variant: "default",
+    hasExplicitRevalidate: false,
+    hasExplicitExpire: false,
+    dynamicNestedCacheError: undefined,
+  };
+
+  async function messageInUseCache(apiName: string, variant = "default"): Promise<string> {
+    const { cacheContextStorage } = await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { throwIfInsideCacheScope } =
+      await import("../packages/vinext/src/shims/internal/headers-state.js");
+    return cacheContextStorage.run({ ...useCacheContext, variant }, () => {
+      try {
+        throwIfInsideCacheScope(apiName);
+        return "no error";
+      } catch (error) {
+        return (error as Error).message;
+      }
+    });
+  }
+
+  async function messageInUnstableCache(apiName: string): Promise<string> {
+    const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { throwIfInsideCacheScope } =
+      await import("../packages/vinext/src/shims/internal/headers-state.js");
+    setCacheHandler(new MemoryCacheHandler());
+    const cached = unstable_cache(async () => {
+      throwIfInsideCacheScope(apiName);
+      return "no error";
+    }, [`diagnostics:${apiName}`]);
+    try {
+      return await cached();
+    } catch (error) {
+      return (error as Error).message;
+    }
+  }
+
+  it("reports request data read inside a cache", async () => {
+    expect(await messageInUseCache("headers()")).toBe(
+      '`headers()` can\'t be read inside `"use cache"`. Read it outside the cached function and pass what you need as an argument.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache',
+    );
+    expect(await messageInUseCache("searchParams")).toBe(
+      '`searchParams` can\'t be read inside `"use cache"`. Await it outside the cached function and pass what you need as an argument.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache',
+    );
+    expect(await messageInUnstableCache("cookies()")).toBe(
+      "`cookies()` can't be read inside `unstable_cache()`. Read it outside the cached function and pass what you need as an argument.\nLearn more: https://nextjs.org/docs/app/api-reference/functions/unstable_cache",
+    );
+    expect(await messageInUnstableCache("request.url")).toBe(
+      "`request.url` can't be read inside `unstable_cache()`. Read it outside the cached function and pass what you need as an argument.\nLearn more: https://nextjs.org/docs/app/api-reference/functions/unstable_cache",
+    );
+  });
+
+  it("reports connection() inside a cache", async () => {
+    expect(await messageInUseCache("connection()")).toBe(
+      '`connection()` can\'t be called inside `"use cache"` because cached functions may run during prerendering, without an incoming request. Call it outside the cached function.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache',
+    );
+    expect(await messageInUnstableCache("connection()")).toBe(
+      "`connection()` can't be called inside `unstable_cache()` because cached functions may run during prerendering, without an incoming request. Call it outside the cached function.\nLearn more: https://nextjs.org/docs/app/api-reference/functions/unstable_cache",
+    );
+  });
+
+  // Ported from Next.js: packages/next/src/server/request/connection.ts and
+  // packages/next/src/server/request/draft-mode.ts, which reject these in a
+  // `private-cache` work unit while cookies() and headers() stay readable.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/connection.ts
+  it('rejects connection() and draft mode toggles inside "use cache: private"', async () => {
+    expect(await messageInUseCache("connection()", "private")).toBe(
+      '`connection()` can\'t be called inside `"use cache: private"` because private cached functions may run during prefetching, without a navigation request. Call it outside the cached function.\nLearn more: https://nextjs.org/docs/app/api-reference/directives/use-cache-private',
+    );
+    expect(await messageInUseCache("draftMode().enable()", "private")).toBe(
+      '`draftMode().enable()` can\'t be called inside `"use cache"`. Draft mode can be read inside a cached function, but enabling or disabling it must happen outside.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache',
+    );
+    expect(await messageInUseCache("cookies()", "private")).toBe("no error");
+    expect(await messageInUseCache("headers()", "private")).toBe("no error");
+  });
+
+  it("reports a draft mode toggle inside a cache", async () => {
+    expect(await messageInUseCache("draftMode().enable()")).toBe(
+      '`draftMode().enable()` can\'t be called inside `"use cache"`. Draft mode can be read inside a cached function, but enabling or disabling it must happen outside.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache',
+    );
+    expect(await messageInUnstableCache("draftMode().disable()")).toBe(
+      "`draftMode().disable()` can't be called inside `unstable_cache()`. Draft mode can be read inside a cached function, but enabling or disabling it must happen outside.\nLearn more: https://nextjs.org/docs/app/api-reference/functions/unstable_cache",
+    );
+  });
+
+  it('reports "use cache: private" composed inside a shared cache', async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    setCacheHandler(new MemoryCacheHandler());
+
+    await runWithRequestContext(createRequestContext(), async () => {
+      const inner = registerCachedFunction(
+        async () => "private",
+        "test:diagnostics-private-inner",
+        "private",
+      );
+      const publicOuter = registerCachedFunction(
+        async () => inner(),
+        "test:diagnostics-private-outer",
+        "",
+      );
+      await expect(publicOuter()).rejects.toThrow(
+        '`"use cache: private"` can\'t be nested inside `"use cache"` because a shared cached function can\'t depend on private request data. Nest it only inside another `"use cache: private"`.\nLearn more: https://nextjs.org/docs/messages/use-cache-private-composition',
+      );
+
+      const unstableOuter = unstable_cache(async () => inner(), ["diagnostics-private-unstable"]);
+      await expect(unstableOuter()).rejects.toThrow(
+        "`\"use cache: private\"` can't be used inside `unstable_cache()` because `unstable_cache()` uses a shared cache that can't contain private request data. Call the private cached function outside `unstable_cache()`.\nLearn more: https://nextjs.org/docs/messages/use-cache-private-composition",
+      );
+    });
   });
 });
 

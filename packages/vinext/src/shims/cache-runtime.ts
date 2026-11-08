@@ -81,6 +81,12 @@ import { suppressHangingPromiseAbortRejections } from "./internal/make-hanging-p
 import type { VinextCacheFunctionInvocation } from "../server/multi-stage.js";
 import { shareIsolatePromise } from "../server/isolate-shared-promise.js";
 import { isInsideWorkStoreScope } from "./internal/work-store-scope.js";
+import {
+  createNestedCacheShortExpireError,
+  createNestedCacheZeroRevalidateError,
+  createUseCachePrivateInsidePublicUseCacheError,
+  createUseCachePrivateInsideUnstableCacheError,
+} from "./internal/cache-scope-messages.js";
 
 import {
   snapshotFlightReply,
@@ -115,49 +121,6 @@ export class NestedDynamicUseCacheError extends Error {
     super('This "use cache" has a dynamic cache life that was propagated to its parent.');
     this.name = 'Nested dynamic "use cache"';
   }
-}
-
-/**
- * Returns the human-readable phrase describing the current context for use in
- * nested-dynamic error messages. The throw is gated to fire only during the
- * build's prerender phase (`VINEXT_PRERENDER=1`) or development; this phrase
- * tells the user which one they're in so the message isn't misleading.
- *
- * `VINEXT_PRERENDER` takes priority over `NODE_ENV=development`: if the
- * prerender flag is set, the user really is prerendering regardless of
- * NODE_ENV (this matters for scenarios like a dev-config prerender). Defaults
- * to "during prerendering" to match Next.js wording when called from a
- * context we don't recognize (the throw also wouldn't fire in that case).
- */
-function nestedCacheContextPhrase(): string {
-  if (typeof process === "undefined") return "during prerendering";
-  if (process.env.VINEXT_PRERENDER === "1") return "during prerendering";
-  if (process.env.NODE_ENV === "development") return "in development";
-  return "during prerendering";
-}
-
-function getNestedCacheZeroRevalidateErrorMessage(): string {
-  const phrase = nestedCacheContextPhrase();
-  return (
-    `A "use cache" with zero \`revalidate\` is nested inside another "use cache" ` +
-    `that has no explicit \`cacheLife\`, which is not allowed ${phrase}. ` +
-    `Add \`cacheLife()\` to the outer "use cache" to choose ` +
-    `whether it should be prerendered (with non-zero \`revalidate\`) or remain ` +
-    `dynamic (with zero \`revalidate\`). Read more: ` +
-    `https://nextjs.org/docs/messages/nested-use-cache-no-explicit-cachelife`
-  );
-}
-
-function getNestedCacheShortExpireErrorMessage(): string {
-  const phrase = nestedCacheContextPhrase();
-  return (
-    `A "use cache" with short \`expire\` (under 5 minutes) is nested inside ` +
-    `another "use cache" that has no explicit \`cacheLife\`, which is not ` +
-    `allowed ${phrase}. Add \`cacheLife()\` to the outer "use cache" ` +
-    `to choose whether it should be prerendered (with longer \`expire\`) or remain ` +
-    `dynamic (with short \`expire\`). Read more: ` +
-    `https://nextjs.org/docs/messages/nested-use-cache-no-explicit-cachelife`
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,16 +1105,14 @@ export function isUseCacheFunction(
 }
 
 function throwPrivateUseCacheInsidePublicUseCacheError(): never {
-  const error = new Error(
-    '"use cache: private" must not be used within "use cache". It can only be nested inside of another "use cache: private".',
-  );
+  const error = createUseCachePrivateInsidePublicUseCacheError();
   const ctx = getRequestContext();
   if (ctx) ctx.invalidDynamicUsageError = error;
   throw error;
 }
 
 function throwPrivateUseCacheInsideUnstableCacheError(): never {
-  const error = new Error('"use cache: private" must not be used within `unstable_cache()`.');
+  const error = createUseCachePrivateInsideUnstableCacheError();
   const ctx = getRequestContext();
   if (ctx) ctx.invalidDynamicUsageError = error;
   throw error;
@@ -1435,27 +1396,22 @@ async function runCachedFunctionWithContext<
   // Production dynamic SSR is not subject to the throw — a runtime request
   // that nests a dynamic cache inside a non-cacheLife() outer will just run
   // both functions; the outer simply won't be cached (its effective
-  // revalidate resolves to the nested 0). The error messages explicitly say "not
-  // allowed during prerendering" — outside prerendering/dev, surfacing the
-  // throw would be misleading and would diverge from Next.js.
+  // revalidate resolves to the nested 0). Surfacing the throw there would
+  // diverge from Next.js.
   //
   const shouldThrow =
     typeof process !== "undefined" &&
     (process.env.VINEXT_PRERENDER === "1" || process.env.NODE_ENV === "development");
   if (shouldThrow && ctx.dynamicNestedCacheError) {
     if (effectiveLife.revalidate === 0 && !ctx.hasExplicitRevalidate) {
-      throw new Error(getNestedCacheZeroRevalidateErrorMessage(), {
-        cause: ctx.dynamicNestedCacheError,
-      });
+      throw createNestedCacheZeroRevalidateError(ctx.dynamicNestedCacheError);
     }
     if (
       effectiveLife.expire !== undefined &&
       effectiveLife.expire < DYNAMIC_EXPIRE &&
       !ctx.hasExplicitExpire
     ) {
-      throw new Error(getNestedCacheShortExpireErrorMessage(), {
-        cause: ctx.dynamicNestedCacheError,
-      });
+      throw createNestedCacheShortExpireError(ctx.dynamicNestedCacheError);
     }
   }
 

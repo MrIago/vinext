@@ -68,8 +68,8 @@ describe("use cache React memoization scope boundaries", () => {
         }),
       ).toContain(
         kind === "public"
-          ? 'must not be used within "use cache"'
-          : "must not be used within `unstable_cache()`",
+          ? 'can\'t be nested inside `"use cache"`'
+          : "can't be used inside `unstable_cache()`",
       );
     },
   );
