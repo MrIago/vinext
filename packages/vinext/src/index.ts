@@ -3218,6 +3218,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         defines["process.env.__NEXT_TEST_MODE"] = JSON.stringify(
           process.env.__NEXT_TEST_MODE ?? false,
         );
+        // App Router StrictMode. Unlike the Pages Router (opt-in), Next.js turns
+        // it on when `reactStrictMode` is unset and only an explicit `false`
+        // opts out (packages/next/src/build/define-env.ts,
+        // `__NEXT_STRICT_MODE_APP`). Raw boolean so the client wrap tree-shakes.
+        defines["process.env.__NEXT_STRICT_MODE_APP"] = JSON.stringify(
+          nextConfig.reactStrictMode ?? true,
+        );
         // Expose experimental.scrollRestoration to the Pages Router client.
         // Next.js defines this from config.experimental.scrollRestoration in
         // packages/next/src/build/define-env.ts.

@@ -2001,6 +2001,38 @@ describe("build-time defines (Pages Router)", () => {
   it("Next.js test mode defaults to false", () => {
     expect(server.config.define?.["process.env.__NEXT_TEST_MODE"]).toBe(JSON.stringify(false));
   });
+
+  // Ported from Next.js packages/next/src/build/define-env.ts: an unset
+  // `reactStrictMode` turns StrictMode on for the App Router.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/define-env.ts
+  it("App Router strict mode defaults to true when reactStrictMode is unset", () => {
+    expect(server.config.define?.["process.env.__NEXT_STRICT_MODE_APP"]).toBe(JSON.stringify(true));
+  });
+});
+
+describe("App Router strict mode define", () => {
+  async function defineFor(reactStrictMode: boolean): Promise<unknown> {
+    const server = await createServer({
+      root: PAGES_FIXTURE_DIR,
+      configFile: false,
+      plugins: [vinext({ nextConfig: { reactStrictMode } })],
+      server: { port: 0 },
+      logLevel: "silent",
+    });
+    try {
+      return server.config.define?.["process.env.__NEXT_STRICT_MODE_APP"];
+    } finally {
+      await server.close();
+    }
+  }
+
+  it("follows an explicit reactStrictMode: false", async () => {
+    expect(await defineFor(false)).toBe(JSON.stringify(false));
+  });
+
+  it("follows an explicit reactStrictMode: true", async () => {
+    expect(await defineFor(true)).toBe(JSON.stringify(true));
+  });
 });
 
 // ---------------------------------------------------------------------------

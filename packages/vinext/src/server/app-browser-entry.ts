@@ -4,6 +4,7 @@ import {
   createElement,
   Fragment,
   startTransition,
+  StrictMode,
   use,
   useEffect,
   useLayoutEffect,
@@ -2113,11 +2114,17 @@ function bootstrapHydration(
           onRecoverableError,
           onUncaughtError,
         });
-  const children = createElement(BrowserRoot, {
+  const browserRoot = createElement(BrowserRoot, {
     hydrationCachePublication,
     initialElements: root,
     initialNavigationSnapshot,
   });
+  // Next.js client/app-index.tsx wraps the whole hydrated tree in
+  // <React.StrictMode> unless `reactStrictMode: false` (define set in
+  // index.ts). StrictMode renders no DOM, so hydration output is unchanged.
+  const children = process.env.__NEXT_STRICT_MODE_APP
+    ? createElement(StrictMode, null, browserRoot)
+    : browserRoot;
   const errorShellStyles = document.querySelectorAll("style[data-vinext-error-shell-style]");
   if (document.documentElement.id === "__next_error__") {
     // Next.js client/app-index.tsx uses the document id alone to select CSR
