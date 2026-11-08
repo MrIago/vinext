@@ -2563,13 +2563,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           !config.build?.ssr &&
           getBuildBundlerOptions(config.build)?.input === undefined)),
     onPrepare: () => {
-      if (!hasAppDir || reactVersionChecked) return;
+      if (reactVersionChecked) return;
       reactVersionChecked = true;
       // Never install during a build: fail with the command to run instead.
-      const reactUpgrade = getReactUpgradeDeps(root);
+      // The react/react-dom floor applies to both routers; RSDW is App Router only.
+      const reactUpgrade = getReactUpgradeDeps(root, { includeRsdw: hasAppDir });
       // plugin-rsc looks for the app's RSDW from the working directory, not
       // the Vite root.
-      const needsAppRsdw = rscVersion !== null && needsAppReactServerDom(process.cwd(), rscVersion);
+      const needsAppRsdw =
+        hasAppDir && rscVersion !== null && needsAppReactServerDom(process.cwd(), rscVersion);
       if (needsAppRsdw && !reactUpgrade.includes("react-server-dom-webpack@latest")) {
         reactUpgrade.push("react-server-dom-webpack@latest");
       }
@@ -2579,6 +2581,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           detectPackageManager(root).replace(/ -D$/, ""),
           reactUpgrade,
           needsAppRsdw ? rscVersion : undefined,
+          hasAppDir,
         ),
       );
     },
