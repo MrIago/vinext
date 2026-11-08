@@ -7,10 +7,16 @@
 
 import { detectPackageManager, findDir, findViteConfigPath } from "./utils/project.js";
 import { normalizePageExtensions } from "./routing/file-matcher.js";
+import {
+  findPackageVersion,
+  isVersionBelow,
+  MINIMUM_REACT_VERSION,
+} from "./utils/react-version.js";
 import { POSTCSS_CONFIG_FILES } from "./plugins/postcss.js";
 import { parseProgram, unwrapExpression } from "./plugins/ast-utils.js";
 import type { ESTree } from "vite";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import ignore, { type Ignore } from "ignore";
 import path from "pathslash";
 
@@ -1318,6 +1324,30 @@ export function analyzeConfig(root: string): CheckItem[] {
   return items;
 }
 
+/** Flag an installed react or react-dom below the version vinext supports. */
+function checkInstalledReact(root: string): CheckItem | null {
+  const req = createRequire(path.join(root, "package.json"));
+  const installed: string[] = [];
+  let tooOld = false;
+  for (const name of ["react", "react-dom"]) {
+    let version: string | null;
+    try {
+      version = findPackageVersion(req.resolve(name), name);
+    } catch {
+      continue;
+    }
+    if (!version) continue;
+    installed.push(`${name} ${version}`);
+    if (isVersionBelow(version, MINIMUM_REACT_VERSION)) tooOld = true;
+  }
+  if (!tooOld) return null;
+  return {
+    name: "react",
+    status: "unsupported",
+    detail: `installed ${installed.join(", ")}; vinext requires ${MINIMUM_REACT_VERSION.join(".")} or later, upgrade react and react-dom`,
+  };
+}
+
 /**
  * Check package.json dependencies for known libraries.
  */
@@ -1338,6 +1368,9 @@ export function checkLibraries(root: string): CheckItem[] {
       });
     }
   }
+
+  const reactItem = checkInstalledReact(root);
+  if (reactItem) items.push(reactItem);
 
   // Sort: unsupported first
   items.sort(compareByStatus);

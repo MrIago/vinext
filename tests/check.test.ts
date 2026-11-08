@@ -1033,6 +1033,38 @@ describe("checkLibraries", () => {
     expect(items).toHaveLength(0);
   });
 
+  it("flags an installed React below the supported minimum", () => {
+    writeFile("package.json", JSON.stringify({ dependencies: { react: "19.1.5" } }));
+    writeFile(
+      "node_modules/react/package.json",
+      JSON.stringify({ name: "react", version: "19.1.5", main: "index.js" }),
+    );
+    writeFile("node_modules/react/index.js", "module.exports = {};");
+    writeFile(
+      "node_modules/react-dom/package.json",
+      JSON.stringify({ name: "react-dom", version: "19.1.5", main: "index.js" }),
+    );
+    writeFile("node_modules/react-dom/index.js", "module.exports = {};");
+
+    const items = checkLibraries(tmpDir);
+    const react = items.find((i) => i.name === "react");
+    expect(react?.status).toBe("unsupported");
+    expect(react?.detail).toContain("react 19.1.5");
+    expect(react?.detail).toContain("react-dom 19.1.5");
+    expect(react?.detail).toContain("19.3.1");
+  });
+
+  it("does not flag an installed React at the supported minimum", () => {
+    writeFile("package.json", JSON.stringify({ dependencies: { react: "19.3.1" } }));
+    writeFile(
+      "node_modules/react/package.json",
+      JSON.stringify({ name: "react", version: "19.3.1", main: "index.js" }),
+    );
+    writeFile("node_modules/react/index.js", "module.exports = {};");
+
+    expect(checkLibraries(tmpDir).find((i) => i.name === "react")).toBeUndefined();
+  });
+
   it("detects supported libraries", () => {
     writeFile(
       "package.json",
