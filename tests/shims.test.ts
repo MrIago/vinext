@@ -33511,6 +33511,42 @@ describe("vinext shim package-subpath resolution", () => {
       hook.handler.call({}, "\0@vercel/og", path.join(FIXTURE_DIR, "app/opengraph-image.tsx")),
     ).toBe(expectedOgShim);
   });
+
+  // Next.js aliases next/head to a noop component in the App Router and,
+  // when a Server Component imports it, warns once at compile time.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/create-compiler-aliases.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/webpack/loaders/next-flight-loader/index.ts
+  it("resolves next/head to a noop that warns once for Server Components", async () => {
+    const hook = getResolveIdHook();
+    const resolve = viteResolve;
+    const expectedHeadShim = toSlash(
+      path.resolve(import.meta.dirname, "../packages/vinext/src/shims/head.ts"),
+    );
+    const expectedReactServerHeadShim = toSlash(
+      path.resolve(import.meta.dirname, "../packages/vinext/src/shims/head.react-server.ts"),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(hook.handler.call({ resolve }, "next/head")).resolves.toEqual({
+        id: `${expectedHeadShim}?v=hash`,
+      });
+      expect(warn).not.toHaveBeenCalled();
+
+      await expect(
+        hook.handler.call({ environment: { name: "rsc" }, resolve }, "next/head"),
+      ).resolves.toEqual({ id: `${expectedReactServerHeadShim}?v=hash` });
+      await hook.handler.call({ environment: { name: "rsc" }, resolve }, "next/head.js");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        "Warning: You're using `next/head` inside the `app` directory, please migrate to the Metadata API. See https://nextjs.org/docs/app/building-your-application/upgrading/app-router-migration#step-3-migrating-nexthead for more details.",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+
+    const { default: NoopHead } = await import("../packages/vinext/src/shims/head.react-server.js");
+    expect(NoopHead()).toBeNull();
+  });
 });
 
 // ── next/head attribute name validation ─────────────────────────────────────

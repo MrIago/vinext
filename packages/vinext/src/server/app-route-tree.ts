@@ -1,4 +1,5 @@
 import { Fragment, createElement, type ReactNode } from "react";
+import { APP_DIR_HEAD_MANAGER, HeadManagerContext } from "vinext/shims/head";
 import { ElementsContext, Slot } from "vinext/shims/slot";
 import type { AppElements } from "./app-elements.js";
 
@@ -22,9 +23,14 @@ export function createAppRouteTree(options: {
     null,
     options.historyCommit,
     createElement(
-      ElementsContext.Provider,
-      { value: options.elements },
-      createElement(Slot, { id: options.routeId }),
+      // Like Next.js, `next/head` is a noop in the App Router.
+      HeadManagerContext.Provider,
+      { value: APP_DIR_HEAD_MANAGER },
+      createElement(
+        ElementsContext.Provider,
+        { value: options.elements },
+        createElement(Slot, { id: options.routeId }),
+      ),
     ),
   );
 }
