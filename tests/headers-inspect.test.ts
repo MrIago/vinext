@@ -5,6 +5,7 @@ import {
   headersContextFromRequest,
   runWithHeadersContext,
 } from "../packages/vinext/src/shims/headers.js";
+import { sealRequestHeaders } from "../packages/vinext/src/shims/server.js";
 
 // Node prints a promise's AsyncLocalStorage store when it inspects the
 // promise, so `console.log(new Promise(() => {}))` in app code walks every
@@ -23,6 +24,12 @@ describe("request headers are safe to util.inspect", () => {
       expect(inspect(ctx.headers)).toContain("x-test");
       expect(() => inspect(new Promise(() => {}), { depth: 10 })).not.toThrow();
     });
+  });
+
+  it("inspects the sealed route handler request headers", () => {
+    const sealed = sealRequestHeaders(new Headers({ "x-route": "1" }));
+    expect(inspect(sealed)).toContain("x-route");
+    expect(sealed).toBeInstanceOf(Headers);
   });
 
   it("inspects the lazy headers proxy after its first write", () => {

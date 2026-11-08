@@ -15,6 +15,7 @@ import {
   MIDDLEWARE_SET_COOKIE_HEADER,
 } from "../server/headers.js";
 import { encodeMiddlewareRequestHeaders } from "../utils/middleware-request-headers.js";
+import { headersProxyTarget } from "./internal/headers-proxy-target.js";
 import { validateCookieAttributeValue, validateCookieName } from "./internal/cookie-serialize.js";
 import { parseEdgeRequestCookieHeader } from "../utils/parse-cookie.js";
 import { getRequestExecutionContext } from "./request-context.js";
@@ -1009,16 +1010,21 @@ class ReadonlyRequestHeadersError extends Error {
 }
 
 export function sealRequestHeaders(headers: Headers): Headers {
-  return new Proxy<Headers>(headers, {
-    get(target, prop) {
-      if (typeof prop === "string" && REQUEST_HEADERS_MUTATING_METHODS.has(prop)) {
-        return ReadonlyRequestHeadersError.callable;
-      }
+  // The target is not `headers` itself so util.inspect doesn't hit undici's
+  // brand check; see headersProxyTarget.
+  return new Proxy<Headers>(
+    headersProxyTarget(() => headers),
+    {
+      get(_target, prop) {
+        if (typeof prop === "string" && REQUEST_HEADERS_MUTATING_METHODS.has(prop)) {
+          return ReadonlyRequestHeadersError.callable;
+        }
 
-      const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+        const value = Reflect.get(headers, prop, headers);
+        return typeof value === "function" ? value.bind(headers) : value;
+      },
     },
-  });
+  );
 }
 
 export function sealRequestCookies(cookies: RequestCookies): RequestCookies {
