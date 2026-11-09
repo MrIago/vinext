@@ -1993,6 +1993,78 @@ describe("Link prefetch scheduling", () => {
     }
   });
 
+  // #2718: <Link> prefetch setup shares router.prefetch()'s cancellation. These
+  // are the Link versions of the "#2707" cases in tests/prefetch-cache.test.ts.
+  // The first intent prefetch starts while the lazily imported prefetch
+  // modules are still loading, which is the window under test.
+  it("does not repopulate the prefetch cache when invalidated during Link prefetch setup", async () => {
+    const result = await renderIsolatedLink({
+      href: "/intent-prefetch-target",
+      nodeEnv: "production",
+    });
+    const { getPrefetchCache, invalidatePrefetchCache } =
+      await import("../packages/vinext/src/shims/navigation.js");
+
+    try {
+      result.capturedAnchorProps.onMouseEnter?.({ currentTarget: result.anchor });
+      // router.refresh() reaches this before the setup above registers anything.
+      invalidatePrefetchCache({ pingVisibleLinks: false });
+      await flushPrefetchTasks();
+
+      expect(result.fetch).not.toHaveBeenCalled();
+      expect(getPrefetchCache().size).toBe(0);
+    } finally {
+      result.restoreNodeEnv();
+    }
+  });
+
+  // These two differ only in where the navigation goes, so together they pin
+  // the destination scoping: a global counter passes the first and fails the
+  // second.
+  it("cancels Link prefetch setup superseded by a navigation to the same route", async () => {
+    const result = await renderIsolatedLink({
+      href: "/intent-prefetch-target",
+      nodeEnv: "production",
+    });
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    // The navigation's scroll handling reads <html>'s dataset.
+    Object.assign(document, { documentElement: { dataset: {}, style: {} } });
+
+    try {
+      result.capturedAnchorProps.onMouseEnter?.({ currentTarget: result.anchor });
+      appRouterInstance.push("/intent-prefetch-target");
+      await flushPrefetchTasks();
+
+      expect(result.fetch).not.toHaveBeenCalled();
+    } finally {
+      result.restoreNodeEnv();
+    }
+  });
+
+  it("leaves Link prefetch setup alone when the navigation goes elsewhere", async () => {
+    const result = await renderIsolatedLink({
+      href: "/intent-prefetch-target",
+      nodeEnv: "production",
+    });
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    // The navigation's scroll handling reads <html>'s dataset.
+    Object.assign(document, { documentElement: { dataset: {}, style: {} } });
+
+    try {
+      result.capturedAnchorProps.onMouseEnter?.({ currentTarget: result.anchor });
+      appRouterInstance.push("/viewport-prefetch-target");
+      await waitForFetchCalls(result.fetch, 1);
+
+      expectCanonicalRscFetchCall(
+        result.fetch.mock.calls[0],
+        "/intent-prefetch-target",
+        expect.objectContaining({ priority: "high" }),
+      );
+    } finally {
+      result.restoreNodeEnv();
+    }
+  });
+
   it("reuses the App Router prefetch module imports across prefetches", async () => {
     // Production builds wrap each dynamic import() in Vite's preload helper,
     // which scans the document for a CSP nonce on every call. Re-mocking the

@@ -37,6 +37,11 @@ import {
   type LinkPrefetchRouterMode,
 } from "./link-prefetch.js";
 import {
+  beginPrefetchSetup,
+  endPrefetchSetup,
+  toAppPrefetchDestination,
+} from "./internal/app-prefetch-setup.js";
+import {
   isAbsoluteOrProtocolRelativeUrl,
   normalizePathTrailingSlash,
   toCanonicalBrowserNavigationHref,
@@ -216,13 +221,6 @@ export function useLinkStatus(): LinkStatusContextValue {
   return useContext(LinkStatusContext);
 }
 
-let linkPrefetchNavigationEpoch = 0;
-
-function notifyLinkNavigationStartAndCancelPrefetchSetup(): void {
-  linkPrefetchNavigationEpoch += 1;
-  notifyLinkNavigationStart();
-}
-
 // Register the link-status reset hook on the navigation runtime as soon as this
 // module evaluates on the client. `navigateClientSide` calls it at the start of
 // every App Router navigation (including router.push and shallow routing), so a
@@ -231,7 +229,7 @@ function notifyLinkNavigationStartAndCancelPrefetchSetup(): void {
 // it can be unit-tested without rendering a <Link>.
 if (typeof window !== "undefined") {
   registerNavigationRuntimeFunctions({
-    notifyLinkNavigationStart: notifyLinkNavigationStartAndCancelPrefetchSetup,
+    notifyLinkNavigationStart,
   });
 }
 
@@ -380,7 +378,6 @@ function prefetchUrl(
   owner?: LinkPrefetchInstance,
 ): void {
   if (typeof window === "undefined") return;
-  const navigationEpoch = linkPrefetchNavigationEpoch;
 
   const prefetchHref = getLinkPrefetchHref({
     href,
@@ -432,6 +429,14 @@ function prefetchUrl(
   }
 
   const runPrefetch = () => {
+    // Registered before the first await, so a navigation to this destination
+    // or a cache invalidation that happens while the modules below load
+    // cancels this setup (shared with router.prefetch(); see
+    // internal/app-prefetch-setup.ts).
+    const prefetchDestination = hasLinkAppNavigationRuntime()
+      ? toAppPrefetchDestination(prefetchHref)
+      : null;
+    const setup = prefetchDestination === null ? null : beginPrefetchSetup(prefetchDestination);
     void (async () => {
       if (hasLinkAppNavigationRuntime()) {
         if (isBotUserAgent(window.navigator?.userAgent ?? "")) return;
@@ -462,7 +467,8 @@ function prefetchUrl(
         // A pointer-intent prefetch and its click navigation can start in the
         // same event turn. If navigation won the module-loading race, do not
         // begin a second request after it consumes an equivalent cached route.
-        if (navigationEpoch !== linkPrefetchNavigationEpoch) return;
+        // A cache invalidation (router.refresh()) also voids this setup.
+        if (setup?.cancelled) return;
         const {
           getPrefetchInterceptionContext,
           getPrefetchCache,
@@ -562,7 +568,7 @@ function prefetchUrl(
           headers,
           rewrittenPrefetchHref,
         });
-        if (navigationEpoch !== linkPrefetchNavigationEpoch) return;
+        if (setup?.cancelled) return;
         const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
         const prefetched = getPrefetchedUrls();
         // The exact request is still fresh as a learning-only prefetch,
@@ -853,9 +859,13 @@ function prefetchUrl(
           document.head.appendChild(link);
         }
       }
-    })().catch((error) => {
-      console.error("[vinext] RSC prefetch setup error:", error);
-    });
+    })()
+      .catch((error) => {
+        console.error("[vinext] RSC prefetch setup error:", error);
+      })
+      .finally(() => {
+        if (setup !== null) endPrefetchSetup(setup);
+      });
   };
 
   if (priority === "high" || hasLinkAppNavigationRuntime()) {
