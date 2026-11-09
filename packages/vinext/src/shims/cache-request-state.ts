@@ -1,6 +1,7 @@
 import { getCdnCacheAdapter } from "./cdn-cache.js";
 import { type CacheLifeConfig, parseCacheLifeProfiles } from "../utils/cache-life-profiles.js";
-import { getHeadersAccessPhase } from "./internal/headers-state.js";
+import { getHeadersAccessPhase, isInsideAnyCacheScope } from "./internal/headers-state.js";
+import { isRouteCacheabilityProbe } from "./cacheability-classification.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
 import type { ResumeDataCache } from "./resume-data-cache.js";
 import {
@@ -399,6 +400,29 @@ export function runWithDetachedCacheObservations<T>(fn: () => Promise<T>): Promi
   );
 }
 
-export function shouldServeStaleUnstableCacheEntry(): boolean {
-  return getCacheState().unstableCacheRevalidation === "background";
+/**
+ * Whether a stale `fetch()`, `"use cache"` or `unstable_cache` entry must be
+ * regenerated before the read returns, instead of being served while it
+ * refreshes in the background. This is the one freshness policy for every
+ * persistent data cache.
+ *
+ * Like Next.js's `willConsumerServerCache`, the answer is yes whenever whoever
+ * consumes the value will persist it in a server cache: static generation (a
+ * prerender, a cacheability probe, an ISR or route handler regeneration, which
+ * run in the foreground mode) and an enclosing `"use cache"` or
+ * `unstable_cache` scope, even inside a dynamic request, and a fallback
+ * shell collecting its resume data cache, whose entries replay at any age.
+ * Serving the stale
+ * value there would store it again and extend its lifetime. Only an ordinary
+ * dynamic request, whose output nothing stores, opts into the background mode.
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/work-unit-async-storage.external.ts
+ */
+export function shouldRevalidateStaleCacheEntryInForeground(): boolean {
+  return (
+    getCacheState().unstableCacheRevalidation !== "background" ||
+    getCacheState().resumeDataCacheCollector !== null ||
+    process.env.VINEXT_PRERENDER === "1" ||
+    isRouteCacheabilityProbe() ||
+    isInsideAnyCacheScope()
+  );
 }

@@ -150,7 +150,6 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     currentForceDynamicFetchDefault: false,
     isDraftMode: false,
     dynamicFetchUrls: new Set<string>(),
-    refreshStaleFetchesInForeground: false,
     isFetchDedupeActive: false,
     currentFetchDedupeEntries: new Map(),
     nextFetchId: 1,

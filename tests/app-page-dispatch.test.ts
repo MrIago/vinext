@@ -47,6 +47,7 @@ import {
   _getResumeDataCacheSeed,
   _isOnDemandRevalidate,
   _setRequestScopedCacheLife,
+  shouldRevalidateStaleCacheEntryInForeground,
 } from "../packages/vinext/src/shims/cache-request-state.js";
 import {
   runWithExecutionContext,
@@ -1458,11 +1459,12 @@ describe("app page dispatch", () => {
     );
   });
 
+  // A request without the shell asks for it in the background mode; collecting
+  // the resume data cache still refreshes stale entries first.
   it("refreshes stale fetches before collecting a PPR fallback shell's resume data cache", async () => {
-    vi.stubEnv("VINEXT_PRERENDER", "1");
     const refreshInForeground: boolean[] = [];
     const buildPageElement = vi.fn<DispatchOptions["buildPageElement"]>(async () => {
-      refreshInForeground.push(getRequestContext().refreshStaleFetchesInForeground);
+      refreshInForeground.push(shouldRevalidateStaleCacheEntryInForeground());
       return React.createElement("main", null, "page");
     });
     const { options } = createDispatchOptions({
@@ -1474,8 +1476,9 @@ describe("app page dispatch", () => {
       pprRuntime: appPagePprRuntime,
     });
 
-    const response = await runWithRequestContext(createRequestContext(), () =>
-      dispatchAppPage(options),
+    const response = await runWithRequestContext(
+      createRequestContext({ unstableCacheRevalidation: "background" }),
+      () => dispatchAppPage(options),
     );
 
     expect(response.status).toBe(200);

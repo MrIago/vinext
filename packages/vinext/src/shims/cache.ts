@@ -62,7 +62,7 @@ import {
   getRegisteredCacheContext,
   markActionRevalidation,
   runWithDetachedCacheObservations,
-  shouldServeStaleUnstableCacheEntry,
+  shouldRevalidateStaleCacheEntryInForeground,
   type CacheLifeConfig,
 } from "./cache-request-state.js";
 
@@ -806,7 +806,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
         if (existing.cacheState === "stale") staleEntry = existing;
         if (cached.ok) {
           if (existing.cacheState === "stale") {
-            if (shouldServeStaleUnstableCacheEntry()) {
+            if (!shouldRevalidateStaleCacheEntryInForeground()) {
               collectFetchResumeDataCacheEntry(cacheKey, existing.value.data);
               scheduleUnstableCacheBackgroundRevalidation(cacheKey, () =>
                 refreshUnstableCacheResult(

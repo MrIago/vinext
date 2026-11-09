@@ -368,20 +368,19 @@ describe("render dynamic latch", () => {
         });
       });
 
-      it("keeps its cacheLife out of an enclosing cache", async () => {
+      // An enclosing cache persists what it reads, so the stale entry is
+      // refreshed before it returns rather than in the background, as in
+      // Next.js since vercel/next.js#96731.
+      it("is not deferred inside an enclosing cache", async () => {
         const getValue = createStaleRead("refresh-probe");
         await runScenario(async (refreshes) => {
           const readOuter = registerCachedFunction(async () => {
             cacheLife({ stale: 45, revalidate: 60, expire: 300 });
-            const value = await getValue();
-            // Let the refresh finish while the enclosing cache is still open.
-            await Promise.all(refreshes);
-            return value;
+            return getValue();
           }, "test:refresh-probe:outer");
 
-          expect(await readOuter()).toBe("stale");
-          expect(refreshes).toHaveLength(1);
-          expect(getRequestContext().requestScopedCacheLife?.stale).toBe(45);
+          expect(await readOuter()).toBe("short");
+          expect(refreshes).toHaveLength(0);
         });
       });
     });

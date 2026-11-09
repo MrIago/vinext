@@ -42,7 +42,6 @@ import {
   setCurrentFetchRevalidate,
   setCurrentForceDynamicFetchDefault,
   setCurrentFetchSoftTags,
-  setRefreshStaleFetchesInForeground,
 } from "vinext/shims/fetch-cache";
 import type { AppOutgoingElements } from "./app-elements.js";
 import type { AppPagePprFallbackCacheShell } from "./app-ppr-fallback-shell.js";
@@ -650,8 +649,6 @@ async function runAppPageRevalidationContext<TResult>(
     /** The render's request data; a static generation has none. */
     headersContext?: HeadersContext;
     params: AppPageParams;
-    /** Refresh stale fetches before rendering, as a prerender does. */
-    refreshStaleFetchesInForeground?: boolean;
     rootParams?: RootParams;
     routePattern: string;
     routeSegments: readonly string[];
@@ -682,9 +679,6 @@ async function runAppPageRevalidationContext<TResult>(
   const revalidation = runWithRequestContext(requestContext, () =>
     runInWorkStoreScope(async () => {
       ensureFetchPatch();
-      setRefreshStaleFetchesInForeground(
-        options.refreshStaleFetchesInForeground ?? process.env.VINEXT_PRERENDER === "1",
-      );
       setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], options.routeSegments));
       options.setNavigationContext({
         pathname: options.displayPathname ?? options.cleanPathname,
@@ -958,7 +952,6 @@ export async function renderAppPageFallbackShell<TRoute extends AppPageDispatchR
       draftModeSecret: options.draftModeSecret,
       dynamicConfig: options.dynamicConfig,
       params,
-      refreshStaleFetchesInForeground: true,
       rootParams: options.rootParams,
       routePattern: route.pattern,
       routeSegments: route.routeSegments,
@@ -1053,7 +1046,6 @@ export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRou
       // A runtime prefetch renders with the request's cookies and headers.
       headersContext: isRuntimePrefetch ? (getHeadersContext() ?? undefined) : undefined,
       params: options.params,
-      refreshStaleFetchesInForeground: true,
       rootParams: options.rootParams,
       routePattern: route.pattern,
       routeSegments: route.routeSegments,
@@ -1881,8 +1873,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     // The shell's resume data cache: every cache entry its renders read or wrote.
     const resumeDataCache = createResumeDataCache();
     _setResumeDataCacheCollector(resumeDataCache);
-    // Its entries replay at any age, so a stale fetch refreshes first, like Next.js.
-    setRefreshStaleFetchesInForeground(true);
+    // Its entries replay at any age, so while it collects, a stale cache entry
+    // refreshes first, like Next.js (see shouldRevalidateStaleCacheEntryInForeground).
     const warmupBuildResult = await buildCurrentPageElement();
     if (warmupBuildResult.response) {
       return warmupBuildResult.response;

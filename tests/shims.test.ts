@@ -8166,7 +8166,55 @@ describe('"use cache" runtime', () => {
     },
   );
 
-  it("serves stale nested values to a background regeneration", async () => {
+  // Ported from Next.js: test/e2e/app-dir/use-cache/use-cache.test.ts
+  // "should refresh a stale cache before storing it in an outer cache"
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache/use-cache.test.ts
+  it("refreshes a stale unstable_cache entry before an outer use cache stores it", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { revalidateTag, setCacheHandler, MemoryCacheHandler, unstable_cache } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    setCacheHandler(new MemoryCacheHandler());
+    let innerCount = 0;
+    const getInnerValue = unstable_cache(async () => ++innerCount, ["consumer-inner"], {
+      revalidate: false,
+      tags: ["cache-consumer-foreground-revalidate-inner"],
+    });
+    const getOuterValue = registerCachedFunction(
+      async (key: string) => ({ key, innerValue: await getInnerValue() }),
+      "test:cache-consumer-foreground-revalidate-outer",
+    );
+    const waitUntil: Promise<unknown>[] = [];
+    const request = (key: string) =>
+      runWithRequestContext(
+        createRequestContext({
+          unstableCacheRevalidation: "background",
+          executionContext: { waitUntil: (promise) => waitUntil.push(promise) },
+        }),
+        () => getOuterValue(key),
+      );
+
+    // A tag turns its entries stale only if they were written before it, so
+    // keep the write and the revalidation in different milliseconds.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+      const first = await request("first");
+      vi.setSystemTime(new Date("2026-01-01T00:00:01Z"));
+      revalidateTag("cache-consumer-foreground-revalidate-inner", "max");
+      // A different outer key misses, and that outer scope persists the inner
+      // value, so it must wait for the stale inner entry to revalidate.
+      const second = await request("second");
+      await Promise.all(waitUntil);
+      expect(second.innerValue).not.toBe(first.innerValue);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refreshes stale nested values before a background regeneration stores them", async () => {
     const { registerCachedFunction } =
       await import("../packages/vinext/src/shims/cache-runtime.js");
     const { cacheLife, setCacheHandler, MemoryCacheHandler } =
@@ -8202,10 +8250,10 @@ describe('"use cache" runtime', () => {
       for (let settled = 0; settled < waitUntil.length; settled = waitUntil.length) {
         await Promise.all(waitUntil);
       }
-      // Like Next.js, the outer regeneration used the stale inner value while the inner
-      // value regenerated in its own background task.
+      // Like Next.js since vercel/next.js#96731, the outer regeneration persists what it
+      // reads, so it regenerated the stale inner value first instead of storing it again.
       expect(innerCount).toBe(2);
-      await expect(request()).resolves.toBe("outer-2:inner-1");
+      await expect(request()).resolves.toBe("outer-2:inner-2");
     } finally {
       vi.useRealTimers();
     }
