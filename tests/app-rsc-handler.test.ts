@@ -12587,7 +12587,7 @@ describe("createAppRscHandler", () => {
     const response = await handler(
       new Request("https://example.test/docs/about", {
         method: "POST",
-        headers: { "next-action": "stale-action" },
+        headers: { "next-action": "stale-action#missing" },
       }),
       null,
     );

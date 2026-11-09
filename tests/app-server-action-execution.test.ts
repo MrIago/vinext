@@ -3066,7 +3066,7 @@ describe("app server action execution helpers", () => {
 
     const response = await handleServerActionRscRequest(
       createRscOptions({
-        actionId: "stale-action-id",
+        actionId: "stale-action-id#missing",
         clearRequestContext,
         contentType: "multipart/form-data; boundary=VINEXTDOS",
         decodeReply,
@@ -3272,7 +3272,7 @@ describe("app server action execution helpers", () => {
 
     const response = await handleServerActionRscRequest(
       createRscOptions({
-        actionId: "abc123",
+        actionId: "abc123#missing",
         loadServerAction() {
           return Promise.reject(new Error("server reference not found 'abc123'"));
         },

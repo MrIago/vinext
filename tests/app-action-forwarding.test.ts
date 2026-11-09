@@ -485,7 +485,7 @@ describe("unrecognized Server Action responses", () => {
   it("answers a malformed id with 400 Invalid Server Action request.", async () => {
     const { createServerActionNotFoundResponse } =
       await import("../packages/vinext/src/server/server-action-not-found.js");
-    const response = createServerActionNotFoundResponse("bad id\n");
+    const response = createServerActionNotFoundResponse("not-an-action-id");
     expect(response.status).toBe(400);
     expect(await response.text()).toBe("Invalid Server Action request.");
     expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
@@ -498,4 +498,22 @@ describe("unrecognized Server Action responses", () => {
     expect(response.status).toBe(409);
     expect(await response.text()).toBe("Server Action unavailable.");
   });
+
+  it.each(["", "#name", "/app/a.ts#", "/app/a.ts#1bad", "/app/a b.ts#x", "/app/a.ts#x y"])(
+    "treats %j as malformed",
+    async (actionId) => {
+      const { isMalformedServerActionId } =
+        await import("../packages/vinext/src/server/server-action-not-found.js");
+      expect(isMalformedServerActionId(actionId)).toBe(true);
+    },
+  );
+
+  it.each(["/app/actions.ts#submit", "000000000000#missing", "c1a2b3#default", "x#$$hoist_0"])(
+    "treats %j as well-formed",
+    async (actionId) => {
+      const { isMalformedServerActionId } =
+        await import("../packages/vinext/src/server/server-action-not-found.js");
+      expect(isMalformedServerActionId(actionId)).toBe(false);
+    },
+  );
 });

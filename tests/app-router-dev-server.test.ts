@@ -2412,7 +2412,7 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "fake-action-id",
+        "x-rsc-action": "fake-action-id#missing",
         Origin: "not-a-url",
         Host: new URL(baseUrl).host,
       },
@@ -2426,7 +2426,7 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "nonexistent-action",
+        "x-rsc-action": "nonexistent-action#missing",
         Origin: baseUrl,
         Host: new URL(baseUrl).host,
         "Content-Type": "text/plain",
@@ -2443,7 +2443,7 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "nonexistent-action",
+        "x-rsc-action": "nonexistent-action#missing",
         "Content-Type": "text/plain",
       },
       body: "[]",
@@ -2626,7 +2626,7 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "nonexistent-action",
+        "x-rsc-action": "nonexistent-action#missing",
         Origin: baseUrl,
         Host: new URL(baseUrl).host,
       },

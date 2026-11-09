@@ -8,21 +8,27 @@ const SERVER_ACTION_NOT_FOUND_DOCS =
  * Like Next.js (vercel/next.js#98123), an unrecognized Server Action is a
  * client error: a malformed id is `400 Invalid Server Action request.`, and a
  * well-formed id this deployment doesn't have (deployment skew) is
- * `409 Server Action unavailable.`. Next.js recognizes its fixed-length hex
- * ids; vinext's ids are module references (`<module>#<export>`), so an id is
- * malformed when it is empty, too long, or carries whitespace or control
- * characters no module reference has.
+ * `409 Server Action unavailable.`.
+ *
+ * Next.js recognizes an id by its fixed length (`mightBeServerReferenceId`).
+ * Every id vinext emits is `<referenceKey>#<exportName>`, as @vitejs/plugin-rsc
+ * builds it for `createServerReference`, so the equivalent structural check is
+ * a non-empty reference key, one `#`, and an export name that is a JavaScript
+ * identifier, with no whitespace or control character in the key.
  */
 const MAX_SERVER_ACTION_ID_LENGTH = 4096;
+const SERVER_ACTION_EXPORT_NAME_RE = /^[A-Za-z_$][\w$]*$/;
 
 export function isMalformedServerActionId(actionId: string | null): boolean {
   if (actionId === null) return false;
-  return (
-    actionId.length === 0 ||
-    actionId.length > MAX_SERVER_ACTION_ID_LENGTH ||
-    // oxlint-disable-next-line no-control-regex -- control characters are what make an id malformed
-    /[\s\u0000-\u001f\u007f]/.test(actionId)
-  );
+  if (actionId.length > MAX_SERVER_ACTION_ID_LENGTH) return true;
+  const hashIndex = actionId.lastIndexOf("#");
+  if (hashIndex <= 0) return true;
+  const referenceKey = actionId.slice(0, hashIndex);
+  const exportName = actionId.slice(hashIndex + 1);
+  // oxlint-disable-next-line no-control-regex -- control characters make an id malformed
+  if (/[\s\u0000-\u001f\u007f]/.test(referenceKey)) return true;
+  return !SERVER_ACTION_EXPORT_NAME_RE.test(exportName);
 }
 
 function getUnrecognizedActionStatusCode(actionId: string | null): 400 | 409 {
