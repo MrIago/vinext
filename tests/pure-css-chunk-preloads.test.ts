@@ -27,6 +27,12 @@ describe("dropUnemittedJsDeps", () => {
     expect(manifest.clientReferenceDeps.ref.js).toEqual(["/_next/static/chunks/button-b.js"]);
   });
 
+  it("matches whole file names only", () => {
+    const manifest = { clientEntryDeps: { js: ["/_next/static/chunks/other-a.js"], css: [] } };
+    dropUnemittedJsDeps(manifest, new Set(["a.js"]));
+    expect(manifest.clientEntryDeps.js).toEqual([]);
+  });
+
   it("leaves URLs it can't read alone", () => {
     const runtimeAsset = { other: true };
     const manifest = { clientEntryDeps: { js: [runtimeAsset], css: [] } };

@@ -35,7 +35,11 @@ export function dropUnemittedJsDeps(
     deps.js = deps.js.filter((url) => {
       const text = assetUrlText(url);
       // Leave a URL we can't read alone rather than drop a real chunk.
-      return text === null || emitted.some((fileName) => text.endsWith(fileName));
+      if (text === null) return true;
+      // plugin-rsc builds each URL as `base + fileName`, so the file is the
+      // URL's whole tail after a path boundary, never a partial name.
+      const path = text.split(/[?#]/, 1)[0]!;
+      return emitted.some((fileName) => path === fileName || path.endsWith(`/${fileName}`));
     });
     dropped += before - deps.js.length;
   };
