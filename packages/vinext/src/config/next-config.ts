@@ -352,6 +352,10 @@ export type NextConfig = {
   headers?: () => Promise<NextHeader[]> | NextHeader[];
   /** Image optimization config */
   images?: {
+    /** Image loader. Defaults to "default"; only "default" and "custom" can be combined with `loaderFile`. */
+    loader?: "default" | "imgix" | "cloudinary" | "akamai" | "custom";
+    /** Path (relative to the project root) to a module whose default export is the image loader. */
+    loaderFile?: string;
     remotePatterns?: Array<
       | URL
       | {
@@ -390,6 +394,18 @@ export type NextConfig = {
     contentDispositionType?: "inline" | "attachment";
     /** Content-Security-Policy header for image responses. Defaults to "script-src 'none'; frame-src 'none'; sandbox;" */
     contentSecurityPolicy?: string;
+    /**
+     * Formats the optimizer may serve, chosen from the Accept header in this
+     * order. Defaults to `["image/webp"]`, as in Next.js.
+     */
+    formats?: Array<"image/avif" | "image/webp">;
+    /**
+     * Bytes of optimized images the Node.js server keeps in
+     * `<outDir>/cache/images`. `0` disables the cache, as in Next.js.
+     */
+    maximumDiskCacheSize?: number;
+    /** Redirects the Node.js server follows for a remote image source. Defaults to 3. */
+    maximumRedirects?: number;
     /** Least max-age, in seconds, of an image the endpoint serves as-is. Defaults to 14400. */
     minimumCacheTTL?: number;
     /**

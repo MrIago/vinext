@@ -1005,8 +1005,9 @@ export default {
 
       const image = await get("/open.png");
       expect(image.status).toBe(200);
-      // Format negotiation reads the request headers after middleware.
-      expect(image.headers.get("content-type")).toBe("image/avif");
+      // Format negotiation reads the request headers after middleware, whose
+      // Accept names no default images.formats entry, so the PNG stays PNG.
+      expect(image.headers.get("content-type")).toBe("image/png");
       expect(fetchedAssetHeaders).toEqual(["1"]);
       expect(image.headers.get("x-mw")).toBe("1");
       expect(image.headers.getSetCookie()).toEqual(["mw=1"]);

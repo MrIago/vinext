@@ -34,7 +34,15 @@ import {
   staticFileCacheControl,
 } from "./static-file-cache.js";
 import { signalFromNodeResponse } from "./node-response-signal.js";
+import { fetchRemoteImage, RemoteImageError } from "./node-remote-image.js";
 import {
+  NodeImageCache,
+  optimizeNodeImage,
+  resolveNodeImageOptimizer,
+} from "./node-image-optimization.js";
+import {
+  handleImageOptimization,
+  imageSourceErrorResponse,
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,
   IMAGE_RESPONSE_CACHE_STATE,
@@ -45,6 +53,8 @@ import {
   isImageSourceBodyStatus,
   IMAGE_TYPE_NOT_ALLOWED_MESSAGE,
   isSafeImageContentType,
+  detectImageContentType,
+  IMAGE_DETECTION_LENGTH,
   sourceImageCacheControl,
   readImageOptimizationSignal,
   DEFAULT_DEVICE_SIZES,
@@ -807,6 +817,149 @@ function withImageSourceCacheControl(
       config,
     ),
   };
+}
+
+/**
+ * The type of the file the static cache serves for an image source, from its
+ * first bytes as the image endpoint types every source rather than by its
+ * name, or undefined when the cache has no such file.
+ */
+async function detectStaticImageContentType(
+  cache: StaticFileCache,
+  pathname: string,
+): Promise<string | null | undefined> {
+  const lookupPath = staticCacheLookupPath(pathname);
+  const entry = lookupPath === null ? undefined : cache.lookup(lookupPath);
+  if (!entry) return undefined;
+  const { buffer, headers, path, size } = entry.original;
+  const label = headers["Content-Type"] ?? null;
+  if (buffer) {
+    return detectImageContentType(buffer.subarray(0, IMAGE_DETECTION_LENGTH), label, size);
+  }
+  const file = await fsp.open(path, "r");
+  try {
+    const bytes = new Uint8Array(IMAGE_DETECTION_LENGTH);
+    // A read can return fewer bytes than asked for before the end of the file.
+    let bytesRead = 0;
+    while (bytesRead < IMAGE_DETECTION_LENGTH) {
+      const read = await file.read(bytes, bytesRead, IMAGE_DETECTION_LENGTH - bytesRead, bytesRead);
+      if (read.bytesRead === 0) break;
+      bytesRead += read.bytesRead;
+    }
+    return detectImageContentType(bytes.subarray(0, bytesRead), label, size);
+  } finally {
+    await file.close();
+  }
+}
+
+/**
+ * Answer an image request for a file in the static cache through the Node
+ * optimizer (the registered backend, else the application's `sharp`), as
+ * Next.js does. False when there is no optimizer, so the file is served as-is.
+ * A public file passes the Cache-Control a direct request gets, or null; a
+ * build asset passes undefined.
+ */
+async function serveNodeOptimizedImage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  imageRequest: Request,
+  cache: StaticFileCache,
+  sourcePath: string,
+  contentType: string,
+  publicFileCacheControl: string | null | undefined,
+  allowedWidths: number[],
+  imageConfig: ImageConfig | undefined,
+  optimizerRoots: readonly string[],
+  imageCache: NodeImageCache,
+): Promise<boolean> {
+  const lookupPath = staticCacheLookupPath(sourcePath);
+  const file = lookupPath === null ? undefined : cache.lookup(lookupPath)?.original;
+  if (!file) return false;
+  const optimizer = await resolveNodeImageOptimizer(optimizerRoots);
+  if (!optimizer) return false;
+  const response = await imageCache.handle(imageRequest, imageConfig, () =>
+    optimizeNodeImage(
+      imageRequest,
+      {
+        buffer: file.buffer,
+        path: file.path,
+        contentType,
+        isBuildAsset: publicFileCacheControl === undefined,
+        cacheControl: publicFileCacheControl ?? staticFileCacheControl(false),
+      },
+      optimizer,
+      allowedWidths,
+      imageConfig,
+    ),
+  );
+  if (imageRequest.signal.aborted) {
+    cancelResponseBody(response, imageRequest.signal.reason);
+    return true;
+  }
+  await sendWebResponse(response, req, res, false);
+  return true;
+}
+
+function isRemoteImageSource(imageUrl: string): boolean {
+  return /^https?:\/\//i.test(imageUrl);
+}
+
+/**
+ * Answer an image request for a remote source images.remotePatterns allows,
+ * fetched with the address checks and DNS pinning of Next.js'
+ * fetchExternalImage and optimized like a local file.
+ */
+async function serveNodeRemoteImage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  imageRequest: Request,
+  sourceHref: string,
+  allowedWidths: number[],
+  imageConfig: ImageConfig | undefined,
+  optimizerRoots: readonly string[],
+  imageCache: NodeImageCache,
+): Promise<void> {
+  const optimizer = await resolveNodeImageOptimizer(optimizerRoots);
+  const response = await imageCache.handle(imageRequest, imageConfig, () =>
+    handleImageOptimization(
+      imageRequest,
+      {
+        allowRemote: true,
+        fetchAsset: async () => {
+          try {
+            const image = await fetchRemoteImage(sourceHref, {
+              dangerouslyAllowLocalIP: imageConfig?.dangerouslyAllowLocalIP === true,
+              maximumResponseBody: imageConfig?.maximumResponseBody ?? 50_000_000,
+              maximumRedirects: imageConfig?.maximumRedirects ?? 3,
+            });
+            const headers = new Headers();
+            if (image.contentType) headers.set("Content-Type", image.contentType);
+            if (image.cacheControl) headers.set("Cache-Control", image.cacheControl);
+            return new Response(new Uint8Array(image.buffer), { headers });
+          } catch (error) {
+            if (error instanceof RemoteImageError) {
+              return imageSourceErrorResponse(error.statusCode, error.message);
+            }
+            console.error("[vinext] Failed to fetch remote image", sourceHref, error);
+            return imageSourceErrorResponse(
+              500,
+              '"url" parameter is valid but upstream response is invalid',
+            );
+          }
+        },
+        transformImage: optimizer
+          ? (body, options) => optimizer.transformImage(body, options)
+          : undefined,
+      },
+      allowedWidths,
+      imageConfig,
+    ),
+  );
+  if (imageRequest.signal.aborted) {
+    cancelResponseBody(response, imageRequest.signal.reason);
+    return;
+  }
+  await sendWebResponse(response, req, res, false);
 }
 
 /**
@@ -2050,6 +2203,13 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   // stat() calls — all lookups are pure in-memory Map.get(). Precompressed
   // .br/.gz/.zst variants (generated at build time) are detected automatically.
   const staticCache = await StaticFileCache.create(clientDir);
+  // Like `next`, which lists `sharp` as an optional dependency, the app owns it.
+  const imageOptimizerRoots = [serverDir, process.cwd()];
+  // Like Next.js' `.next/cache/images`, beside the build output.
+  const imageCache = new NodeImageCache(
+    path.join(path.dirname(clientDir), "cache", "images"),
+    imageConfig?.maximumDiskCacheSize,
+  );
 
   // Image optimization passthrough (Node.js prod server has no Images binding;
   // serves the original file with cache headers and security headers). Runs
@@ -2084,9 +2244,30 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     const parsedUrl = new URL(`/${signal.search}`, "http://localhost");
     const params = parseImageParams(parsedUrl, appImageAllowedWidths, imageConfig?.qualities, {
       localPatterns: imageConfig?.localPatterns,
+      remote: { remotePatterns: imageConfig?.remotePatterns, domains: imageConfig?.domains },
     });
     if (!params) {
       sendBadRequest("Bad Request");
+      return;
+    }
+    // The endpoint request middleware and rewrites produced, for the optimizer.
+    const imageRequestUrl = new URL(request.url);
+    imageRequestUrl.search = signal.search;
+    const imageRequest = new Request(imageRequestUrl, {
+      headers: signal.requestHeaders ?? request.headers,
+      signal: request.signal,
+    });
+    if (isRemoteImageSource(params.imageUrl)) {
+      await serveNodeRemoteImage(
+        req,
+        res,
+        imageRequest,
+        params.imageUrl,
+        appImageAllowedWidths,
+        imageConfig,
+        imageOptimizerRoots,
+        imageCache,
+      );
       return;
     }
     // Block SVG and other unsafe content types by checking the file extension
@@ -2107,12 +2288,40 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         imageConfig?.contentDispositionType === "attachment" ? "attachment" : "inline",
     };
     // A public file passes the Cache-Control its pipeline staged, or null; a
-    // build asset passes undefined.
-    const serveSource = (
+    // build asset passes undefined. Past the extension check above, the file's
+    // bytes decide the type served, as Next.js types every source.
+    const serveSource = async (
       sourcePath: string,
       publicFileCacheControl?: string | null,
-    ): Promise<boolean> =>
-      tryServeStatic(
+    ): Promise<boolean> => {
+      const contentType = await detectStaticImageContentType(staticCache, sourcePath);
+      if (contentType === undefined) return false;
+      if (contentType === null) {
+        sendBadRequest(INVALID_IMAGE_SOURCE_MESSAGE);
+        return true;
+      }
+      if (!isSafeImageContentType(contentType, imageConfig?.dangerouslyAllowSVG)) {
+        sendUnsafeContentType();
+        return true;
+      }
+      if (
+        await serveNodeOptimizedImage(
+          req,
+          res,
+          imageRequest,
+          staticCache,
+          sourcePath,
+          contentType,
+          publicFileCacheControl,
+          appImageAllowedWidths,
+          imageConfig,
+          imageOptimizerRoots,
+          imageCache,
+        )
+      ) {
+        return true;
+      }
+      return tryServeStatic(
         req,
         res,
         clientDir,
@@ -2121,8 +2330,9 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         staticCache,
         withImageSourceCacheControl(imageSecurityHeaders, publicFileCacheControl, imageConfig),
         undefined,
-        IMAGE_REPRESENTATION_HEADERS,
+        { ...IMAGE_REPRESENTATION_HEADERS, "Content-Type": contentType },
       );
+    };
 
     // Serve the source only as an anonymous direct request would receive it.
     // Build assets bypass middleware there too.
@@ -2580,6 +2790,11 @@ async function createPagesRouterRequestHandler(
         dangerouslyAllowSVG: vinextConfig.images.dangerouslyAllowSVG,
         dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,
         qualities: vinextConfig.images.qualities,
+        formats: vinextConfig.images.formats,
+        remotePatterns: vinextConfig.images.remotePatterns,
+        domains: vinextConfig.images.domains,
+        maximumRedirects: vinextConfig.images.maximumRedirects,
+        maximumDiskCacheSize: vinextConfig.images.maximumDiskCacheSize,
         localPatterns: vinextConfig.images.localPatterns,
         contentDispositionType: vinextConfig.images.contentDispositionType,
         contentSecurityPolicy: vinextConfig.images.contentSecurityPolicy,
@@ -2601,6 +2816,13 @@ async function createPagesRouterRequestHandler(
 
   // Build the static file metadata cache at startup (same as App Router).
   const staticCache = await StaticFileCache.create(clientDir);
+  // Like `next`, which lists `sharp` as an optional dependency, the app owns it.
+  const imageOptimizerRoots = [serverDir, process.cwd()];
+  // Like Next.js' `.next/cache/images`, beside the build output.
+  const imageCache = new NodeImageCache(
+    path.join(path.dirname(clientDir), "cache", "images"),
+    pagesImageConfig?.maximumDiskCacheSize,
+  );
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stripNodeRequestUrlFragment(req);
@@ -3047,11 +3269,33 @@ async function createPagesRouterRequestHandler(
               parsedUrl,
               allowedImageWidths,
               pagesImageConfig?.qualities,
-              { localPatterns: pagesImageConfig?.localPatterns },
+              {
+                localPatterns: pagesImageConfig?.localPatterns,
+                remote: {
+                  remotePatterns: pagesImageConfig?.remotePatterns,
+                  domains: pagesImageConfig?.domains,
+                },
+              },
             );
             if (!params) {
               res.writeHead(400);
               res.end("Bad Request");
+              return true;
+            }
+            if (isRemoteImageSource(params.imageUrl)) {
+              await serveNodeRemoteImage(
+                req,
+                res,
+                new Request(new URL(resolvedUrl, webRequest.url), {
+                  headers: filesystemRequest.headers,
+                  signal: webRequest.signal,
+                }),
+                params.imageUrl,
+                allowedImageWidths,
+                pagesImageConfig,
+                imageOptimizerRoots,
+                imageCache,
+              );
               return true;
             }
             // Check the extension of the file actually served, not the `url`
@@ -3073,12 +3317,45 @@ async function createPagesRouterRequestHandler(
                 pagesImageConfig?.contentDispositionType === "attachment" ? "attachment" : "inline",
             };
             // A public file passes the Cache-Control its pipeline staged, or
-            // null; a build asset passes undefined.
-            const serveSource = (
+            // null; a build asset passes undefined. Past the extension check
+            // above, the file's bytes decide the type served, as Next.js types
+            // every source.
+            const serveSource = async (
               sourcePath: string,
               publicFileCacheControl?: string | null,
-            ): Promise<boolean> =>
-              tryServeStatic(
+            ): Promise<boolean> => {
+              const contentType = await detectStaticImageContentType(staticCache, sourcePath);
+              if (contentType === undefined) return false;
+              if (contentType === null) {
+                res.writeHead(400);
+                res.end(INVALID_IMAGE_SOURCE_MESSAGE);
+                return true;
+              }
+              if (!isSafeImageContentType(contentType, pagesImageConfig?.dangerouslyAllowSVG)) {
+                sendUnsafeContentType();
+                return true;
+              }
+              if (
+                await serveNodeOptimizedImage(
+                  req,
+                  res,
+                  new Request(new URL(resolvedUrl, webRequest.url), {
+                    headers: filesystemRequest.headers,
+                    signal: webRequest.signal,
+                  }),
+                  staticCache,
+                  sourcePath,
+                  contentType,
+                  publicFileCacheControl,
+                  allowedImageWidths,
+                  pagesImageConfig,
+                  imageOptimizerRoots,
+                  imageCache,
+                )
+              ) {
+                return true;
+              }
+              return tryServeStatic(
                 req,
                 res,
                 clientDir,
@@ -3091,8 +3368,9 @@ async function createPagesRouterRequestHandler(
                   pagesImageConfig,
                 ),
                 undefined,
-                IMAGE_REPRESENTATION_HEADERS,
+                { ...IMAGE_REPRESENTATION_HEADERS, "Content-Type": contentType },
               );
+            };
 
             // Serve the source only as an anonymous direct request would
             // receive it. Build assets bypass middleware there too.

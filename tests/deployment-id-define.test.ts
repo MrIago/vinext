@@ -38,7 +38,10 @@ async function setupTmpProject(nextConfigBody: string): Promise<string> {
   return tmpDir;
 }
 
-async function runConfig(tmpDir: string): Promise<Record<string, string>> {
+async function runConfig(
+  tmpDir: string,
+  userPlugins: { name: string }[] = [],
+): Promise<Record<string, string>> {
   const vinext = (await import("../packages/vinext/src/index.js")).default;
   const plugins = vinext() as VinextPlugin[];
   const mainPlugin = plugins.find(
@@ -46,7 +49,7 @@ async function runConfig(tmpDir: string): Promise<Record<string, string>> {
   );
   expect(mainPlugin).toBeDefined();
   const result = (await mainPlugin!.config!(
-    { root: tmpDir, build: {}, plugins: [], optimizeDeps: {} },
+    { root: tmpDir, build: {}, plugins: userPlugins, optimizeDeps: {} },
     { command: "build" },
   )) as { define?: Record<string, string> };
   expect(result.define).toBeDefined();
@@ -105,4 +108,19 @@ describe("image optimization define", () => {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   }, 15000);
+
+  it("lets next/image send remote sources to the endpoint only on the Node.js server", async () => {
+    const tmpDir = await setupTmpProject(`export default {};`);
+    try {
+      expect((await runConfig(tmpDir))["process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION"]).toBe(
+        '"true"',
+      );
+      const workers = await runConfig(tmpDir, [{ name: "vite-plugin-cloudflare" }]);
+      expect(workers["process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION"]).toBe('"false"');
+      const nitro = await runConfig(tmpDir, [{ name: "nitro" }]);
+      expect(nitro["process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION"]).toBe('"false"');
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 30000);
 });
