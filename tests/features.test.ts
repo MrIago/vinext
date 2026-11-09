@@ -3047,6 +3047,18 @@ describe("MetadataHead rendering", () => {
     expect(html).toContain('href="/apple.png"');
   });
 
+  // https://github.com/cloudflare/vinext/issues/3066: Next.js resolves an
+  // absolute metadata URL with `new URL()`, which percent-encodes it.
+  it("percent-encodes absolute og:image and twitter:image URLs", () => {
+    const html = renderMetadataToHtml({
+      openGraph: { images: ["https://cdn.example.com/og image.png"] },
+      twitter: { images: ["https://cdn.example.com/tw image.png"] },
+    });
+    expect(html).toContain('content="https://cdn.example.com/og%20image.png"');
+    expect(html).toContain('content="https://cdn.example.com/tw%20image.png"');
+    expect(html).not.toContain("og image.png");
+  });
+
   it("serializes rich metadata for the streaming body outlet", () => {
     const html = renderMetadataToHtml(
       {

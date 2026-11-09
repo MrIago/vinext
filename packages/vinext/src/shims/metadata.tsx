@@ -861,6 +861,21 @@ function formatResolvedMetadataUrl(url: URL): string {
 const TRAILING_SLASH_FILE_REGEX =
   /^(?:\/((?!\.well-known(?:\/.*)?)((?:[^/]+\/)*)([^/]+\.\w+)))(\/?|$)/i;
 
+/**
+ * Next.js passes every absolute metadata URL through `new URL()`
+ * (resolvers/resolve-url.ts `resolveUrl`), so a space or other unsafe
+ * character in an og:image or twitter:image is percent-encoded (#3066).
+ * Relative and unparseable values are returned unchanged.
+ */
+function encodeAbsoluteMetadataUrl(value: string): string {
+  if (!/^[a-z][a-z\d+.-]*:/i.test(value)) return value;
+  try {
+    return new URL(value).href;
+  } catch {
+    return value;
+  }
+}
+
 function resolveMetadataUrl(
   url: string | URL,
   metadataBase: URL | null | undefined,
@@ -868,7 +883,7 @@ function resolveMetadataUrl(
 ): string {
   const value = stringifyUrl(url);
   if (!metadataBase) {
-    return value;
+    return encodeAbsoluteMetadataUrl(value);
   }
 
   try {
@@ -877,7 +892,7 @@ function resolveMetadataUrl(
       ? new URL(value, metadataBase)
       : new URL(joinMetadataPath(metadataBase.pathname, value), metadataBase);
     if (isAbsolute && composed.origin !== metadataBase.origin) {
-      return value;
+      return encodeAbsoluteMetadataUrl(value);
     }
     // Match Next.js's resolveAbsoluteUrlWithPathname: only ADD a trailing slash
     // when trailingSlash is true; never strip when false. See
