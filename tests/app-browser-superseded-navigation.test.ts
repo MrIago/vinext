@@ -12,7 +12,10 @@ function state(
   return { activeOperation, visibleCommitVersion } as AppRouterState;
 }
 
-const committed = (lane: "navigation" | "traverse", startedVisibleCommitVersion: number) => ({
+const committed = (
+  lane: "navigation" | "traverse" | "server-action" | "refresh",
+  startedVisibleCommitVersion: number,
+) => ({
   id: 1,
   lane,
   startedVisibleCommitVersion,
@@ -37,6 +40,14 @@ describe("isSupersededByHistoryRestore", () => {
     const visible = state(1, committed("navigation", 0));
     const nextNavigation = state(2, committed("navigation", 1));
     expect(isSupersededByHistoryRestore(visible, nextNavigation)).toBe(false);
+  });
+
+  it("keeps a Server Action result or refresh that started before the restore", () => {
+    const restored = state(2, committed("traverse", 1));
+    expect(isSupersededByHistoryRestore(restored, state(2, committed("server-action", 1)))).toBe(
+      false,
+    );
+    expect(isSupersededByHistoryRestore(restored, state(2, committed("refresh", 1)))).toBe(false);
   });
 
   it("never drops a later traversal", () => {

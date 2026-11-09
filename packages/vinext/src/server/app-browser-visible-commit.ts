@@ -573,8 +573,10 @@ export function isSupersededByHistoryRestore(
   const operation = next.activeOperation;
   return (
     restore?.lane === "traverse" &&
-    operation !== null &&
-    operation.lane !== "traverse" &&
+    // Only a navigation is superseded by the traversal. A refresh, an HMR
+    // update or a Server Action result still applies on top of the restored
+    // tree, as in Next.js.
+    operation?.lane === "navigation" &&
     operation.startedVisibleCommitVersion < current.visibleCommitVersion
   );
 }
