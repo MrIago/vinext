@@ -2034,6 +2034,38 @@ function processedRouteSources(
  * Resolve a NextConfig into a fully-resolved ResolvedNextConfig.
  * Awaits async functions for redirects/rewrites/headers.
  */
+const EXPERIMENTAL_REACT_FLAGS = [
+  "blockingSSR",
+  "taint",
+  "transitionIndicator",
+  "gestureTransition",
+  "hydrationChangeEvent",
+  "externalBrowserRuntime",
+  "useExperimentalReact",
+] as const;
+
+/**
+ * The enabled `experimental` flags that need React's experimental channel.
+ * Ported from Next.js: packages/next/src/lib/needs-experimental-react.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/needs-experimental-react.ts
+ */
+export function getExperimentalReactFlags(
+  experimental: Record<string, unknown> | undefined,
+): string[] {
+  if (!experimental) return [];
+  return EXPERIMENTAL_REACT_FLAGS.filter((flag) => Boolean(experimental[flag]));
+}
+
+function readInstalledReactVersion(root: string): string | null {
+  try {
+    const require = createRequire(path.join(root, "package.json"));
+    const pkg = require("react/package.json") as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveNextConfig(
   config: NextConfig | null,
   root: string = toSlash(process.cwd()),
@@ -2352,6 +2384,22 @@ export async function resolveNextConfig(
       '[vinext] next.config option "experimental.swcEnvOptions" is not applicable and will be ignored (vinext uses Vite, not SWC). ' +
         "A Vite-compatible polyfill solution may be explored in the future.",
     );
+  }
+
+  // Next.js switches its bundled React to the experimental channel for these
+  // flags (lib/needs-experimental-react.ts). vinext renders with the app's own
+  // React, so it can only check that the installed copy is experimental and say
+  // how to get it (#2109, #4390). `useExperimentalReact` is the legacy switch.
+  const experimentalReactFlags = getExperimentalReactFlags(experimental);
+  if (experimentalReactFlags.length > 0) {
+    const reactVersion = readInstalledReactVersion(root);
+    if (reactVersion !== null && !/-(?:experimental|canary)-/.test(reactVersion)) {
+      console.warn(
+        `[vinext] next.config ${experimentalReactFlags.map((flag) => `"experimental.${flag}"`).join(", ")} ` +
+          `needs React's experimental channel, but react@${reactVersion} is installed. ` +
+          "Install react@experimental and react-dom@experimental to use it.",
+      );
+    }
   }
 
   // `next/root-params` is now stable — no longer requires an experimental flag.
