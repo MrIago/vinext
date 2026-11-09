@@ -141,6 +141,7 @@ const appPrerenderStaticParamsPath = resolveEntryPath(
   "../server/app-prerender-static-params.js",
   import.meta.url,
 );
+const appParamMatchingPath = resolveEntryPath("../server/app-param-matching.js", import.meta.url);
 const seedCachePath = resolveEntryPath("../server/seed-cache.js", import.meta.url);
 const pregeneratedConcretePathsPath = resolveEntryPath(
   "../server/pregenerated-concrete-paths.js",
@@ -1087,6 +1088,7 @@ import { clearAppRequestContext as __clearRequestContext, setAppNavigationContex
 __configureMemoryCacheHandler({ cacheMaxMemorySize: ${JSON.stringify(cacheMaxMemorySize)} });
 import { createAppPrerenderStaticParamsResolver as __createAppPrerenderStaticParamsResolver } from ${JSON.stringify(appPrerenderStaticParamsPath)};
 import { ensureAppRouteModulesLoaded as __ensureRouteLoaded } from ${JSON.stringify(appRouteModuleLoaderPath)};
+import { resolveAppParamMatchingPolicies as __resolveAppParamMatchingPolicies } from ${JSON.stringify(appParamMatchingPath)};
 import {
   getRenderedConcreteUrlPathsForRoute as __getRenderedConcreteUrlPathsForRoute,
   initPregeneratedPathsFromGlobals as __initPregeneratedPathsFromGlobals,
@@ -2197,6 +2199,12 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       : ""
   }
   rootParamNamesByPattern: rootParamNamesMap,
+  resolvePrerenderParamMatchingPolicies() {
+    return __resolveAppParamMatchingPolicies(routes, {
+      cacheComponents: ${cacheComponents},
+      ensureRouteLoaded: __ensureRouteLoaded,
+    });
+  },
   setNavigationContext,
   skipProxyUrlNormalize: ${JSON.stringify(config?.skipProxyUrlNormalize ?? false)},
   skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
