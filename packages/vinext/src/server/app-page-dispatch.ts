@@ -147,6 +147,18 @@ import { encodePrerenderRouteParams } from "./prerender-route-params.js";
 import { runWithPrerenderWorkUnit } from "./prerender-work-unit-setup.js";
 import { normalizePregeneratedPathname } from "./pregenerated-concrete-paths.js";
 import { getFrameworkLinkHeader } from "./app-response-header-provenance.js";
+import { notFoundResponse } from "./http-error-responses.js";
+import {
+  collectGeneratedParamNames,
+  getResolvedClosedParamNames,
+  isParamMatchingFallbackShellAllowed,
+  resolveParamMatchingAdmission,
+  resolveRouteParamMatching,
+  validateParamMatchingParams,
+  type ParamMatching,
+  type ParamMatchingFallbackMode,
+  type ParamMatchingRoute,
+} from "./app-param-matching.js";
 
 type AppPageParams = Record<string, string | string[]>;
 type AppPageElement = ReactNode | Readonly<Record<string, ReactNode>>;
@@ -810,12 +822,141 @@ function withRenderMode<TRoute extends AppPageDispatchRoute>(
   return options.withRequest?.({ renderMode }) ?? { ...options, renderMode };
 }
 
+type AppPageParamMatchingAdmission = {
+  fallbackMode: ParamMatchingFallbackMode | undefined;
+  paramMatching: ParamMatching;
+  resolvedParamCount: number;
+};
+
+const paramMatchingAdmissions = new WeakMap<
+  Request,
+  Promise<AppPageParamMatchingAdmission | null>
+>();
+
+/**
+ * Where the request stands under its route's `unstable_paramMatching` policy,
+ * once per request. Null when the route configures none, or for a render that
+ * isn't a request for the route's URL: a fallback shell's own render, which
+ * leaves its params as placeholders, or one that skips generated-param checks.
+ *
+ * Like Next.js's prerender matchers, the most specific generated prefix of
+ * the request's params decides, and the first configured param after it gives
+ * the mode. Next.js reads both from its prerender manifest; vinext asks
+ * generateStaticParams, as `dynamicParams = false` does, so a deploy without
+ * prerendering decides the same way.
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/base-server.ts
+ */
+function getAppPageParamMatchingAdmission<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+): Promise<AppPageParamMatchingAdmission | null> {
+  if (
+    options.pprFallbackShell !== undefined ||
+    options.skipStaticParamsValidation === true ||
+    options.route.params.length === 0
+  ) {
+    return Promise.resolve(null);
+  }
+  let admission = paramMatchingAdmissions.get(options.request);
+  if (!admission) {
+    admission = resolveAppPageParamMatchingAdmission(options);
+    paramMatchingAdmissions.set(options.request, admission);
+  }
+  return admission;
+}
+
+async function resolveAppPageParamMatchingAdmission<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+): Promise<AppPageParamMatchingAdmission | null> {
+  const route = options.route as TRoute & ParamMatchingRoute;
+  const paramMatching = await resolveRouteParamMatching(route, {
+    cacheComponents: options.pprRuntime !== undefined,
+    run: (work) => runAppPageStaticGenerationWork(options, work),
+  });
+  if (!paramMatching) return null;
+
+  const { hasGeneratedStaticParamsFor, resolveAppPageGeneratedStaticParams } =
+    await import("./app-page-request.js");
+  const params = options.staticParamsValidationParams ?? options.params;
+  const generated = await runAppPageStaticGenerationWork(options, () =>
+    resolveAppPageGeneratedStaticParams({
+      generateStaticParams: options.generateStaticParams,
+      params,
+      routeParamNames: {
+        optionalCatchAllParamNames: route.pattern
+          .split("/")
+          .filter((part) => part.startsWith(":") && part.endsWith("*"))
+          .map((part) => part.slice(1, -1)),
+        paramNames: route.params,
+      },
+    }),
+  );
+  const staticParams = generated?.staticParams ?? [];
+  // The build checks this against every generated set; dev checks it here,
+  // as Next.js's dev server does when it resolves the route's static paths.
+  const { generatedParamNames, missingParamNames } = collectGeneratedParamNames(
+    route.params,
+    staticParams,
+  );
+  validateParamMatchingParams(
+    route.pattern,
+    paramMatching,
+    generatedParamNames,
+    missingParamNames,
+    route.params,
+    undefined,
+  );
+
+  if (generated?.isGenerated) {
+    return { fallbackMode: undefined, paramMatching, resolvedParamCount: route.params.length };
+  }
+  return {
+    paramMatching,
+    ...resolveParamMatchingAdmission({
+      dynamicParams: options.dynamicParamsConfig,
+      isGenerated: (paramNames) => hasGeneratedStaticParamsFor(params, staticParams, paramNames),
+      paramMatching,
+      rootParamNames: route.rootParamNames ?? [],
+      routeParamNames: route.params,
+    }),
+  };
+}
+
+/**
+ * The fallback shells a request may resume under its admission: none past a
+ * blocking boundary, and only those leaving a fallback boundary unknown.
+ */
+function filterParamMatchingFallbackShells<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  admission: AppPageParamMatchingAdmission | null,
+): DispatchAppPageOptions<TRoute> {
+  if (!admission || !options.pprFallbackCacheShells?.length) return options;
+  const rootParamNames = (options.route as TRoute & ParamMatchingRoute).rootParamNames ?? [];
+  return {
+    ...options,
+    pprFallbackCacheShells:
+      admission.fallbackMode === "blocking"
+        ? []
+        : options.pprFallbackCacheShells.filter((shell) =>
+            isParamMatchingFallbackShellAllowed(
+              admission.paramMatching,
+              shell.fallbackParamNames,
+              rootParamNames,
+            ),
+          ),
+  };
+}
+
 export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
 ): Promise<Response> {
   const prefetchStage =
     options.renderMode === undefined ? undefined : getStaticShellPrefetchStage(options.renderMode);
-  if (prefetchStage !== undefined) {
+  // A rejected param value is a 404 before any prefetch serves its route, so
+  // client route discovery never learns a tree for it.
+  if (
+    prefetchStage !== undefined &&
+    (await getAppPageParamMatchingAdmission(options))?.fallbackMode !== "not-found"
+  ) {
     const {
       markRuntimePrefetchResponse,
       prefetchesAtRuntime,
@@ -1015,7 +1156,10 @@ export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRou
   if (!options.withRequest) throw new Error("[vinext] A static shell needs its own request.");
   const route = options.route;
   const pathname = options.cleanPathname;
-  const varyParams = new Set<string>();
+  // Closed params decide whether the route exists even when no component
+  // reads them, so a shell is shared only by URLs with the same values, as
+  // Next.js's `PrefetchHint.IsClosedParam` keeps the client from predicting.
+  const varyParams = new Set<string>(getResolvedClosedParamNames(route));
   const pprFallbackShell = {
     fallbackParamNames: [],
     ...(isRuntimePrefetch ? { isRuntimePrefetch: true } : {}),
@@ -1278,6 +1422,54 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // serves the stored entry: it renders in the foreground and stores that.
   const isOnDemandRevalidate = _isOnDemandRevalidate();
   const shouldReadCache = isStoredRender && !isOnDemandRevalidate;
+  // A request a generated-param check rejects: `dynamicParams = false`, or a
+  // parameter matching `not-found` boundary.
+  const renderGeneratedParamMiss = async (
+    plainResponse: Response,
+    boundary: Pick<
+      Parameters<typeof options.renderHttpAccessFallbackPage>[1],
+      "boundaryComponent" | "boundaryModule" | "layouts"
+    >,
+  ): Promise<Response> => {
+    const renderedNotFound = await options.renderHttpAccessFallbackPage(
+      404,
+      { ...boundary, matchedParams: options.params },
+      options.middlewareContext,
+    );
+    const cachePolicy = {
+      dynamicStaleTimeSeconds: options.dynamicStaleTimeSeconds,
+      isDraftMode,
+      isDynamicError,
+      isForceDynamic,
+      isForceStatic,
+      isPrerender,
+      isProduction: options.isProduction,
+      isProgressiveActionRender: options.isProgressiveActionRender === true,
+      isRscRequest: options.isRscRequest,
+      isStaticEligible,
+      middlewareContext: options.middlewareContext,
+      peekDynamicUsage,
+      revalidateSeconds: currentRevalidateSeconds,
+      scriptNonce: options.scriptNonce,
+    };
+    if (renderedNotFound) {
+      return applyIneligibleRouteCachePolicy(renderedNotFound, cachePolicy);
+    }
+    options.clearRequestContext();
+    return applyIneligibleRouteCachePolicy(plainResponse, cachePolicy);
+  };
+  // Like Next.js, a parameter matching rejection is decided before the cache
+  // is read, and renders the root not-found without the route's layouts
+  // below the root one: routing rejects the URL, not the page.
+  const paramMatchingAdmission = await getAppPageParamMatchingAdmission(options);
+  if (paramMatchingAdmission?.fallbackMode === "not-found") {
+    const boundaryModule = options.rootNotFoundModule ?? getDefaultHttpAccessFallbackModule(404);
+    return renderGeneratedParamMiss(notFoundResponse(), {
+      boundaryComponent: boundaryModule?.default,
+      boundaryModule,
+      layouts: route.layouts.slice(0, 1),
+    });
+  }
   // A render that may be stored, and so must not let the request's query reach
   // its output unless it turns out dynamic. The Workers Cache deploy probe
   // renders this way too, so its manifest matches the runtime. A
@@ -1635,7 +1827,11 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // Next.js' production force-dynamic routes are absent from the prerender
   // manifest, so they never enter its generated-path fallback gate. Dev still
   // resolves and exact-matches generateStaticParams for the same route.
-  if (options.skipStaticParamsValidation !== true && !(options.isProduction && isForceDynamic)) {
+  if (
+    paramMatchingAdmission === null &&
+    options.skipStaticParamsValidation !== true &&
+    !(options.isProduction && isForceDynamic)
+  ) {
     const dynamicParamsResponse = await validateAppPageDynamicParams({
       enforceStaticParamsOnly: options.dynamicParamsConfig === false,
       generateStaticParams: options.generateStaticParams,
@@ -1645,44 +1841,17 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     if (dynamicParamsResponse) {
       // A generated-param miss belongs to a matched App route, so render the
       // route's not-found boundary just like a page-level notFound() signal.
-      // The plain response remains a defensive fallback if boundary rendering
-      // is unavailable, but the normal path must include Next.js's canonical
-      // not-found markup (and custom not-found.tsx when present). The route's
-      // own not-found is the nearest one in its tree; the manifest's root
-      // not-found can belong to another root layout's (issue #4304).
-      const boundaryModule = route.notFound ?? getDefaultHttpAccessFallbackModule(404);
-      const renderedNotFound = await options.renderHttpAccessFallbackPage(
-        404,
-        { boundaryModule, matchedParams: options.params },
-        options.middlewareContext,
-      );
-      const cachePolicy = {
-        dynamicStaleTimeSeconds: options.dynamicStaleTimeSeconds,
-        isDraftMode,
-        isDynamicError,
-        isForceDynamic,
-        isForceStatic,
-        isPrerender,
-        isProduction: options.isProduction,
-        isProgressiveActionRender: options.isProgressiveActionRender === true,
-        isRscRequest: options.isRscRequest,
-        isStaticEligible,
-        middlewareContext: options.middlewareContext,
-        peekDynamicUsage,
-        revalidateSeconds: currentRevalidateSeconds,
-        scriptNonce: options.scriptNonce,
-      };
-      if (renderedNotFound) {
-        return applyIneligibleRouteCachePolicy(renderedNotFound, cachePolicy);
-      }
-      options.clearRequestContext();
-      return applyIneligibleRouteCachePolicy(dynamicParamsResponse, cachePolicy);
+      // The route's own not-found is the nearest one in its tree; the
+      // manifest's root not-found can belong to another root layout's (issue #4304).
+      return renderGeneratedParamMiss(dynamicParamsResponse, {
+        boundaryModule: route.notFound ?? getDefaultHttpAccessFallbackModule(404),
+      });
     }
   }
 
   const fallbackShellResult = options.pprRuntime
     ? await options.pprRuntime.tryServe(
-        options,
+        filterParamMatchingFallbackShells(options, paramMatchingAdmission),
         currentRevalidateSeconds,
         isDraftMode,
         isForceStatic,
