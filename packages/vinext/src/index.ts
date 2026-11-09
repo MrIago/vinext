@@ -1511,6 +1511,8 @@ const RESOLVED_CDN_CACHE_ADAPTER = VIRTUAL_PREFIX + VIRTUAL_CDN_CACHE_ADAPTER;
 const RESOLVED_IMAGE_ADAPTERS = VIRTUAL_PREFIX + VIRTUAL_IMAGE_ADAPTERS;
 /** Virtual module for composed instrumentation-client bootstrap. */
 const VIRTUAL_INSTRUMENTATION_CLIENT = "private-next-instrumentation-client";
+const VIRTUAL_INJECTED_INSTRUMENTATION = "virtual:vinext-injected-instrumentation";
+const RESOLVED_INJECTED_INSTRUMENTATION = `${VIRTUAL_PREFIX}${VIRTUAL_INJECTED_INSTRUMENTATION}.mjs`;
 const RESOLVED_INSTRUMENTATION_CLIENT = `${VIRTUAL_PREFIX}${VIRTUAL_INSTRUMENTATION_CLIENT}.mjs`;
 /** What a static image import resolves to, beside its URL (Next.js' StaticImageData). */
 type StaticImageMeta = { width: number; height: number } & StaticImageBlur;
@@ -1937,6 +1939,49 @@ function readPackageJsonType(root: string): unknown {
   }
 }
 
+/**
+ * `instrumentationInject` lets adapters and config wrappers add server
+ * instrumentation without touching the app (vercel/next.js#100658). The
+ * composite module imports each injected module, then the project's
+ * instrumentation file; `register()` hooks run in that order, and each
+ * `onRequestError()` runs on its own so one failing hook can't silence the
+ * others. Null when nothing is injected.
+ */
+export function createInjectedInstrumentationModule(
+  injected: readonly string[],
+  projectInstrumentationPath: string | null,
+): string | null {
+  if (injected.length === 0) return null;
+  const sources = projectInstrumentationPath ? [...injected, projectInstrumentationPath] : injected;
+  const imports = sources
+    .map(
+      (source, index) =>
+        `import * as __vinextInstrumentation${index} from ${JSON.stringify(source)};`,
+    )
+    .join("\n");
+  const modules = sources.map((_, index) => `__vinextInstrumentation${index}`).join(", ");
+  return `${imports}
+const modules = [${modules}];
+export async function register() {
+  for (const mod of modules) {
+    if (typeof mod.register === "function") await mod.register();
+  }
+}
+export async function onRequestError(...args) {
+  await Promise.all(
+    modules.map(async (mod) => {
+      if (typeof mod.onRequestError !== "function") return;
+      try {
+        await mod.onRequestError(...args);
+      } catch (error) {
+        console.error("[vinext] onRequestError handler threw:", error);
+      }
+    }),
+  );
+}
+`;
+}
+
 export default function vinext(options: VinextOptions = {}): PluginOption[] {
   const internalOptions = options as InternalVinextOptions;
   const { supportsNativeTypeofWindowFolding: useNativeTypeofWindowFolding } =
@@ -1960,6 +2005,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let middlewarePath: string | null = null;
   let canonicalMiddlewarePath: string | null = null;
   let instrumentationPath: string | null = null;
+  // The project's own instrumentation file. With `instrumentationInject`,
+  // `instrumentationPath` is the composite module that runs the injected
+  // modules before it.
+  let projectInstrumentationPath: string | null = null;
+  let injectedInstrumentationModule: string | null = null;
   let instrumentationClientPath: string | null = null;
   let clientInjectModule: string | null = null;
   let globalNotFoundCssIsolationPath: string | null = null;
@@ -3180,7 +3230,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           env?.command === "build" && nextConfig.globalNotFound
             ? findFileWithExts(appDir, "global-not-found", fileMatcher)
             : null;
-        instrumentationPath = findInstrumentationFile(root, fileMatcher);
+        projectInstrumentationPath = findInstrumentationFile(root, fileMatcher);
+        injectedInstrumentationModule = createInjectedInstrumentationModule(
+          nextConfig.instrumentationInject.map((entry) =>
+            entry.startsWith(".") || path.isAbsolute(entry) ? path.resolve(root, entry) : entry,
+          ),
+          projectInstrumentationPath,
+        );
+        instrumentationPath =
+          injectedInstrumentationModule === null
+            ? projectInstrumentationPath
+            : VIRTUAL_INJECTED_INSTRUMENTATION;
         instrumentationClientPath = findInstrumentationClientFile(root, fileMatcher);
         const middlewareConventionDir =
           canonicalize(baseDir) === canonicalize(path.join(root, "src"))
@@ -4317,7 +4377,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ...(hasPagesDir
                 ? [toRelativeFileEntry(root, pagesDir) + "/**/*.{tsx,ts,jsx,js}"]
                 : []),
-              ...[instrumentationPath, instrumentationClientPath].flatMap((entry) =>
+              ...[projectInstrumentationPath, instrumentationClientPath].flatMap((entry) =>
                 entry ? [toRelativeFileEntry(root, entry)] : [],
               ),
             ]
@@ -6295,13 +6355,31 @@ export const loadServerActionClient = ${
       () => nextConfig.instrumentationClientRouteManifest,
     ),
     createInstrumentationServerTransformPlugin(
-      () => instrumentationPath,
+      () => projectInstrumentationPath,
       () => nextConfig.instrumentationServerValueInjections,
     ),
     createNextIntlCatalogPlugin(
       () => root,
       () => nextConfig.nextIntlCatalogLoader,
     ),
+    {
+      name: "vinext:injected-instrumentation",
+      enforce: "pre",
+      resolveId: {
+        filter: { id: /^virtual:vinext-injected-instrumentation$/ },
+        handler(id) {
+          if (id !== VIRTUAL_INJECTED_INSTRUMENTATION) return null;
+          return injectedInstrumentationModule !== null ? RESOLVED_INJECTED_INSTRUMENTATION : null;
+        },
+      },
+      load: {
+        filter: { id: /virtual:vinext-injected-instrumentation\.mjs$/ },
+        handler(id) {
+          if (id !== RESOLVED_INJECTED_INSTRUMENTATION) return null;
+          return injectedInstrumentationModule;
+        },
+      },
+    },
     {
       name: "vinext:instrumentation-client-inject",
       enforce: "pre",

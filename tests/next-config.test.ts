@@ -2903,6 +2903,7 @@ describe("detectNextIntlConfig", () => {
       instrumentationClientInject: [],
       instrumentationClientRouteManifest: undefined,
       instrumentationServerValueInjections: {},
+      instrumentationInject: [],
       clientTraceMetadata: undefined,
       staleTimes: { dynamic: 0, static: 300 },
       cacheLife: parseCacheLifeProfiles(undefined),

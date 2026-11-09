@@ -610,6 +610,11 @@ export type ResolvedNextConfig = {
   instrumentationClientRouteManifest: string | undefined;
   /** Server globals injected into instrumentation.ts by wrapped webpack configs. */
   instrumentationServerValueInjections: Record<string, unknown>;
+  /**
+   * Server instrumentation modules adapters and config wrappers contribute,
+   * run before the project's instrumentation file (vercel/next.js#100658).
+   */
+  instrumentationInject: string[];
   cacheComponents: boolean;
   /** `partialPrefetching`, which only takes effect with `cacheComponents`. */
   partialPrefetching: boolean;
@@ -2134,6 +2139,7 @@ export async function resolveNextConfig(
       instrumentationClientInject: [],
       instrumentationClientRouteManifest: undefined,
       instrumentationServerValueInjections: {},
+      instrumentationInject: [],
       clientTraceMetadata: undefined,
       staleTimes: { ...DEFAULT_STALE_TIMES },
       cacheLife: resolveCacheLifeProfiles(
@@ -2551,6 +2557,7 @@ export async function resolveNextConfig(
       : [],
     instrumentationClientRouteManifest: webpackProbe.instrumentationClientRouteManifest,
     instrumentationServerValueInjections: webpackProbe.instrumentationServerValueInjections,
+    instrumentationInject: readStringArray(config.instrumentationInject),
     cacheComponents,
     partialPrefetching: cacheComponents && config.partialPrefetching === true,
     cachedNavigations: cacheComponents && experimental?.cachedNavigations === true,
