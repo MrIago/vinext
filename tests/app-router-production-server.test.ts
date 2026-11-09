@@ -1699,6 +1699,47 @@ describe("App Router Production server (startProdServer)", () => {
     expect(ts2).toBe(ts1);
   });
 
+  // Ported from Next.js: test/e2e/app-dir/prerender-encoding/prerender-encoding.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/prerender-encoding/prerender-encoding.test.ts
+  // A literal `%` survives the request's single decode as `%`. Matching the
+  // decoded pathname again must not decode it a second time, or the page
+  // looks like another route's spelling and is never cached.
+  describe("prerender-encoding: percent-containing catch-all params", () => {
+    function readSlug(html: string): string | undefined {
+      return html.match(/params\.slug is (?:<!-- -->)?([^<]*)</)?.[1];
+    }
+
+    it.each([
+      ["/prerender-encoding/closed/docs/space%20here/100%25", "docs/space%20here/100%25"],
+      [
+        "/prerender-encoding/closed/docs/space%20here/with%2Fslash/100%25",
+        "docs/space%20here/with%2Fslash/100%25",
+      ],
+    ])("serves the exact closed catch-all path %s", async (pathname, slug) => {
+      const res = await fetch(`${baseUrl}${pathname}`);
+      expect(res.status).toBe(200);
+      expect(readSlug(await res.text())).toBe(slug);
+      expect(res.headers.get("cache-control")).not.toContain("private");
+    });
+
+    it.each([
+      ["/prerender-encoding/open/docs/space%20here/fallback%25", "docs/space%20here/fallback%25"],
+      [
+        "/prerender-encoding/open/docs/space%20here/with%2Fslash/fallback%25",
+        "docs/space%20here/with%2Fslash/fallback%25",
+      ],
+    ])("generates and then reuses the open catch-all fallback %s", async (pathname, slug) => {
+      const first = await fetch(`${baseUrl}${pathname}`);
+      expect(first.status).toBe(200);
+      expect(readSlug(await first.text())).toBe(slug);
+
+      const second = await fetch(`${baseUrl}${pathname}`);
+      expect(second.status).toBe(200);
+      expect(readSlug(await second.text())).toBe(slug);
+      expect(second.headers.get("x-vinext-cache")).toBe("HIT");
+    });
+  });
+
   // Regression test for issue 1487 — App Router page-segment `revalidate = Infinity`
   // (and `revalidate = false`) should produce a stable cached response. Two
   // requests must return identical HTML bytes; the first MISS render writes
