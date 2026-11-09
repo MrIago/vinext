@@ -399,12 +399,26 @@ function detectPackageManager(
   return "npm";
 }
 
-function getPackageManagerVersion(packageManager: PackageManagerName): string | null {
+/**
+ * The package manager's version, for the `packageManager` field. Corepack
+ * rejects a bare name, so an unknown version leaves the field out (#3322).
+ * The user agent the running package manager sets is read first; on Windows
+ * the binary is a `.cmd` shim that only resolves through a shell.
+ */
+export function getPackageManagerVersion(
+  packageManager: PackageManagerName,
+  userAgent: string | undefined = process.env.npm_config_user_agent,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const fromUserAgent = userAgent?.match(new RegExp(`(?:^|\\s)${packageManager}/(\\S+)`))?.[1];
+  if (fromUserAgent && /^\d+\.\d+\.\d+/.test(fromUserAgent)) return fromUserAgent;
   const result = spawnSync(packageManager, ["--version"], {
     encoding: "utf-8",
+    shell: platform === "win32",
     stdio: ["ignore", "pipe", "ignore"],
   });
-  return result.status === 0 ? result.stdout.trim() : null;
+  const version = result.status === 0 ? result.stdout.trim() : "";
+  return /^\d+\.\d+\.\d+/.test(version) ? version : null;
 }
 
 function writeFile(root: string, relativePath: string, content: string): void {
@@ -419,7 +433,7 @@ function writePackageJson(root: string, appName: string, packageManager: Package
     name: appName,
     version: "0.1.0",
     private: true,
-    packageManager: version ? `${packageManager}@${version}` : packageManager,
+    ...(version ? { packageManager: `${packageManager}@${version}` } : {}),
     dependencies: {
       react: "latest",
       "react-dom": "latest",
