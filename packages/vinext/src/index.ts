@@ -278,6 +278,7 @@ import {
 } from "./plugins/instrumentation-client.js";
 import { createNextIntlCatalogPlugin } from "./plugins/next-intl-catalog.js";
 import { createStyledJsxPlugin } from "./plugins/styled-jsx.js";
+import { createLayoutOwnedGlobalCssPlugin } from "./plugins/layout-owned-global-css.js";
 import {
   generateInstrumentationClientInjectModule,
   INSTRUMENTATION_CLIENT_EMPTY_MODULE,
@@ -5899,6 +5900,14 @@ export const loadServerActionClient = ${
         },
       },
     },
+    createLayoutOwnedGlobalCssPlugin(
+      () => appDir,
+      () => (hasPagesDir ? pagesDir : null),
+      {
+        getPageExtensions: () => nextConfig.pageExtensions,
+        getMdxOptions: () => nextConfig.mdx,
+      },
+    ),
     {
       name: "vinext:pages-client-assets-resolver",
       // The resolver and writer share a build-scoped destination registry.

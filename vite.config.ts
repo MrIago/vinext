@@ -265,6 +265,7 @@ export default defineConfig({
             "tests/nextjs-compat/**/*.test.ts",
             // Flaky under parallelism due to 1 MiB buffer allocation pressure.
             "tests/kv-cache-handler.test.ts",
+            "tests/layout-owned-global-css-build.test.ts",
           ],
         },
       },
@@ -338,6 +339,7 @@ export default defineConfig({
             "tests/instrumentation-dev.test.ts",
             "tests/invalid-static-asset-404.test.ts",
             "tests/kv-cache-handler.test.ts",
+            "tests/layout-owned-global-css-build.test.ts",
             "tests/middleware-matcher-auth.test.ts",
             "tests/next-image-alias.test.ts",
             "tests/next-intl-cloudflare.test.ts",
