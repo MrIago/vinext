@@ -436,6 +436,33 @@ export type PagesPipelineResult =
   | { type: "next" };
 
 /**
+ * The status a direct request receives for a source the image endpoint runs
+ * through the pipeline without rendering: the pipeline's own response, else
+ * middleware's status or the page's, a missing page being a 404. An API route
+ * answers what its handler returns, which is no file either way, so it counts
+ * as a success. Null when the pipeline served the request itself.
+ */
+export function pagesImageSourceStatus(
+  result: PagesPipelineResult,
+  pageExists: (pathname: string) => boolean,
+): number | null {
+  switch (result.type) {
+    case "response":
+      return result.response.status;
+    case "render":
+      return (
+        result.middlewareStatus ??
+        (pageExists(result.resolvedUrl.split("#", 1)[0].split("?", 1)[0]) ? 200 : 404)
+      );
+    case "api":
+      return result.middlewareStatus ?? 200;
+    case "handled":
+    case "next":
+      return null;
+  }
+}
+
+/**
  * Run the Pages Router request pipeline.
  *
  * ASSUMPTION: request already has internal headers filtered and basePath stripped.

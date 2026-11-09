@@ -36,9 +36,10 @@ test.describe("middleware extras", () => {
   test("preserves image parameters from a beforeFiles rewrite", async ({ request }) => {
     const response = await request.get("/legacy/image-alias", { maxRedirects: 0 });
     // The configured source is intentionally absent, so reaching the image
-    // optimizer produces its invalid-source 400. Losing the rewritten query
+    // optimizer answers with the missing source's 404, as Next.js does since
+    // https://github.com/vercel/next.js/pull/97957. Losing the rewritten query
     // instead fails parameter validation with "Bad Request" before that fetch.
-    expect(response.status()).toBe(400);
-    expect(await response.text()).toBe("The requested resource isn't a valid image.");
+    expect(response.status()).toBe(404);
+    expect(await response.text()).toBe('"url" parameter is valid but internal response is invalid');
   });
 });

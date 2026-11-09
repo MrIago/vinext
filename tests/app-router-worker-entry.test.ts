@@ -622,8 +622,8 @@ describe("App Router Production server worker entry compatibility", () => {
         );
 
       const denied = await requestImage("/members.png");
-      expect(denied.status).toBe(400);
-      expect(await denied.text()).toBe("The requested resource isn't a valid image.");
+      expect(denied.status).toBe(403);
+      expect(await denied.text()).toBe('"url" parameter is valid but internal response is invalid');
       expect(sourceRequests).toHaveLength(1);
       expect(sourceRequests[0].method).toBe("GET");
       expect(sourceRequests[0].headers.has("cookie")).toBe(false);
@@ -1010,11 +1010,13 @@ export default {
       await expect(image.text()).resolves.toBe("/open.png");
 
       const denied = await get("/protected/private.png");
-      expect(denied.status).toBe(400);
+      expect(denied.status).toBe(403);
       expect(denied.headers.get("x-mw")).toBe("1");
       // Only an image replaces the Content-Type middleware or config set.
       expect(denied.headers.get("content-type")).toBe("text/plain");
-      await expect(denied.text()).resolves.toBe("The requested resource isn't a valid image.");
+      await expect(denied.text()).resolves.toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
       expect(fetchedAssets).toEqual(["/open.png"]);
     } finally {
       setImageOptimizer(null);

@@ -8,8 +8,10 @@ import { isNextStaticPath } from "../utils/asset-prefix.js";
 import { resolveClientBuildFile } from "./client-build-files.js";
 import {
   handleConfiguredImageOptimization,
+  imageSourceStatusResponse,
   invalidImageSourceResponse,
   isImageSourceBodyStatus,
+  isImageSourceErrorResponse,
   markImageBuildAsset,
   type ImageConfig,
   type ImageOptimizationSignal,
@@ -28,7 +30,8 @@ export type WorkerImageSourceOptions = {
   /**
    * Run `sourceRequest`, a GET without the caller's headers, through the
    * application pipeline and return the public file it selects with a 2xx
-   * outcome, or null.
+   * outcome, a response carrying the pipeline's status when it selects none,
+   * or null.
    */
   fetchPublicFile(sourceRequest: Request): Promise<Response | null>;
 };
@@ -111,9 +114,13 @@ export async function fetchWorkerImageSource(
   const sourceResponse = await options.fetchPublicFile(
     attachRequestCfMetadata(new Request(sourceUrl, { signal: request.signal }), request),
   );
-  if (sourceResponse && isImageSourceBodyStatus(sourceResponse.status)) return sourceResponse;
-  if (sourceResponse) cancelResponseBody(sourceResponse);
-  return invalidImageSourceResponse();
+  if (sourceResponse === null) return invalidImageSourceResponse();
+  if (isImageSourceErrorResponse(sourceResponse)) return sourceResponse;
+  if (isImageSourceBodyStatus(sourceResponse.status)) return sourceResponse;
+  cancelResponseBody(sourceResponse);
+  // Like Next.js' fetchInternalImage, keep the status the source was answered
+  // with, such as middleware's denial or a missing file's 404.
+  return imageSourceStatusResponse(sourceResponse.status);
 }
 
 /**
@@ -136,18 +143,19 @@ export function withStagedCacheControl(asset: Response, cacheControl: string | n
  * Return the public file a framework static-file signal selects, provided the
  * pipeline answered with a body-bearing 2xx outcome. The file is fetched with middleware's
  * request header overrides, as resolveStaticAssetSignal fetches it, and keeps
- * the Cache-Control the pipeline staged.
+ * the Cache-Control the pipeline staged. Without a file, return the image
+ * endpoint's answer for the pipeline's status.
  */
 export function fetchSignalledPublicFile(
   response: Response,
   sourceRequest: Request,
   assets: VinextAssetFetcher,
-): Promise<Response> | null {
+): Promise<Response> {
   const signal = isImageSourceBodyStatus(response.status) ? readStaticFileSignal(response) : null;
   const requestHeaders = readStaticFileSignalRequestHeaders(response);
   const stagedCacheControl = response.headers.get("Cache-Control");
   cancelResponseBody(response);
-  if (signal === null) return null;
+  if (signal === null) return Promise.resolve(imageSourceStatusResponse(response.status));
   let assetPath = signal;
   try {
     assetPath = decodeURIComponent(signal);

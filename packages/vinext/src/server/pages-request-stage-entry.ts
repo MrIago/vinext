@@ -7,6 +7,7 @@
 
 import {
   fetchWorkerFilesystemRoute,
+  pagesImageSourceStatus,
   runPagesRequest,
   wrapMiddlewareWithBasePath,
 } from "./pages-request-pipeline.js";
@@ -15,6 +16,7 @@ import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
   handleConfiguredImageOptimization,
+  imageSourceStatusResponse,
   isImageOptimizationPath,
   isImageSourceBodyStatus,
 } from "./image-optimization.js";
@@ -820,18 +822,26 @@ async function handleRequestImpl(
           },
         },
       );
-      if (sourceResult.type !== "response") return null;
-      await sourceResult.response.body?.cancel().catch(() => {});
-      if (isImageSourceBodyStatus(sourceResult.response.status) && sourceAsset !== null) {
-        // The pipeline staged middleware and `headers()` values on its response.
-        const { withStagedCacheControl } = await import("./worker-image-optimization.js");
-        return withStagedCacheControl(
-          sourceAsset,
-          sourceResult.response.headers.get("Cache-Control"),
-        );
+      if (sourceResult.type === "response") {
+        await sourceResult.response.body?.cancel().catch(() => {});
+        if (isImageSourceBodyStatus(sourceResult.response.status) && sourceAsset !== null) {
+          // The pipeline staged middleware and `headers()` values on its response.
+          const { withStagedCacheControl } = await import("./worker-image-optimization.js");
+          return withStagedCacheControl(
+            sourceAsset,
+            sourceResult.response.headers.get("Cache-Control"),
+          );
+        }
       }
       await sourceAsset?.body?.cancel().catch(() => {});
-      return null;
+      // Like Next.js' fetchInternalImage, answer with the status a direct
+      // request receives, such as middleware's denial or a missing page's 404.
+      const status = pagesImageSourceStatus(
+        sourceResult,
+        (pathname) =>
+          typeof matchPageRoute === "function" && matchPageRoute(pathname, sourceRequest) !== null,
+      );
+      return status === null ? null : imageSourceStatusResponse(status);
     };
 
     const result = await runPagesRequest(request, deps);

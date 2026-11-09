@@ -30517,16 +30517,40 @@ describe("handleImageOptimization", () => {
     expect(response.status).toBe(400);
   });
 
-  it("returns 400 when fetchAsset fails", async () => {
+  // Ported from Next.js: test/unit/image-optimizer/fetch-internal-image.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/unit/image-optimizer/fetch-internal-image.test.ts
+  // fetchInternalImage keeps a failed source's status, and ImageError answers
+  // 500 for one below 400 (https://github.com/vercel/next.js/pull/97957).
+  it("keeps the status of a source fetch that fails", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
     const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
-    const handlers = {
-      fetchAsset: async () => new Response("", { status: 404 }),
-    };
-    const response = await handleImageOptimization(request, handlers);
-    expect(response.status).toBe(400);
-    expect(await response.text()).toBe("The requested resource isn't a valid image.");
+    for (const [sourceStatus, status] of [
+      [404, 404],
+      [401, 401],
+      [307, 500],
+    ] as const) {
+      const response = await handleImageOptimization(request, {
+        fetchAsset: async () => new Response("<html>not found</html>", { status: sourceStatus }),
+      });
+      expect(response.status, String(sourceStatus)).toBe(status);
+      expect(await response.text()).toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
+    }
+  });
+
+  it("answers 400 for a source fetch without a body", async () => {
+    const { handleImageOptimization } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
+    for (const source of [new Response(null, { status: 204 }), new Response(null)]) {
+      const response = await handleImageOptimization(request, { fetchAsset: async () => source });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
+    }
   });
 
   it("returns original image when no transformImage handler", async () => {
@@ -30628,7 +30652,7 @@ describe("handleImageOptimization", () => {
         fetchAsset: source("image/svg+xml"),
       }),
     ];
-    expect(errors.map((response) => response.status)).toEqual([400, 400, 400]);
+    expect(errors.map((response) => response.status)).toEqual([400, 404, 400]);
     for (const response of errors) {
       expect(response.headers.get("x-nextjs-cache")).toBeNull();
       expect(response.headers.get("x-vinext-cache")).toBeNull();
@@ -30712,7 +30736,7 @@ describe("handleImageOptimization", () => {
     expect(response.headers.get("Vary")).toBe("Accept");
   });
 
-  it("returns 400 when refetch fallback cannot reload the source image", async () => {
+  it("keeps the status of a refetch that cannot reload the source image", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
     const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
@@ -30735,8 +30759,8 @@ describe("handleImageOptimization", () => {
     };
     const response = await handleImageOptimization(request, handlers);
     expect(fetchCount).toBe(2);
-    expect(response.status).toBe(400);
-    expect(await response.text()).toBe("The requested resource isn't a valid image.");
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('"url" parameter is valid but internal response is invalid');
   });
 
   it("returns 400 when refetch fallback reloads an unsafe content type", async () => {
