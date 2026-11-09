@@ -4256,6 +4256,11 @@ describe("Link prefetch scheduling", () => {
           ],
         },
       });
+      // The click commits a navigation whose scroll fallback reads <html>'s
+      // dataset (and, in development, its computed scroll-behavior) in a
+      // microtask, so the stubbed document needs a root element to read.
+      Object.assign(document, { documentElement: { dataset: {}, style: {} } });
+      vi.stubGlobal("getComputedStyle", () => ({ scrollBehavior: "auto" }));
 
       try {
         const clickEvent = {
@@ -4268,6 +4273,7 @@ describe("Link prefetch scheduling", () => {
         } satisfies CapturedClickEvent;
         await result.capturedAnchorProps.onClick?.(clickEvent);
         await flushPrefetchTasks();
+        await vi.waitFor(() => expect(result.navigate).toHaveBeenCalledTimes(1));
 
         const messages = error.mock.calls.map(([value]) =>
           value instanceof Error ? value.message : String(value),
