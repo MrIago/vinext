@@ -571,6 +571,9 @@ export const __imageAllowedWidths = ${JSON.stringify([
 export const __imageConfig = ${JSON.stringify({
     qualities: config?.imageConfig?.qualities,
     formats: config?.imageConfig?.formats,
+    remotePatterns: config?.imageConfig?.remotePatterns,
+    domains: config?.imageConfig?.domains,
+    maximumRedirects: config?.imageConfig?.maximumRedirects,
     maximumDiskCacheSize: config?.imageConfig?.maximumDiskCacheSize,
     localPatterns: config?.imageConfig?.localPatterns,
     dangerouslyAllowSVG: config?.imageConfig?.dangerouslyAllowSVG,
@@ -803,6 +806,9 @@ export function generateRscEntry(
   const imageConfig = {
     qualities: config?.imageConfig?.qualities,
     formats: config?.imageConfig?.formats,
+    remotePatterns: config?.imageConfig?.remotePatterns,
+    domains: config?.imageConfig?.domains,
+    maximumRedirects: config?.imageConfig?.maximumRedirects,
     maximumDiskCacheSize: config?.imageConfig?.maximumDiskCacheSize,
     localPatterns: config?.imageConfig?.localPatterns,
     dangerouslyAllowSVG: config?.imageConfig?.dangerouslyAllowSVG,

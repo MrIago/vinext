@@ -34,12 +34,15 @@ import {
   staticFileCacheControl,
 } from "./static-file-cache.js";
 import { signalFromNodeResponse } from "./node-response-signal.js";
+import { fetchRemoteImage, RemoteImageError } from "./node-remote-image.js";
 import {
   NodeImageCache,
   optimizeNodeImage,
   resolveNodeImageOptimizer,
 } from "./node-image-optimization.js";
 import {
+  handleImageOptimization,
+  imageSourceErrorResponse,
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,
   IMAGE_RESPONSE_CACHE_STATE,
@@ -895,6 +898,68 @@ async function serveNodeOptimizedImage(
   }
   await sendWebResponse(response, req, res, false);
   return true;
+}
+
+function isRemoteImageSource(imageUrl: string): boolean {
+  return /^https?:\/\//i.test(imageUrl);
+}
+
+/**
+ * Answer an image request for a remote source images.remotePatterns allows,
+ * fetched with the address checks and DNS pinning of Next.js'
+ * fetchExternalImage and optimized like a local file.
+ */
+async function serveNodeRemoteImage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  imageRequest: Request,
+  sourceHref: string,
+  allowedWidths: number[],
+  imageConfig: ImageConfig | undefined,
+  optimizerRoots: readonly string[],
+  imageCache: NodeImageCache,
+): Promise<void> {
+  const optimizer = await resolveNodeImageOptimizer(optimizerRoots);
+  const response = await imageCache.handle(imageRequest, imageConfig, () =>
+    handleImageOptimization(
+      imageRequest,
+      {
+        allowRemote: true,
+        fetchAsset: async () => {
+          try {
+            const image = await fetchRemoteImage(sourceHref, {
+              dangerouslyAllowLocalIP: imageConfig?.dangerouslyAllowLocalIP === true,
+              maximumResponseBody: imageConfig?.maximumResponseBody ?? 50_000_000,
+              maximumRedirects: imageConfig?.maximumRedirects ?? 3,
+            });
+            const headers = new Headers();
+            if (image.contentType) headers.set("Content-Type", image.contentType);
+            if (image.cacheControl) headers.set("Cache-Control", image.cacheControl);
+            return new Response(new Uint8Array(image.buffer), { headers });
+          } catch (error) {
+            if (error instanceof RemoteImageError) {
+              return imageSourceErrorResponse(error.statusCode, error.message);
+            }
+            console.error("[vinext] Failed to fetch remote image", sourceHref, error);
+            return imageSourceErrorResponse(
+              500,
+              '"url" parameter is valid but upstream response is invalid',
+            );
+          }
+        },
+        transformImage: optimizer
+          ? (body, options) => optimizer.transformImage(body, options)
+          : undefined,
+      },
+      allowedWidths,
+      imageConfig,
+    ),
+  );
+  if (imageRequest.signal.aborted) {
+    cancelResponseBody(response, imageRequest.signal.reason);
+    return;
+  }
+  await sendWebResponse(response, req, res, false);
 }
 
 /**
@@ -2179,6 +2244,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     const parsedUrl = new URL(`/${signal.search}`, "http://localhost");
     const params = parseImageParams(parsedUrl, appImageAllowedWidths, imageConfig?.qualities, {
       localPatterns: imageConfig?.localPatterns,
+      remote: { remotePatterns: imageConfig?.remotePatterns, domains: imageConfig?.domains },
     });
     if (!params) {
       sendBadRequest("Bad Request");
@@ -2191,6 +2257,19 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       headers: signal.requestHeaders ?? request.headers,
       signal: request.signal,
     });
+    if (isRemoteImageSource(params.imageUrl)) {
+      await serveNodeRemoteImage(
+        req,
+        res,
+        imageRequest,
+        params.imageUrl,
+        appImageAllowedWidths,
+        imageConfig,
+        imageOptimizerRoots,
+        imageCache,
+      );
+      return;
+    }
     // Block SVG and other unsafe content types by checking the file extension
     // of the file actually served, not the `url` text, whose query or hash
     // could carry an image extension. SVG is only allowed when
@@ -2712,6 +2791,9 @@ async function createPagesRouterRequestHandler(
         dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,
         qualities: vinextConfig.images.qualities,
         formats: vinextConfig.images.formats,
+        remotePatterns: vinextConfig.images.remotePatterns,
+        domains: vinextConfig.images.domains,
+        maximumRedirects: vinextConfig.images.maximumRedirects,
         maximumDiskCacheSize: vinextConfig.images.maximumDiskCacheSize,
         localPatterns: vinextConfig.images.localPatterns,
         contentDispositionType: vinextConfig.images.contentDispositionType,
@@ -3187,11 +3269,33 @@ async function createPagesRouterRequestHandler(
               parsedUrl,
               allowedImageWidths,
               pagesImageConfig?.qualities,
-              { localPatterns: pagesImageConfig?.localPatterns },
+              {
+                localPatterns: pagesImageConfig?.localPatterns,
+                remote: {
+                  remotePatterns: pagesImageConfig?.remotePatterns,
+                  domains: pagesImageConfig?.domains,
+                },
+              },
             );
             if (!params) {
               res.writeHead(400);
               res.end("Bad Request");
+              return true;
+            }
+            if (isRemoteImageSource(params.imageUrl)) {
+              await serveNodeRemoteImage(
+                req,
+                res,
+                new Request(new URL(resolvedUrl, webRequest.url), {
+                  headers: filesystemRequest.headers,
+                  signal: webRequest.signal,
+                }),
+                params.imageUrl,
+                allowedImageWidths,
+                pagesImageConfig,
+                imageOptimizerRoots,
+                imageCache,
+              );
               return true;
             }
             // Check the extension of the file actually served, not the `url`

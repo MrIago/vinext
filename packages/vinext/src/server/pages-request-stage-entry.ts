@@ -195,6 +195,9 @@ const imageConfig: ImageConfig | undefined = vinextConfig?.images
   ? {
       qualities: vinextConfig.images.qualities,
       formats: vinextConfig.images.formats,
+      remotePatterns: vinextConfig.images.remotePatterns,
+      domains: vinextConfig.images.domains,
+      maximumRedirects: vinextConfig.images.maximumRedirects,
       maximumDiskCacheSize: vinextConfig.images.maximumDiskCacheSize,
       localPatterns: vinextConfig.images.localPatterns,
       dangerouslyAllowSVG: vinextConfig.images.dangerouslyAllowSVG,

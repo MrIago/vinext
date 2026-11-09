@@ -400,6 +400,8 @@ export type NextConfig = {
      * `<outDir>/cache/images`. `0` disables the cache, as in Next.js.
      */
     maximumDiskCacheSize?: number;
+    /** Redirects the Node.js server follows for a remote image source. Defaults to 3. */
+    maximumRedirects?: number;
     /** Least max-age, in seconds, of an image the endpoint serves as-is. Defaults to 14400. */
     minimumCacheTTL?: number;
     /**

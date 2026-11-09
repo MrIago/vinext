@@ -27,6 +27,7 @@ import {
   ImageSourceTooLargeError,
 } from "./image-source-reader.js";
 import { hasLocalMatch, type LocalPattern } from "./image-local-patterns.js";
+import { hasRemoteMatch, type RemotePattern } from "vinext/shims/image-config";
 import { setCacheStateHeaders } from "./cache-headers.js";
 import { badRequestResponse } from "./http-error-responses.js";
 
@@ -108,6 +109,15 @@ export type ImageConfig = {
    */
   formats?: string[];
   /**
+   * Remote sources the Node.js server may fetch and optimize, as in Next.js.
+   * Workers serve local sources only.
+   */
+  remotePatterns?: RemotePattern[];
+  /** Deprecated Next.js allow-list of remote hostnames. */
+  domains?: string[];
+  /** Redirects a remote source may follow. Default: 3. */
+  maximumRedirects?: number;
+  /**
    * Bytes of optimized images the Node.js server keeps on disk; 0 disables
    * the cache, as in Next.js.
    */
@@ -133,6 +143,11 @@ const DEV_BLUR_QUALITY = 70;
 
 export type ParseImageParamsOptions = {
   isDev?: boolean;
+  /**
+   * Accept an absolute http(s) source these patterns allow, as Next.js does.
+   * Only hosts that fetch remote sources safely (the Node.js server) pass it.
+   */
+  remote?: { remotePatterns?: RemotePattern[]; domains?: string[] };
   /** `images.localPatterns`; DEFAULT_LOCAL_PATTERNS when unset. */
   localPatterns?: LocalPattern[];
 };
@@ -145,6 +160,9 @@ export function resolveDevImageRedirect(
 ): string | null {
   const params = parseImageParams(requestUrl, allowedWidths, allowedQualities, options);
   if (!params) return null;
+  // A remote source images.remotePatterns allows: hosts that optimize remote
+  // images (the Node.js server) answer the signal, and the rest redirect.
+  if (options.remote && /^https?:\/\//i.test(params.imageUrl)) return params.imageUrl;
   if (
     params.imageUrl.startsWith("/@") ||
     params.imageUrl.startsWith("/__vite") ||
@@ -300,6 +318,11 @@ function markImageSourceError(response: Response): Response {
   return response;
 }
 
+/** The image endpoint's error for a source, answered as-is by the handler. */
+export function imageSourceErrorResponse(status: number, message: string): Response {
+  return markImageSourceError(new Response(message, { status }));
+}
+
 /** Whether a source fetch already answered with the image endpoint's error. */
 export function isImageSourceErrorResponse(response: Response): boolean {
   return Reflect.get(response, IMAGE_SOURCE_ERROR) === true;
@@ -400,6 +423,24 @@ export function parseImageParams(
   // from those versions don't break (see ImageConfig.qualities).
   if (allowedQualities && !allowedQualities.includes(quality) && !isDevBlurQuality) {
     return null;
+  }
+
+  // Like Next.js' validateUrlParam, an absolute source must be http(s) and
+  // match images.remotePatterns (or images.domains).
+  if (options.remote && /^https?:\/\//i.test(imageUrl)) {
+    let remoteUrl: URL;
+    try {
+      remoteUrl = new URL(imageUrl);
+    } catch {
+      return null;
+    }
+    if (remoteUrl.protocol !== "http:" && remoteUrl.protocol !== "https:") return null;
+    if (
+      !hasRemoteMatch(options.remote.domains ?? [], options.remote.remotePatterns ?? [], remoteUrl)
+    ) {
+      return null;
+    }
+    return { imageUrl: remoteUrl.href, width, quality };
   }
 
   // Prevent open redirect / SSRF — only allow path-relative URLs.
@@ -946,6 +987,11 @@ function sourceTooLargeResponse(): Response {
  * Workers provide these callbacks to adapt their specific bindings.
  */
 export type ImageHandlers = {
+  /**
+   * Accept absolute sources images.remotePatterns allows, which `fetchAsset`
+   * then fetches. Only for hosts that pin the connection to checked addresses.
+   */
+  allowRemote?: boolean;
   /** Fetch the source image from storage (e.g., Cloudflare ASSETS binding). */
   fetchAsset: (path: string, request: Request) => Promise<Response>;
   /** Optional: Transform the image (resize, format, quality). */
@@ -971,6 +1017,9 @@ export async function handleImageOptimization(
   const url = new URL(request.url);
   const params = parseImageParams(url, allowedWidths, imageConfig?.qualities, {
     localPatterns: imageConfig?.localPatterns,
+    remote: handlers.allowRemote
+      ? { remotePatterns: imageConfig?.remotePatterns, domains: imageConfig?.domains }
+      : undefined,
   });
 
   if (!params) {

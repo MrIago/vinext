@@ -5568,6 +5568,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   imageSizes: nextConfig?.images?.imageSizes,
                   qualities: nextConfig?.images?.qualities,
                   formats: nextConfig?.images?.formats,
+                  remotePatterns: nextConfig?.images?.remotePatterns,
+                  domains: nextConfig?.images?.domains,
+                  maximumRedirects: nextConfig?.images?.maximumRedirects,
                   maximumDiskCacheSize: nextConfig?.images?.maximumDiskCacheSize,
                   localPatterns: nextConfig?.images?.localPatterns,
                   dangerouslyAllowSVG: nextConfig?.images?.dangerouslyAllowSVG,
@@ -7649,6 +7652,13 @@ export const loadServerActionClient = ${
                       imageRequestUrl,
                       allowedWidths,
                       nextConfig.images?.qualities,
+                      {
+                        isDev: true,
+                        remote: {
+                          remotePatterns: nextConfig.images?.remotePatterns,
+                          domains: nextConfig.images?.domains,
+                        },
+                      },
                     );
                     return encodedLocation
                       ? new Response(null, {

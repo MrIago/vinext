@@ -2,7 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
-import type { Server } from "node:http";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { build, createBuilder } from "vite-plus";
 import vinext from "../packages/vinext/src/index.js";
 import { loadSharp, type Sharp } from "../packages/vinext/src/server/image-sharp.js";
@@ -114,8 +115,22 @@ describe("Node production server optimizes images with the app's sharp", () => {
   const dirs: string[] = [];
   const urls: Record<"app" | "pages", string> = { app: "", pages: "" };
 
+  let origin: Server;
+  let originUrl = "";
+
   beforeAll(async () => {
     const source = await photo(400, 200);
+    // A remote image host. It is on loopback, so the apps opt into
+    // dangerouslyAllowLocalIP as Next.js' own image tests do.
+    origin = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=600" });
+      res.end(source);
+    });
+    await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+    originUrl = `http://127.0.0.1:${(origin.address() as AddressInfo).port}`;
+    const nextConfig =
+      "export default { images: { dangerouslyAllowLocalIP: true, " +
+      'remotePatterns: [{ protocol: "http", hostname: "127.0.0.1", pathname: "/remote/**" }] } };\n';
 
     const pagesDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-pages-sharp-"));
     dirs.push(pagesDir);
@@ -125,6 +140,7 @@ describe("Node production server optimizes images with the app's sharp", () => {
       path.join(pagesDir, "pages", "index.jsx"),
       "export default function Page() {\n  return <p>home</p>;\n}\n",
     );
+    await fs.writeFile(path.join(pagesDir, "next.config.mjs"), nextConfig);
     await fs.mkdir(path.join(pagesDir, "public"));
     await fs.writeFile(path.join(pagesDir, "public", "photo.png"), source);
     const pagesOut = path.join(pagesDir, "dist");
@@ -168,6 +184,7 @@ describe("Node production server optimizes images with the app's sharp", () => {
       path.join(appDir, "app", "page.tsx"),
       "export default function Page() {\n  return <p>home</p>;\n}\n",
     );
+    await fs.writeFile(path.join(appDir, "next.config.mjs"), nextConfig);
     await fs.mkdir(path.join(appDir, "public"));
     await fs.writeFile(path.join(appDir, "public", "photo.png"), source);
     const appOut = path.join(appDir, "dist");
@@ -229,6 +246,28 @@ describe("Node production server optimizes images with the app's sharp", () => {
       expect((await fs.readdir(cacheDir)).length).toBeGreaterThan(0);
     });
 
+    // Ported from Next.js: test/e2e/image-optimizer/util.ts ("should resize
+    // absolute url from localhost", "should fail when domain is not defined
+    // in next.config.js").
+    it(`${router} router: optimizes a remote image images.remotePatterns allows`, async () => {
+      const remote = encodeURIComponent(`${originUrl}/remote/photo.png`);
+      const res = await fetch(`${urls[router]}/_next/image?url=${remote}&w=64&q=75`, {
+        headers: { Accept: "image/webp" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Type")).toBe("image/webp");
+      expect(res.headers.get("Cache-Control")).toBe("public, max-age=14400, must-revalidate");
+      expect(await metadata(await res.arrayBuffer())).toMatchObject({ format: "webp", width: 64 });
+
+      for (const source of [`${originUrl}/elsewhere/photo.png`, "http://localhost/remote/a.png"]) {
+        const denied = await fetch(
+          `${urls[router]}/_next/image?url=${encodeURIComponent(source)}&w=64&q=75`,
+        );
+        expect(denied.status, source).toBe(400);
+        await denied.arrayBuffer();
+      }
+    });
+
     it(`${router} router: keeps a PNG for a client that accepts no WebP`, async () => {
       const res = await fetch(`${urls[router]}/_next/image?url=%2Fphoto.png&w=128&q=75`, {
         headers: { Accept: "image/png,*/*" },
@@ -262,7 +301,7 @@ describe("Node image disk cache", () => {
       headers: { Accept: "image/webp", ...headers },
     });
 
-  function optimizer(maxAge = 60) {
+  function optimizer(maxAge: number | ((call: number) => number) = 60) {
     let calls = 0;
     return {
       get calls() {
@@ -273,7 +312,7 @@ describe("Node image disk cache", () => {
         return new Response(`image ${calls}`, {
           headers: {
             "Content-Type": "image/webp",
-            "Cache-Control": `public, max-age=${maxAge}, must-revalidate`,
+            "Cache-Control": `public, max-age=${typeof maxAge === "number" ? maxAge : maxAge(calls)}, must-revalidate`,
             "Content-Security-Policy": "script-src 'none'; frame-src 'none'; sandbox;",
             Vary: "Accept",
             "X-Nextjs-Cache": "MISS",
@@ -328,7 +367,8 @@ describe("Node image disk cache", () => {
     const { NodeImageCache } =
       await import("../packages/vinext/src/server/node-image-optimization.js");
     const cache = new NodeImageCache(await cacheDir());
-    const source = optimizer(0);
+    // The first rendition expires at once; its replacement stays fresh.
+    const source = optimizer((call) => (call === 1 ? 0 : 60));
     const config = { minimumCacheTTL: 0 };
 
     await cache.handle(request("url=%2Fb.png&w=64&q=75"), config, source.optimize);

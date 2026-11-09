@@ -1773,7 +1773,14 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
         ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
       ],
       options.imageConfig?.qualities,
-      { isDev: options.isDev, localPatterns: options.imageConfig?.localPatterns },
+      {
+        isDev: options.isDev,
+        localPatterns: options.imageConfig?.localPatterns,
+        remote: {
+          remotePatterns: options.imageConfig?.remotePatterns,
+          domains: options.imageConfig?.domains,
+        },
+      },
     );
     const middlewareHeaders = new Headers();
     mergeMiddlewareResponseHeaders(middlewareHeaders, middlewareContext.headers);
