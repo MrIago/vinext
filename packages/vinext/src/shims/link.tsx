@@ -60,6 +60,7 @@ import { interpolateDynamicRouteHref, resolveDynamicRouteHref } from "./internal
 import { markAppRouteDetectedOnPrefetch } from "./internal/app-route-detection.js";
 import {
   canAutoPrefetchFullAppRoute,
+  hasAppRouteInstantConfig,
   resolveAutoAppRoutePrefetch,
   resolveFullAppRoutePrefetch,
 } from "./internal/app-route-prefetch-policy.js";
@@ -124,6 +125,7 @@ type AppPrefetchModules = [
   typeof import("./internal/app-prefetch-rsc-request.js"),
   typeof import("../server/app-rsc-render-mode.js"),
   typeof import("../server/headers.js"),
+  typeof import("./internal/app-static-shell-vary-params.js"),
 ];
 
 let appRscCacheBustingModulePromise: Promise<AppRscCacheBustingModule> | null = null;
@@ -143,6 +145,7 @@ function loadAppPrefetchModules(): Promise<AppPrefetchModules> {
     import("./internal/app-prefetch-rsc-request.js"),
     import("../server/app-rsc-render-mode.js"),
     import("../server/headers.js"),
+    import("./internal/app-static-shell-vary-params.js"),
   ]));
 }
 
@@ -445,8 +448,10 @@ function prefetchUrl(
             {
               APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
               APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+              APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
             },
             headersModule,
+            { createVaryingStaticShellResolver },
           ],
           hybridRouteOwner,
           routeManifestLoaded,
@@ -478,6 +483,7 @@ function prefetchUrl(
           prepareNavigationPrefetchSnapshot,
           promotePrefetchCacheEntryForNavigation,
           seedFullPrefetchFromVisitedResponse,
+          seedStaticShellPrefetchFromVaryingShell,
           hasNavigationFreshVisitedResponse,
           DYNAMIC_NAVIGATION_CACHE_TTL,
           PREFETCH_CACHE_TTL,
@@ -507,6 +513,11 @@ function prefetchUrl(
         const prefetchPolicyHref = rewrittenPrefetchHref ?? prefetchHref;
         const interceptionContext = getPrefetchInterceptionContext(fullHref);
         const mountedSlotsHeader = getMountedSlotsHeader();
+        // Like Next.js, a route with an `unstable_instant` config ignores a
+        // full prefetch: it's prefetched as an automatic one.
+        if (mode !== "auto" && hasAppRouteInstantConfig(prefetchPolicyHref, interceptionContext)) {
+          mode = "auto";
+        }
         const autoPrefetch =
           mode === "auto"
             ? resolveAutoAppRoutePrefetch(prefetchPolicyHref, interceptionContext)
@@ -515,8 +526,13 @@ function prefetchUrl(
 
         const isOptimisticRouteShellPrefetch = !autoPrefetch.cacheForNavigation;
         const hasSearchParams = new URL(fullHref, window.location.href).search !== "";
+        // A static shell with search params is a runtime prefetch, which
+        // renders them.
         const isAutomaticSearchParamShell =
-          mode === "auto" && isOptimisticRouteShellPrefetch && hasSearchParams;
+          mode === "auto" &&
+          isOptimisticRouteShellPrefetch &&
+          hasSearchParams &&
+          autoPrefetch.staticShell !== true;
         // A prefetch never renders the page of a route that renders
         // dynamically, so its search-param href fetches the loading shell.
         const hasSearchAgnosticShell =
@@ -534,11 +550,13 @@ function prefetchUrl(
           // its first, loading-shell request is not.
           prefetchKind: mode === "full" || mode === "full-after-shell" ? "full" : "auto",
           renderMode: isOptimisticRouteShellPrefetch
-            ? hasSearchAgnosticShell
-              ? APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
-              : isAutomaticSearchParamShell
-                ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
-                : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
+            ? autoPrefetch.staticShell === true
+              ? APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL
+              : hasSearchAgnosticShell
+                ? APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
+                : isAutomaticSearchParamShell
+                  ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
+                  : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
             : undefined,
         });
         if (mountedSlotsHeader) {
@@ -735,6 +753,20 @@ function prefetchUrl(
         ) {
           return;
         }
+        // Another URL's shell serves this one when they agree on the params it
+        // read. A client rewrite's target isn't the URL the shell keys on.
+        if (
+          autoPrefetch.staticShell === true &&
+          rewrittenPrefetchHref === null &&
+          seedStaticShellPrefetchFromVaryingShell(
+            rscUrl,
+            interceptionContext,
+            mountedSlotsHeader,
+            createVaryingStaticShellResolver(fullHref),
+          )
+        ) {
+          return;
+        }
         prefetched.add(cacheKey);
         // Next's `prefetchInlining` Segment Cache path fetches a route tree
         // and then one inlined segment payload. Vinext still caches the unified
@@ -808,10 +840,17 @@ function prefetchUrl(
                 : PREFETCH_CACHE_TTL,
             dynamicStaleTime: autoPrefetch.dynamicStaleTime,
             optimisticRouteShell: isOptimisticRouteShellPrefetch,
-            prefetchKind: isOptimisticRouteShellPrefetch ? "loading-shell" : "navigation",
-            prepareSnapshot: autoPrefetch.cacheForNavigation
-              ? prepareNavigationPrefetchSnapshot
-              : undefined,
+            prefetchKind:
+              autoPrefetch.staticShell === true
+                ? "static-shell"
+                : isOptimisticRouteShellPrefetch
+                  ? "loading-shell"
+                  : "navigation",
+            // A static shell that turns out to be the whole page is reused too.
+            prepareSnapshot:
+              autoPrefetch.cacheForNavigation || autoPrefetch.staticShell === true
+                ? prepareNavigationPrefetchSnapshot
+                : undefined,
             searchAgnosticShell: isAutomaticSearchParamShell && !hasSearchAgnosticShell,
           },
         );

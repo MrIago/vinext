@@ -65,8 +65,9 @@ const { createRequestContext, runWithRequestContext } =
   await import("../packages/vinext/src/shims/unified-request-context.js");
 const { registerFrameworkTracingIntegration } =
   await import("../packages/vinext/src/server/tracer.js");
-const { _peekRequestScopedCacheLife } =
+const { _peekRequestScopedCacheLife, _setResumeDataCacheCollector } =
   await import("../packages/vinext/src/shims/cache-request-state.js");
+const { createResumeDataCache } = await import("../packages/vinext/src/shims/resume-data-cache.js");
 
 describe("fetch cache shim", () => {
   let cleanup: (() => void) | null = null;
@@ -1311,6 +1312,368 @@ describe("fetch cache shim", () => {
     expect(staleEntry).toMatchObject({ cacheState: "stale" });
     expect(set).toHaveBeenCalledOnce();
     expect(set.mock.calls[0]?.[2]?.staleEntry).toBe(staleEntry);
+  });
+
+  it("collects a foreground-refreshed fetch into the shell's resume data cache", async () => {
+    await fetch("https://api.example.com/foreground-stale-rdc", { next: { revalidate: 1 } });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    for (const [, entry] of store) {
+      entry.revalidateAt = Date.now() - 1000;
+    }
+    startNewFetchCacheScope();
+
+    const collector = createResumeDataCache();
+    await runWithRequestContext(createRequestContext(), async () => {
+      setRefreshStaleFetchesInForeground(true);
+      _setResumeDataCacheCollector(collector);
+      await fetch("https://api.example.com/foreground-stale-rdc", { next: { revalidate: 1 } });
+    });
+
+    const [entry] = collector.fetch.values();
+    expect(collector.fetch.size).toBe(1);
+    expect(JSON.parse(Buffer.from(entry.body, "base64").toString()).count).toBe(2);
+  });
+
+  it.each([
+    ["without cache options", undefined],
+    ["with cache: no-store", { cache: "no-store" }],
+    ["with cache: no-cache", { cache: "no-cache" }],
+    ["with revalidate: 0", { next: { revalidate: 0 } }],
+    ["with empty next options", { next: {} }],
+    ["with an Authorization header", { headers: { authorization: "Bearer token" } }],
+  ] as const)(
+    "leaves an uncached fetch %s in a shell's render to a hole, without making it",
+    async (_label, init) => {
+      const { createPprFallbackShellState, runWithPprFallbackShellState } =
+        await import("../packages/vinext/src/shims/ppr-fallback-shell.js");
+      const state = createPprFallbackShellState({
+        fallbackParamNames: [],
+        routePattern: "/feed",
+      });
+
+      let settled = false;
+      void runWithPprFallbackShellState(state, () =>
+        fetch("https://api.example.com/shell-uncached", init as RequestInit | undefined),
+      ).finally(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(settled).toBe(false);
+      expect(state.hasDynamicBoundary).toBe(true);
+      expect(fetchMock).not.toHaveBeenCalled();
+      // The hole keeps the shell storable.
+      expect(consumeDynamicUsage()).toBe(false);
+      state.abortController.abort();
+    },
+  );
+
+  // Like Next.js's untracked hanging promise, a fetch nobody awaits leaves no hole.
+  it("leaves no hole for an uncached fetch in a shell's render that nothing awaits", async () => {
+    const { createPprFallbackShellState, runWithPprFallbackShellState } =
+      await import("../packages/vinext/src/shims/ppr-fallback-shell.js");
+    const state = createPprFallbackShellState({
+      fallbackParamNames: [],
+      routePattern: "/feed",
+    });
+
+    const response = runWithPprFallbackShellState(state, () =>
+      fetch("https://api.example.com/shell-ignored"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.hasDynamicBoundary).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Awaiting it later makes the hole.
+    void response.then(() => {});
+    expect(state.hasDynamicBoundary).toBe(true);
+    state.abortController.abort();
+  });
+
+  it.each([
+    ["without cache options", undefined],
+    ["with cache: no-store", { cache: "no-store" }],
+    ["with an Authorization header", { headers: { authorization: "Bearer token" } }],
+  ] as const)(
+    "makes an uncached fetch %s inside unstable_cache in a shell's render",
+    async (label, init) => {
+      const { unstable_cache } = await import("../packages/vinext/src/shims/cache.js");
+      const { createPprFallbackShellState, runWithPprFallbackShellState } =
+        await import("../packages/vinext/src/shims/ppr-fallback-shell.js");
+      const state = createPprFallbackShellState({
+        fallbackParamNames: [],
+        routePattern: "/feed",
+      });
+      const cached = unstable_cache(
+        async () =>
+          (await fetch("https://api.example.com/shell-cached", init as RequestInit | undefined))
+            .status,
+        ["shell-scope", label],
+      );
+
+      // A cache keeps the fetch's value, so it isn't a hole.
+      await expect(runWithPprFallbackShellState(state, () => cached())).resolves.toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(consumeDynamicUsage()).toBe(false);
+    },
+  );
+
+  it("marks an auto no-cache fetch dynamic with Cache Components", async () => {
+    vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
+    try {
+      await fetch("https://api.example.com/cache-components-auto");
+      expect(consumeDynamicUsage()).toBe(true);
+      await fetch("https://api.example.com/cache-components-cached", {
+        next: { revalidate: 60 },
+      });
+      expect(consumeDynamicUsage()).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("holds a fallback shell open while a cacheable fetch is pending", async () => {
+    const { createPprFallbackShellState, runWithPprFallbackShellState } =
+      await import("../packages/vinext/src/shims/ppr-fallback-shell.js");
+    let respond!: () => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = () => resolve(new Response(JSON.stringify({ count: 1 })));
+        }),
+    );
+    const state = createPprFallbackShellState({
+      fallbackParamNames: ["slug"],
+      routePattern: "/posts/[slug]",
+    });
+
+    const pending = runWithPprFallbackShellState(state, () =>
+      fetch("https://api.example.com/shell-pending", { next: { revalidate: 60 } }),
+    );
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(state.pendingCacheTasks).toBe(1);
+
+    respond();
+    await pending;
+    expect(state.pendingCacheTasks).toBe(0);
+  });
+
+  it("doesn't hold a fallback shell open while a cacheable fetch's body is pending", async () => {
+    const { createPprFallbackShellState, runWithPprFallbackShellState } =
+      await import("../packages/vinext/src/shims/ppr-fallback-shell.js");
+    const state = createPprFallbackShellState({
+      fallbackParamNames: ["slug"],
+      routePattern: "/posts/[slug]",
+    });
+
+    // A body derived from fallback params never resolves.
+    void runWithPprFallbackShellState(state, () =>
+      fetch("https://api.example.com/shell-hanging-body", {
+        body: new ReadableStream(),
+        duplex: "half",
+        method: "POST",
+        next: { revalidate: 60 },
+      } as RequestInit),
+    );
+    await vi.waitFor(() => expect(state.pendingCacheTasks).toBe(0));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a left-out cache's fetch lifetime and tags off a shell's request, a kept cache's applied", async () => {
+    const {
+      createPprFallbackShellState,
+      preparePprFallbackShellFinalRender,
+      runWithPprFallbackShellState,
+    } = await import("../packages/vinext/src/shims/ppr-fallback-shell.js");
+    const { cacheLife } = await import("../packages/vinext/src/shims/cache.js");
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const shortLived = registerCachedFunction(async () => {
+      cacheLife("seconds");
+      await fetch("https://api.example.com/shell-short", {
+        next: { revalidate: 5, tags: ["short"] },
+      });
+      return "short";
+    }, "shell-fetch-short");
+    const longLived = registerCachedFunction(async () => {
+      cacheLife("minutes");
+      await fetch("https://api.example.com/shell-long", {
+        next: { revalidate: 120, tags: ["long"] },
+      });
+      return "long";
+    }, "shell-fetch-long");
+    const state = createPprFallbackShellState({ fallbackParamNames: [], routePattern: "/page" });
+    preparePprFallbackShellFinalRender(state);
+
+    const observed = await runWithRequestContext(createRequestContext(), () =>
+      runWithPprFallbackShellState(state, async () => {
+        void shortLived();
+        await longLived();
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { life: _peekRequestScopedCacheLife(), tags: getCollectedFetchTags() };
+      }),
+    );
+    state.abortController.abort();
+    expect(observed.life).toEqual({ stale: 300, revalidate: 60, expire: 3600 });
+    expect(observed.tags).toContain("long");
+    expect(observed.tags).not.toContain("short");
+  });
+
+  it("carries a cached function's fetch lifetime and tags to the request, on a hit too", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const cached = registerCachedFunction(async () => {
+      await fetch("https://api.example.com/in-cache", {
+        next: { revalidate: 30, tags: ["in-cache"] },
+      });
+      return "value";
+    }, "fetch-in-cache");
+
+    const observe = () =>
+      runWithRequestContext(createRequestContext(), async () => {
+        await cached();
+        return { life: _peekRequestScopedCacheLife(), tags: getCollectedFetchTags() };
+      });
+    const miss = await observe();
+    const hit = await observe();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(miss.life?.revalidate).toBe(30);
+    expect(miss.tags).toContain("in-cache");
+    expect(hit).toEqual(miss);
+  });
+
+  it("lets a cached function's cacheLife() win over its fetch's revalidate", async () => {
+    const { cacheLife } = await import("../packages/vinext/src/shims/cache.js");
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const cached = registerCachedFunction(async () => {
+      cacheLife("hours");
+      await fetch("https://api.example.com/in-cache-life", { next: { revalidate: 30 } });
+      return "value";
+    }, "fetch-in-cache-life");
+
+    const life = await runWithRequestContext(createRequestContext(), async () => {
+      await cached();
+      return _peekRequestScopedCacheLife();
+    });
+    expect(life?.revalidate).toBe(3600);
+  });
+
+  it("leaves a later tags-only fetch the route's revalidate after a cached function's fetch", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const cached = registerCachedFunction(async () => {
+      await fetch("https://api.example.com/in-cache-short", { next: { revalidate: 5 } });
+      return "value";
+    }, "fetch-in-cache-short");
+
+    await runWithRequestContext(createRequestContext(), async () => {
+      setCurrentFetchRevalidate(60);
+      await cached();
+      await fetch("https://api.example.com/after-cache", { next: { tags: ["after-cache"] } });
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    const afterCache = [...store.values()].find(
+      (entry) => entry.value.data?.url === "https://api.example.com/after-cache",
+    );
+    expect(afterCache?.value.revalidate).toBe(60);
+  });
+
+  it("carries a private cached function's fetch tags to the request", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const cached = registerCachedFunction(
+      async () => {
+        await fetch("https://api.example.com/in-private", {
+          next: { revalidate: 30, tags: ["in-private"] },
+        });
+        return "value";
+      },
+      "fetch-in-private-cache",
+      "private",
+    );
+
+    const tags = await runWithRequestContext(createRequestContext(), async () => {
+      await cached();
+      return getCollectedFetchTags();
+    });
+    expect(tags).toContain("in-private");
+  });
+
+  it("stores a cached function's later tags-only fetch for the cache's lowered revalidate", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const cached = registerCachedFunction(async () => {
+      await fetch("https://api.example.com/in-cache-first", { next: { revalidate: 5 } });
+      await fetch("https://api.example.com/in-cache-tagged", { next: { tags: ["tagged"] } });
+      return "value";
+    }, "fetch-in-cache-tagged");
+
+    await runWithRequestContext(createRequestContext(), async () => {
+      setCurrentFetchRevalidate(60);
+      await cached();
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    const tagged = [...store.values()].find(
+      (entry) => entry.value.data?.url === "https://api.example.com/in-cache-tagged",
+    );
+    expect(tagged?.value.revalidate).toBe(5);
+  });
+
+  it("stores a cached function's tags-only fetch after a nested cache for the nested cache's revalidate", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { cacheLife } = await import("../packages/vinext/src/shims/cache.js");
+    const inner = registerCachedFunction(async () => {
+      cacheLife({ revalidate: 5 });
+      return "inner";
+    }, "fetch-in-cache-nested-inner");
+    const outer = registerCachedFunction(async () => {
+      await inner();
+      await fetch("https://api.example.com/in-cache-after-nested", { next: { tags: ["tagged"] } });
+      return "value";
+    }, "fetch-in-cache-nested-outer");
+
+    await runWithRequestContext(createRequestContext(), async () => {
+      await outer();
+    });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    const tagged = [...store.values()].find(
+      (entry) => entry.value.data?.url === "https://api.example.com/in-cache-after-nested",
+    );
+    expect(tagged?.value.revalidate).toBe(5);
+  });
+
+  it("refetches an expired entry instead of collecting it into the shell's resume data cache", async () => {
+    await fetch("https://api.example.com/expired-rdc", { next: { revalidate: 60 } });
+
+    const handler = getCacheHandler() as InstanceType<typeof MemoryCacheHandler>;
+    const store = (handler as any).store as Map<string, any>;
+    for (const [, entry] of store) {
+      entry.expireAt = Date.now() - 1000;
+    }
+    startNewFetchCacheScope();
+
+    const collector = createResumeDataCache();
+    await runWithRequestContext(createRequestContext(), async () => {
+      _setResumeDataCacheCollector(collector);
+      const res = await fetch("https://api.example.com/expired-rdc", { next: { revalidate: 60 } });
+      expect((await res.json()).count).toBe(2);
+    });
+
+    const [entry] = collector.fetch.values();
+    expect(JSON.parse(Buffer.from(entry.body, "base64").toString()).count).toBe(2);
   });
 
   it("foreground fetch refresh treats a shorter current revalidate as stale", async () => {

@@ -35,6 +35,7 @@ import {
 } from "../server/app-history-state.js";
 import {
   createRscRequestHeaders,
+  omitStaticShellRouterStateHeaders,
   createRscRequestUrl,
   formatRscRequestPath,
   parseRscRequestPath,
@@ -72,6 +73,7 @@ import { isExternalUrl } from "../utils/external-url.js";
 import { ReadonlyURLSearchParams } from "./readonly-url-search-params.js";
 import { assertSafeNavigationUrl } from "./url-safety.js";
 import {
+  createPprFallbackShellSuspensePromiseForState,
   getPprFallbackShellState,
   markPprFallbackShellDynamicBoundary,
 } from "./ppr-fallback-shell.js";
@@ -79,6 +81,9 @@ import { BailoutToCSRError as NavigationBailoutToCSRError } from "./navigation-e
 import {
   APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
   APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+  APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
+  VINEXT_STATIC_SHELL_HEADER,
+  VINEXT_VARY_PARAMS_HEADER,
   type AppRscRenderMode,
 } from "../server/app-rsc-render-mode.js";
 import { AppRouterContext, type AppRouterInstance } from "./internal/app-router-context.js";
@@ -350,7 +355,18 @@ export type CachedRscResponse = {
   redirectTypeHeader?: string;
   renderedPathAndSearch: string | null;
   serverStaleTime?: ServerStaleTime;
+  /**
+   * A static-shell prefetch's payload: `partial` when the page's dynamic holes
+   * were left out, so its stream never ends, `complete` when it's the page,
+   * `runtime` when it's the page rendered for the request.
+   */
+  staticShell?: "partial" | "complete" | "runtime";
   url: string;
+  /**
+   * The route params a static shell's render read, `?` for search params, so
+   * another URL of the route with the same values for them can reuse it.
+   */
+  varyParams?: readonly string[];
 };
 
 export type PrefetchOptions = {
@@ -358,7 +374,7 @@ export type PrefetchOptions = {
   onInvalidate?: () => void;
 };
 
-export type PrefetchCacheKind = "loading-shell" | "navigation" | "route-tree";
+export type PrefetchCacheKind = "loading-shell" | "navigation" | "route-tree" | "static-shell";
 
 export type PrefetchCacheEntry = {
   cacheForNavigation?: boolean;
@@ -434,12 +450,16 @@ export function createAppPrefetchRequestHeaders(options: {
   renderMode?: AppRscRenderMode;
 }): Headers {
   const prefetchRouterState = getNavigationRuntime()?.functions.getPrefetchRouterState?.() ?? null;
-  return createRscRequestHeaders({
+  const headers = createRscRequestHeaders({
     ...options,
     nextUrl: getCurrentNextUrl(),
     includePrefetchHeader: options.prefetchKind !== "full",
     prefetchRouterState,
   });
+  if (options.renderMode === APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL) {
+    omitStaticShellRouterStateHeaders(headers);
+  }
+  return headers;
 }
 
 /** Get or create the shared in-memory RSC prefetch cache on window. */
@@ -756,7 +776,10 @@ export function hasFreshLearningOnlyPrefetchCacheEntry(
   const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
   const cache = getPrefetchCache();
   const entry = cache.get(cacheKey);
-  if (entry?.cacheForNavigation !== false) return false;
+  // A static shell is never refetched while fresh, whether or not it turned
+  // out to be the whole page.
+  if (entry === undefined) return false;
+  if (entry.cacheForNavigation !== false && entry.prefetchKind !== "static-shell") return false;
 
   if (entry.pending !== undefined || resolvePrefetchCacheEntryExpiresAt(entry) > Date.now()) {
     touchPrefetchCacheEntry(cache, cacheKey, entry);
@@ -767,6 +790,109 @@ export function hasFreshLearningOnlyPrefetchCacheEntry(
   return false;
 }
 
+/**
+ * A settled, fresh static shell a navigation to the URL can show while the
+ * page renders. It stays cached for later navigations, as it holds no dynamic
+ * data.
+ */
+export function peekStaticShellPrefetchForNavigation(
+  rscUrl: string,
+  interceptionContext: string | null = null,
+  mountedSlotsHeader: string | null = null,
+  additionalRscUrls: readonly string[] = [],
+): CachedRscResponse | null {
+  const normalizedTargets = new Set(
+    [rscUrl, ...additionalRscUrls]
+      .map((lookupRscUrl) => normalizeRscCacheLookupUrl(lookupRscUrl))
+      .filter((lookupRscUrl): lookupRscUrl is string => lookupRscUrl !== null),
+  );
+  if (normalizedTargets.size === 0) return null;
+  const now = Date.now();
+  for (const [cacheKey, entry] of getPrefetchCache()) {
+    if (entry.prefetchKind !== "static-shell" || entry.snapshot?.staticShell !== "partial") {
+      continue;
+    }
+    if (entry.pending !== undefined || resolvePrefetchCacheEntryExpiresAt(entry) <= now) continue;
+    const source = parsePrefetchCacheKey(cacheKey);
+    if (source.interceptionContext !== interceptionContext) continue;
+    const normalizedSource = normalizeRscCacheLookupUrl(source.rscUrl);
+    if (normalizedSource === null || !normalizedTargets.has(normalizedSource)) continue;
+    if (!isPrefetchCacheEntryCompatibleWithMountedSlots(entry, mountedSlotsHeader)) continue;
+    return entry.snapshot;
+  }
+  return null;
+}
+
+/**
+ * Seed a static-shell prefetch of `rscUrl` from a settled, fresh shell
+ * prefetched for another URL, when `resolveSnapshot` returns that shell for
+ * this URL. Like Next.js's segment cache, a shell is reused for any params its
+ * render didn't read (`varyParams`), so the prefetch needs no request. A
+ * complete shell is the whole page, so a navigation consumes it.
+ */
+export function seedStaticShellPrefetchFromVaryingShell(
+  rscUrl: string,
+  interceptionContext: string | null,
+  mountedSlotsHeader: string | null,
+  resolveSnapshot: (source: CachedRscResponse, sourceHref: string) => CachedRscResponse | null,
+  onInvalidate?: () => void,
+): boolean {
+  if (interceptionContext !== null) return false;
+  const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
+  const cache = getPrefetchCache();
+  const now = Date.now();
+  for (const [sourceCacheKey, source] of cache) {
+    if (
+      source.prefetchKind !== "static-shell" ||
+      (source.snapshot?.staticShell !== "partial" && source.snapshot?.staticShell !== "complete") ||
+      source.snapshot.varyParams === undefined ||
+      source.pending !== undefined
+    ) {
+      continue;
+    }
+    const expiresAt = resolvePrefetchCacheEntryExpiresAt(source);
+    if (expiresAt <= now) continue;
+    const sourceKey = parsePrefetchCacheKey(sourceCacheKey);
+    if (sourceKey.interceptionContext !== null || sourceCacheKey === cacheKey) continue;
+    if (!isPrefetchCacheEntryCompatibleWithMountedSlots(source, mountedSlotsHeader)) continue;
+    const sourceHref = normalizeRscCacheLookupUrl(sourceKey.rscUrl);
+    if (sourceHref === null) continue;
+    const snapshot = resolveSnapshot(source.snapshot, sourceHref);
+    if (snapshot === null) continue;
+
+    const existing = cache.get(cacheKey);
+    // The URL's own pending prefetch it supersedes hands over its subscribers.
+    const supersededCallbacks = existing?.onInvalidateCallbacks;
+    if (existing) {
+      deletePrefetchCacheEntry(cache, getPrefetchedUrls(), cacheKey, existing, false);
+    }
+    const size = snapshot.buffer.byteLength;
+    const entry: PrefetchCacheEntry = {
+      cacheForNavigation: snapshot.staticShell === "complete",
+      cacheKeys: new Set([cacheKey]),
+      expiresAt,
+      mountedSlotsHeader: resolvePrefetchCacheEntryMountedSlotsHeader(source),
+      optimisticRouteShell: source.optimisticRouteShell,
+      outcome: "cache-seeded",
+      prefetchKind: "static-shell",
+      size,
+      snapshot: { ...snapshot, url: rscUrl },
+      timestamp: source.timestamp,
+    };
+    for (const callback of supersededCallbacks ?? []) {
+      addPrefetchInvalidationCallback(entry, callback);
+    }
+    addPrefetchInvalidationCallback(entry, onInvalidate);
+    cache.set(cacheKey, entry);
+    adjustPrefetchCacheByteSize(cache, size);
+    getPrefetchedUrls().add(cacheKey);
+    schedulePrefetchInvalidation(cacheKey, entry);
+    evictPrefetchCacheIfNeeded();
+    return true;
+  }
+  return false;
+}
+
 export function hasSearchAgnosticPrefetchShellForRoute(
   rscUrl: string,
   interceptionContext: string | null = null,
@@ -774,6 +900,7 @@ export function hasSearchAgnosticPrefetchShellForRoute(
 ): boolean {
   const normalizedTargetPathname = normalizeRscCacheLookupPathname(rscUrl);
   if (normalizedTargetPathname === null) return false;
+  const normalizedTarget = normalizeRscCacheLookupUrl(rscUrl);
 
   const cache = getPrefetchCache();
   for (const [cacheKey, entry] of cache) {
@@ -782,6 +909,9 @@ export function hasSearchAgnosticPrefetchShellForRoute(
     const source = parsePrefetchCacheKey(cacheKey);
     if (source.interceptionContext !== interceptionContext) continue;
     if (normalizeRscCacheLookupPathname(source.rscUrl) !== normalizedTargetPathname) continue;
+    // The URL's own prefetch: a repeat one (on hover, say) asks for it again,
+    // so it dedupes against it rather than fetching a loading shell.
+    if (normalizeRscCacheLookupUrl(source.rscUrl) === normalizedTarget) continue;
     if (!isPrefetchCacheEntryCompatibleWithMountedSlots(entry, mountedSlotsHeader)) continue;
 
     if (entry.pending !== undefined) return true;
@@ -1401,6 +1531,8 @@ export function createCachedRscResponseSnapshot(
     : parsedServerStaleTime;
   const redirectHeader = response.headers.get(VINEXT_RSC_REDIRECT_HEADER);
   const redirectTypeHeader = response.headers.get(VINEXT_RSC_REDIRECT_TYPE_HEADER);
+  const staticShell = response.headers.get(VINEXT_STATIC_SHELL_HEADER);
+  const varyParams = parseVaryParamsHeader(response.headers.get(VINEXT_VARY_PARAMS_HEADER));
   return {
     compatibilityIdHeader: response.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
     buffer: extracted.buffer,
@@ -1416,8 +1548,24 @@ export function createCachedRscResponseSnapshot(
       response.headers.get(VINEXT_RENDERED_PATH_AND_SEARCH_HEADER),
     ),
     ...(serverStaleTime === undefined ? {} : { serverStaleTime }),
+    ...(staticShell === "partial" || staticShell === "complete" || staticShell === "runtime"
+      ? { staticShell }
+      : {}),
     url: responseUrl ?? response.url,
+    ...(varyParams === undefined ? {} : { varyParams }),
   };
+}
+
+function parseVaryParamsHeader(value: string | null): readonly string[] | undefined {
+  if (value === null) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.every((name) => typeof name === "string")
+      ? parsed
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1508,7 +1656,18 @@ export function restoreRscResponse(cached: CachedRscResponse, copy = true): Resp
     );
   }
 
-  const response = new Response(copy ? cached.buffer.slice(0) : cached.buffer, {
+  const buffer = copy ? cached.buffer.slice(0) : cached.buffer;
+  // Like Next.js's `createUnclosingPrefetchStream`, a partial static shell's
+  // stream stays open, so its holes suspend rather than fail as unfinished.
+  const body =
+    cached.staticShell === "partial"
+      ? new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(buffer));
+          },
+        })
+      : buffer;
+  const response = new Response(body, {
     status: 200,
     headers,
   });
@@ -1676,6 +1835,21 @@ export function prefetchRscResponse(
       if (isFlightPrefetchResponse(response)) {
         const snapshot = await snapshotRscResponse(response);
         if (cache.get(cacheKey) !== entry) return;
+        let settledDynamicStaleTime = behavior.dynamicStaleTime;
+        if (entry.prefetchKind === "static-shell") {
+          if (snapshot.staticShell === undefined) {
+            // The server answered with the route's loading shell instead.
+            entry.prefetchKind = "loading-shell";
+          } else if (snapshot.staticShell === "complete") {
+            // The shell is the whole page, so a navigation needs nothing else.
+            entry.cacheForNavigation = true;
+          } else if (snapshot.staticShell === "runtime") {
+            // A runtime prefetch holds request data, so it's kept like a
+            // navigation's own payload.
+            entry.cacheForNavigation = true;
+            settledDynamicStaleTime = "verbatim";
+          }
+        }
         const previousSize = getPrefetchCacheEntrySize(entry);
         entry.snapshot = snapshot;
         entry.size = snapshot.buffer.byteLength;
@@ -1689,7 +1863,7 @@ export function prefetchRscResponse(
           behavior.searchAgnosticShell === true
             ? "ignore"
             : (entry.dynamicStaleTime ??
-              behavior.dynamicStaleTime ??
+              settledDynamicStaleTime ??
               (behavior.optimisticRouteShell === true ? "ignore" : "verbatim"));
         if (
           dynamicStaleTime === "learning-only" &&
@@ -2492,6 +2666,12 @@ export function usePathname(): string {
  */
 export function useSearchParams(): ReadonlyURLSearchParams {
   if (isServer) {
+    const shellState = getPprFallbackShellState();
+    if (shellState !== null && shellState.varyParams === null && !shellState.isRuntimePrefetch) {
+      // Like Next.js's prerender, a document shell leaves the query to a hole,
+      // so every query string shares it.
+      React.use(createPprFallbackShellSuspensePromiseForState(shellState, "useSearchParams()"));
+    }
     const ctx = getNavigationContext();
     if (
       ctx?.isStaticGeneration === true &&
@@ -3335,17 +3515,25 @@ const _appRouter: AppRouterInstance = {
       const rewrittenPrefetchHref = HAS_CLIENT_REWRITES
         ? resolveLoadedHybridClientRewriteHref(fullHref, __basePath)
         : null;
-      const kind = options?.kind === "full" ? "full" : "auto";
       // Dynamic import keeps the policy module and its route-trie
       // dependencies off the startup path of every next/navigation consumer.
       const [
-        { resolveAutoAppRoutePrefetch, resolveFullAppRoutePrefetch },
+        { hasAppRouteInstantConfig, resolveAutoAppRoutePrefetch, resolveFullAppRoutePrefetch },
         { resolveAppPrefetchRscRequest },
+        { createVaryingStaticShellResolver },
       ] = await Promise.all([
         import("./internal/app-route-prefetch-policy.js"),
         import("./internal/app-prefetch-rsc-request.js"),
+        import("./internal/app-static-shell-vary-params.js"),
       ]);
       if (setup.cancelled) return;
+      // Like Next.js, a route with an `unstable_instant` config ignores a full
+      // prefetch: it's prefetched as an automatic one.
+      const kind =
+        options?.kind === "full" &&
+        !hasAppRouteInstantConfig(rewrittenPrefetchHref ?? fullHref, interceptionContext)
+          ? "full"
+          : "auto";
       const policy =
         kind === "full"
           ? resolveFullAppRoutePrefetch()
@@ -3368,11 +3556,14 @@ const _appRouter: AppRouterInstance = {
       if (!reusable && kind === "auto") {
         headers.set(NEXT_ROUTER_PREFETCH_HEADER, "1");
         headers.set(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER, "1");
+        if (policy.staticShell === true) omitStaticShellRouterStateHeaders(headers);
         headers.set(
           VINEXT_RSC_RENDER_MODE_HEADER,
-          hasSearchParams && policy.rendersDynamically !== true
-            ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
-            : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+          policy.staticShell === true
+            ? APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL
+            : hasSearchParams && policy.rendersDynamically !== true
+              ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
+              : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
         );
       }
       const { additionalRscUrls, rscUrl } = await resolveAppPrefetchRscRequest({
@@ -3448,6 +3639,23 @@ const _appRouter: AppRouterInstance = {
       ) {
         return;
       }
+      // Another URL's shell serves this one when they agree on the params it
+      // read. A client rewrite's target isn't the URL the shell keys on.
+      if (
+        !reusable &&
+        kind === "auto" &&
+        policy.staticShell === true &&
+        rewrittenPrefetchHref === null &&
+        seedStaticShellPrefetchFromVaryingShell(
+          rscUrl,
+          interceptionContext,
+          mountedSlotsHeader,
+          createVaryingStaticShellResolver(fullHref),
+          options?.onInvalidate,
+        )
+      ) {
+        return;
+      }
       prefetched.add(cacheKey);
       const fetchFullRscPayload = () =>
         scheduleAppPrefetchFetch(
@@ -3507,7 +3715,9 @@ const _appRouter: AppRouterInstance = {
                   : PREFETCH_CACHE_TTL,
               dynamicStaleTime: policy.dynamicStaleTime,
               optimisticRouteShell: true,
-              prefetchKind: "navigation",
+              prefetchKind: policy.staticShell === true ? "static-shell" : "navigation",
+              prepareSnapshot:
+                policy.staticShell === true ? prepareNavigationPrefetchSnapshot : undefined,
             },
       );
     })()

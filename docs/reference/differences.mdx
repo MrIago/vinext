@@ -77,6 +77,14 @@ Under `dynamicParams = false`, Next.js checks a request against the params its b
 
 Like Next.js, a client navigation renders only below the layouts the client already holds, so a shared layout's server code doesn't run again. vinext does this only for renders it never stores: every render in development, and in production draft-mode requests and routes with `runtime = "edge"`, `dynamic = "force-dynamic"`, `revalidate = 0`, or a dynamic segment without `generateStaticParams`. A route that reads `cookies()` or `headers()` without route config renders every layout on each navigation in production, because vinext learns that it's dynamic only while rendering it, where Next.js knows from its build. In development the same route skips the held layouts. To skip them in production too, export `dynamic = "force-dynamic"` from the route's `layout.tsx`.
 
+## Partial prerendering
+
+With `cacheComponents`, vinext resumes stored shells as Next.js does (see [Partial prerendering](/docs/caching#partial-prerendering)), with these differences:
+
+- Next.js prerenders a route's shells at build. vinext renders a path in full on its first request and, when that render is dynamic, produces the path's own shell after it, and renders a fallback shell on the first request that needs it.
+- A client page that reads its `searchParams` prop is a hole of its shell, which a request fills with the browser's query. Next.js renders that page in the browser instead, and serves the route as a static page when nothing else in it is dynamic.
+- On a Workers Cache deployment, a path the deploy manifest certifies as static is dispatched without its query, unless a `next.config` header sets its cache policy, so a resumed shell's `useSearchParams()` holes render in the browser, as the path's static render does.
+
 ## Routing config
 
 Like Next.js, vinext doesn't check the regexes in `redirects`, `rewrites`, and `headers` sources, in `has` and `missing` values, or in middleware matchers for catastrophic backtracking. They run as written against request paths, headers, cookies, query values, and hosts, so avoid nested or overlapping repeats such as `(a+)+` in these patterns.

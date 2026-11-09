@@ -44,8 +44,10 @@ import {
   invalidateVisitedResponsePrefetches,
   invalidatePrefetchCache,
   parseRenderedPathAndSearchHeader,
+  peekStaticShellPrefetchForNavigation,
   preloadHybridClientRouteOwner,
   seedPrefetchResponseSnapshot,
+  seedStaticShellPrefetchFromVaryingShell,
   decodeRedirectError,
   isRedirectError,
   pushHistoryStateWithoutNotify,
@@ -178,6 +180,7 @@ import {
 } from "vinext/shims/error-boundary";
 import DefaultGlobalError from "vinext/shims/default-global-error";
 import { AppRouterContext } from "vinext/shims/internal/app-router-context";
+import { createVaryingStaticShellResolver } from "vinext/shims/internal/app-static-shell-vary-params";
 import {
   BfcacheIdentityMapContext,
   bindAppElementsRenderedSearch,
@@ -218,9 +221,9 @@ import {
   canCommitOptimisticRouteTemplate,
   createOptimisticRouteTemplate,
   createOptimisticRouteTemplateStore,
+  createShellMetadataKeeper,
   getOptimisticPrefetchSourceKey,
   getOptimisticRouteTemplateKey,
-  keepOptimisticStreamingMetadata,
   resolveOptimisticNavigationParamsForHref,
   resolveOptimisticNavigationPayload,
   type LearnedOptimisticRouteTemplate,
@@ -768,7 +771,8 @@ async function learnOptimisticRouteTemplatesFromPrefetchCache(options: {
     });
     if (optimisticRouteTemplates.hasSource(sourceKey)) continue;
     if (!isSettledPrefetchCacheEntry(entry)) continue;
-    if (entry.prefetchKind === "route-tree") continue;
+    // A static shell is one URL's page, never a template for its route.
+    if (entry.prefetchKind === "route-tree" || entry.prefetchKind === "static-shell") continue;
 
     learning.push(
       optimisticRouteTemplates.learn(sourceKey, () =>
@@ -2193,19 +2197,8 @@ function bootstrapHydration(
     let currentPrevNextUrl = previousNextUrlOverride;
     let redirectCount = redirectDepth;
     let detachedNavigationCommits = false;
-    // The optimistic shell this navigation committed, if any.
-    let optimisticShellElements: AppElements | null = null;
-    const keepOptimisticShellMetadata = (
-      payload: Promise<AppElements> | AppElements,
-    ): Promise<AppElements> | AppElements => {
-      const shellElements = optimisticShellElements;
-      if (shellElements === null) return payload;
-      return payload instanceof Promise
-        ? payload.then((elements) =>
-            keepOptimisticStreamingMetadata(elements, shellElements, String(navId)),
-          )
-        : keepOptimisticStreamingMetadata(payload, shellElements, String(navId));
-    };
+    // The shell this navigation committed, if any.
+    const shellMetadata = createShellMetadataKeeper(String(navId));
     const activeTraversalIntent =
       navigationKind === "traverse"
         ? (traversalIntent ?? historyController.resolveTraversalIntent(window.history.state))
@@ -2466,18 +2459,42 @@ function bootstrapHydration(
           visitedResponse,
         });
         let routeManifest = navigationKind === "navigate" ? getBrowserRouteManifest() : null;
-        const hasPrefetchCandidate =
+        const hasPrefetchCacheEntry = () =>
+          hasPrefetchCacheEntryForNavigation(
+            rscUrl,
+            requestInterceptionContext,
+            mountedSlotsHeader,
+            {
+              additionalRscUrls: additionalPrefetchRscUrls,
+              notifyInvalidation: false,
+            },
+          );
+        let hasPrefetchCandidate =
           settledPrefetchedResponse !== null ||
-          (prefetchProbeDecision.kind === "probe" &&
-            hasPrefetchCacheEntryForNavigation(
-              rscUrl,
-              requestInterceptionContext,
-              mountedSlotsHeader,
-              {
-                additionalRscUrls: additionalPrefetchRscUrls,
-                notifyInvalidation: false,
-              },
-            ));
+          (prefetchProbeDecision.kind === "probe" && hasPrefetchCacheEntry());
+        // Like Next.js's segment cache, a navigation with no prefetch of its own
+        // reuses another URL's static shell when they agree on the params its
+        // render read (`varyParams`). A client rewrite's target isn't the URL
+        // the shell keys on.
+        if (
+          !hasPrefetchCandidate &&
+          prefetchProbeDecision.kind === "probe" &&
+          navigationKind === "navigate" &&
+          additionalPrefetchRscUrls.length === 0 &&
+          peekStaticShellPrefetchForNavigation(
+            rscUrl,
+            requestInterceptionContext,
+            mountedSlotsHeader,
+          ) === null &&
+          seedStaticShellPrefetchFromVaryingShell(
+            rscUrl,
+            requestInterceptionContext,
+            mountedSlotsHeader,
+            createVaryingStaticShellResolver(currentHref),
+          )
+        ) {
+          hasPrefetchCandidate = hasPrefetchCacheEntry();
+        }
         const reuseDecision = navigationPlanner.classifyNavigationReuse({
           bypassNavigationCache: shouldBypassNavigationCache,
           navigationKind,
@@ -2561,7 +2578,7 @@ function bootstrapHydration(
             navId,
             operationLane: toOperationLane(navigationKind),
             params: cachedParams,
-            payload: keepOptimisticShellMetadata(cachedPayload),
+            payload: shellMetadata.keep(cachedPayload),
             payloadOrigin: cachedRoute.elements
               ? COMMITTED_CACHE_APP_NAVIGATION_PAYLOAD_ORIGIN
               : VISITED_CACHE_APP_NAVIGATION_PAYLOAD_ORIGIN,
@@ -2645,7 +2662,66 @@ function bootstrapHydration(
           }
         }
 
-        if (!navResponse && fallbackReuseDecision.kind === "attemptOptimisticRouteShell") {
+        // Like Next.js, a navigation to a page whose static shell was
+        // prefetched shows it at once, as a detached commit the page's render
+        // then replaces.
+        const staticShell =
+          !navResponse && navigationKind === "navigate" && !shouldBypassNavigationCache
+            ? peekStaticShellPrefetchForNavigation(
+                rscUrl,
+                requestInterceptionContext,
+                mountedSlotsHeader,
+                additionalPrefetchRscUrls,
+              )
+            : null;
+        const committedStaticShell =
+          staticShell !== null && isRscResponseCompatible(staticShell.compatibilityIdHeader);
+        if (committedStaticShell) {
+          detachedNavigationCommits = true;
+          const staticShellParams =
+            parseEncodedJsonHeader<Record<string, string | string[]>>(staticShell.paramsHeader) ??
+            {};
+          const staticShellPayload = decodeAppElementsPromise(
+            createFromFetch<AppWireElements>(Promise.resolve(restoreRscResponse(staticShell))),
+          );
+          // Like an optimistic shell's, its metadata stays up while the page's
+          // streams, once decoded. The page's render never waits for it.
+          shellMetadata.trackShell(staticShellPayload);
+          void renderNavigationPayload({
+            actionType: toActionType(navigationKind),
+            historyUpdateMode: currentHistoryMode,
+            navigationCommitKind: "detached",
+            navigationInitiationState,
+            navigationSnapshot: createClientNavigationRenderSnapshot(
+              currentHref,
+              staticShellParams,
+              staticShell.renderedPathAndSearch,
+            ),
+            navId,
+            operationLane: toOperationLane(navigationKind),
+            params: staticShellParams,
+            payload: staticShellPayload,
+            payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+            pendingRouterState: null,
+            previousNextUrl: requestPreviousNextUrl,
+            restoredBfcacheIds,
+            reuseCurrentBfcacheIds,
+            scrollIntent,
+            targetHref: currentHref,
+            traversalIntent: activeTraversalIntent,
+            visibleCommitMode,
+          }).catch((error) => {
+            if (browserNavigationController.isCurrentNavigation(navId)) {
+              console.error("[vinext] Static shell navigation error:", error);
+            }
+          });
+        }
+
+        if (
+          !navResponse &&
+          !committedStaticShell &&
+          fallbackReuseDecision.kind === "attemptOptimisticRouteShell"
+        ) {
           await learnOptimisticRouteTemplatesFromPrefetchCache({
             interceptionContext: requestInterceptionContext,
             mountedSlotsHeader,
@@ -2679,7 +2755,7 @@ function bootstrapHydration(
               })
             ) {
               detachedNavigationCommits = true;
-              optimisticShellElements = optimisticPayload.elements;
+              shellMetadata.setShell(optimisticPayload.elements);
               const optimisticNavigationSnapshot = createClientNavigationRenderSnapshot(
                 currentHref,
                 optimisticPayload.params,
@@ -2963,7 +3039,7 @@ function bootstrapHydration(
           },
           operationLane: toOperationLane(navigationKind),
           params: navParams,
-          payload: keepOptimisticShellMetadata(rscPayload),
+          payload: shellMetadata.keep(rscPayload),
           payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
           pendingRouterState: detachedNavigationCommits ? null : pendingRouterState,
           previousNextUrl: requestPreviousNextUrl,

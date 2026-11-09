@@ -23,7 +23,7 @@ import {
   isInsideUnifiedScope,
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
-import { createPprFallbackShellSuspensePromise } from "./ppr-fallback-shell.js";
+import { createPprFallbackShellRequestDataSuspensePromise } from "./ppr-fallback-shell.js";
 import type { RenderRequestApiKind } from "../server/cache-proof.js";
 import type { ReadonlyRequestCookies } from "@vinext/types/next/upstream/dist/server/web/spec-extension/adapters/request-cookies";
 import type { ResponseCookie } from "@vinext/types/next/upstream/dist/compiled/@edge-runtime/cookies/index";
@@ -873,11 +873,14 @@ export function headers(): Promise<Headers> & Headers {
     return _decorateRejectedRequestApiPromise<Headers>(state.headersContext.accessError);
   }
 
-  markDynamicUsage();
-  const fallbackShellPromise = createPprFallbackShellSuspensePromise<Headers>("`headers()`");
+  const fallbackShellPromise =
+    createPprFallbackShellRequestDataSuspensePromise<Headers>("`headers()`");
   if (fallbackShellPromise) {
+    // The shell leaves the read to a hole each request resumes, so the read
+    // doesn't make the shell itself dynamic.
     return _decorateSuspendingRequestApiPromise(fallbackShellPromise);
   }
+  markDynamicUsage();
 
   const readonlyHeaders = _getReadonlyHeaders(state.headersContext);
   return _getOrCreateDecoratedRequestApiPromise(_decoratedHeadersPromises, readonlyHeaders);
@@ -908,11 +911,14 @@ function cookiesImpl(): Promise<RequestCookies> & RequestCookies {
     return _decorateRejectedRequestApiPromise<RequestCookies>(state.headersContext.accessError);
   }
 
-  markDynamicUsage();
-  const fallbackShellPromise = createPprFallbackShellSuspensePromise<RequestCookies>("`cookies()`");
+  const fallbackShellPromise =
+    createPprFallbackShellRequestDataSuspensePromise<RequestCookies>("`cookies()`");
   if (fallbackShellPromise) {
+    // The shell leaves the read to a hole each request resumes, so the read
+    // doesn't make the shell itself dynamic.
     return _decorateSuspendingRequestApiPromise(fallbackShellPromise);
   }
+  markDynamicUsage();
 
   const cookieStore = _areCookiesMutableInCurrentPhase()
     ? _getMutableCookies(state.headersContext)
