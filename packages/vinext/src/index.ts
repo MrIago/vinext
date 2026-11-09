@@ -437,6 +437,7 @@ import commonjs from "vite-plugin-commonjs";
 import { createIgnoreDynamicRequestsPlugin } from "./plugins/ignore-dynamic-requests.js";
 import { createTransformCache } from "./plugins/transform-cache.js";
 import { omitUnusedBuildSourcemap } from "./plugins/transform-result.js";
+import { createPureCssChunkPreloadsPlugin } from "./plugins/pure-css-chunk-preloads.js";
 import { isServerEnvironment } from "./plugins/environment.js";
 import {
   claimViteCliBuildInvocation,
@@ -9576,6 +9577,14 @@ export const loadServerActionClient = ${
       }),
     );
     plugins.push(createScanBuildCssPlugin());
+    plugins.push(
+      createPureCssChunkPreloadsPlugin({
+        async getManager(config) {
+          const rscPluginModule = await rscPluginModulePromise;
+          return rscPluginModule?.getPluginApi(config)?.manager;
+        },
+      }),
+    );
   }
   if (rscPluginPromise) {
     plugins.push(createRscReferenceValidationNormalizerPlugin());
