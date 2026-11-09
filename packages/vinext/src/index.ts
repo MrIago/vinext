@@ -438,6 +438,11 @@ import commonjs from "vite-plugin-commonjs";
 import { createIgnoreDynamicRequestsPlugin } from "./plugins/ignore-dynamic-requests.js";
 import { createTransformCache } from "./plugins/transform-cache.js";
 import { omitUnusedBuildSourcemap } from "./plugins/transform-result.js";
+import {
+  combineStrictRouteMatchingErrors,
+  findStrictRouteMatchingErrors,
+  STRICT_ROUTE_MATCHING_DEFAULT_WARNING,
+} from "./routing/strict-route-matching-check.js";
 import { createPureCssChunkPreloadsPlugin } from "./plugins/pure-css-chunk-preloads.js";
 import { isServerEnvironment } from "./plugins/environment.js";
 import {
@@ -1982,6 +1987,13 @@ export async function onRequestError(...args) {
   );
 }
 `;
+}
+
+let warnedStrictRouteMatchingDefault = false;
+function warnStrictRouteMatchingDefaultOnce(): void {
+  if (warnedStrictRouteMatchingDefault) return;
+  warnedStrictRouteMatchingDefault = true;
+  console.warn(STRICT_ROUTE_MATCHING_DEFAULT_WARNING);
 }
 
 export default function vinext(options: VinextOptions = {}): PluginOption[] {
@@ -6245,6 +6257,23 @@ export const loadServerActionClient = ${
       },
     },
     {
+      // Strict App Router route matching fails the build on an invalid route
+      // structure, as Next.js's entry discovery does (build/entries.ts), with
+      // the opt-out warning while strict matching is the default.
+      name: "vinext:strict-route-matching",
+      apply: "build",
+      buildStart() {
+        if (!hasAppDir || !nextConfig.strictRouteMatching) return;
+        if (this.environment && this.environment.name !== "rsc") return;
+        const error = combineStrictRouteMatchingErrors(
+          findStrictRouteMatchingErrors({ appDir, root, matcher: fileMatcher }),
+        );
+        if (!error) return;
+        warnStrictRouteMatchingDefaultOnce();
+        throw error;
+      },
+    },
+    {
       // A project that declares `"type": "commonjs"` makes Node read every
       // `.js` the server build writes as CommonJS, so the generated ESM
       // (Server Actions entry included) fails to load (#4565). Next.js gives
@@ -6802,6 +6831,37 @@ export const loadServerActionClient = ${
             });
         }
 
+        // Strict App Router route matching, reported in dev like Next.js's
+        // dev bundler: each new set of errors is logged once with the opt-out
+        // warning and shown in the overlay, and the server keeps running so the
+        // structure can be fixed (setup-dev-bundler.ts).
+        let previousStrictRouteMatchingErrors: string | null = null;
+        let strictRouteMatchingError: Error | null = null;
+        server.ws.on("connection", () => {
+          if (strictRouteMatchingError) sendHybridRouteValidationError(strictRouteMatchingError);
+        });
+        function revalidateStrictRouteMatching() {
+          if (!hasAppDir || !nextConfig.strictRouteMatching) return;
+          let errors: Error[];
+          try {
+            errors = findStrictRouteMatchingErrors({ appDir, root, matcher: fileMatcher });
+          } catch (error) {
+            errors = [error instanceof Error ? error : new Error(String(error))];
+          }
+          const key = errors.map((error) => error.message).join("\n\n") || null;
+          if (key !== null && key !== previousStrictRouteMatchingErrors) {
+            for (const error of errors) console.error(error.message);
+            warnStrictRouteMatchingDefaultOnce();
+          }
+          strictRouteMatchingError = combineStrictRouteMatchingErrors(errors);
+          if (strictRouteMatchingError) {
+            sendHybridRouteValidationError(strictRouteMatchingError);
+          } else if (previousStrictRouteMatchingErrors !== null) {
+            server.ws.send({ type: "full-reload" });
+          }
+          previousStrictRouteMatchingErrors = key;
+        }
+
         let appRouteTypeGeneration: Promise<void> | null = null;
         let appRouteTypeGenerationPending = false;
 
@@ -6863,6 +6923,7 @@ export const loadServerActionClient = ${
 
         regenerateAppRouteTypes();
         revalidateHybridRoutes();
+        revalidateStrictRouteMatching();
 
         // Node throws on unhandled 'error' events on sockets. When a browser
         // drops the connection mid-response (common in dev: HMR triggers a
@@ -6956,6 +7017,7 @@ export const loadServerActionClient = ${
             if (!hasAppDir) server.ws.send({ type: "full-reload" });
             invalidateHybridClientEntries();
             revalidateHybridRoutes();
+            revalidateStrictRouteMatching();
           }
         });
         server.watcher.on("change", (filePath: string) => {
@@ -7020,6 +7082,7 @@ export const loadServerActionClient = ${
             if (!hasAppDir) server.ws.send({ type: "full-reload" });
             invalidateHybridClientEntries();
             revalidateHybridRoutes();
+            revalidateStrictRouteMatching();
           }
         });
 

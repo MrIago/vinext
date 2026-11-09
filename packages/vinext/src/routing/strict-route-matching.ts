@@ -22,7 +22,7 @@ const UNDERSCORE_GLOBAL_ERROR_ROUTE = "/_global-error";
 const UNDERSCORE_GLOBAL_ERROR_ROUTE_ENTRY = `${UNDERSCORE_GLOBAL_ERROR_ROUTE}/page`;
 
 // --- lib/is-app-page-route.ts
-function isAppPageRoute(route: string): boolean {
+export function isAppPageRoute(route: string): boolean {
   return route.endsWith("/page");
 }
 
