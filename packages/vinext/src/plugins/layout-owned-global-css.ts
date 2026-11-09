@@ -49,7 +49,7 @@ function isNonStylesheetImport(source: string, resolvedId: string): boolean {
 
 function isDescendantPath(filePath: string, directory: string): boolean {
   const relative = path.relative(directory, filePath);
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+  return relative === "" || (!relative.startsWith("../") && relative !== "..");
 }
 
 function sourceModuleLang(modulePath: string): "js" | "jsx" | "ts" | "tsx" {
@@ -240,7 +240,7 @@ export function createLayoutOwnedGlobalCssPlugin(
 
   function isPagesApiRoute(modulePath: string, pagesDir: string): boolean {
     const relativePath = path.relative(pagesDir, modulePath);
-    if (relativePath.startsWith(`api${path.sep}`)) return true;
+    if (relativePath.startsWith("api/")) return true;
 
     const lowerRelativePath = relativePath.toLowerCase();
     return normalizedPageExtensions().some((extension) => lowerRelativePath === `api.${extension}`);
