@@ -2014,15 +2014,20 @@ describe("App Router integration", () => {
     expect(ts1![2]).not.toBe(ts2![2]);
   });
 
-  it("non-force-dynamic pages do not set no-store", async () => {
+  // Ported from Next.js: test/development/dev-cache-control/dev-cache-control.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/development/dev-cache-control/dev-cache-control.test.ts
+  // Every dev document and RSC payload is no-store, whatever the route config,
+  // so a back navigation never restores output from before the latest edit.
+  it("sends no-store for App Router documents and RSC payloads in development", async () => {
     const res = await fetch(`${baseUrl}/about`);
     expect(res.status).toBe(200);
-    const cacheControl = res.headers.get("cache-control");
-    // Normal pages should not have no-store
-    expect(cacheControl).toBeNull();
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const rsc = await fetch(`${baseUrl}/about`, { headers: { RSC: "1" } });
+    expect(rsc.status).toBe(200);
+    expect(rsc.headers.get("cache-control")).toBe("no-store");
   });
 
-  it("export const dynamic = 'force-static' sets long-lived Cache-Control", async () => {
+  it("export const dynamic = 'force-static' renders as STATIC with the dev no-store Cache-Control", async () => {
     const res = await fetch(`${baseUrl}/static-test`);
     expect(res.status).toBe(200);
 
@@ -2032,7 +2037,7 @@ describe("App Router integration", () => {
 
     // force-static should set s-maxage for indefinite caching
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=31536000");
+    expect(cacheControl).toBe("no-store");
     expect(res.headers.get("x-vinext-cache")).toBe("STATIC");
   });
 
@@ -2055,7 +2060,7 @@ describe("App Router integration", () => {
     expect(html).toContain('data-testid="error-dynamic-page"');
     // Should be treated as static — long-lived cache
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=31536000");
+    expect(cacheControl).toBe("no-store");
     expect(res.headers.get("x-vinext-cache")).toBe("STATIC");
   });
 
@@ -2239,8 +2244,7 @@ describe("App Router integration", () => {
 
     // revalidate=60 should set s-maxage=60 on first request (cache MISS)
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=60");
-    expect(cacheControl).toContain("stale-while-revalidate");
+    expect(cacheControl).toBe("no-store");
   });
 
   it("keeps a revalidate page that imports CSS cacheable", async () => {
@@ -2251,8 +2255,7 @@ describe("App Router integration", () => {
     expect(await res.text()).toContain('data-testid="revalidate-css-module"');
 
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=60");
-    expect(cacheControl).toContain("stale-while-revalidate");
+    expect(cacheControl).toBe("no-store");
   });
 
   it("applies revalidate exported from a layout to child pages", async () => {
@@ -2261,8 +2264,7 @@ describe("App Router integration", () => {
     expect(await res.text()).toContain('data-testid="layout-segment-config-revalidate"');
 
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=30");
-    expect(cacheControl).toContain("stale-while-revalidate");
+    expect(cacheControl).toBe("no-store");
   });
 
   it("applies dynamic = 'force-dynamic' exported from a layout to child pages", async () => {
