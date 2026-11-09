@@ -13,6 +13,9 @@ import React from "react";
 import ReactDOMServer from "react-dom/server";
 import Image, { getImageProps, type StaticImageData } from "../packages/vinext/src/shims/image.js";
 
+const BLUR_SVG_400x300 =
+  "data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 300'%3E%3Cfilter id='b' color-interpolation-filters='sRGB'%3E%3CfeGaussianBlur stdDeviation='20'/%3E%3CfeColorMatrix values='1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 100 -1' result='s'/%3E%3CfeFlood x='0' y='0' width='100%25' height='100%25'/%3E%3CfeComposite operator='out' in='s'/%3E%3CfeComposite in2='SourceGraphic'/%3E%3CfeGaussianBlur stdDeviation='20'/%3E%3C/filter%3E%3Cimage width='100%25' height='100%25' x='0' y='0' preserveAspectRatio='none' style='filter: url(%23b);' href='data:image/png;base64,abc123'/%3E%3C/svg%3E";
+
 /** Helper: expected optimization URL matching what the image shim produces. */
 function optUrl(src: string, w: number, q = 75): string {
   return `/_next/image?url=${encodeURIComponent(src)}&w=${w}&q=${q}`;
@@ -234,8 +237,49 @@ describe("Image SSR rendering", () => {
         blurDataURL,
       }),
     );
-    expect(html).toContain(`url(${blurDataURL})`);
-    expect(html).toContain("background-size:cover");
+    // Ported from Next.js: test/e2e/next-image-new/default/default-static.test.ts
+    // ("should add a blur placeholder a statically imported jpg"), which pins
+    // the style getImgProps gives a blur placeholder.
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/next-image-new/default/default-static.test.ts
+    expect(html.replaceAll("&#x27;", "'")).toContain(
+      `background-size:cover;background-position:50% 50%;background-repeat:no-repeat;` +
+        `background-image:url(&quot;${BLUR_SVG_400x300}&quot;)`,
+    );
+  });
+
+  it("sizes the blur SVG from a static import's blur size", () => {
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Image, {
+        alt: "static",
+        src: {
+          src: "/_next/static/media/photo.0a1b2c3d.jpg",
+          width: 320,
+          height: 240,
+          blurDataURL: "data:image/jpeg;base64,abc",
+          blurWidth: 8,
+          blurHeight: 6,
+        },
+        placeholder: "blur",
+      }),
+    );
+    expect(html.replaceAll("&#x27;", "'")).toContain("viewBox='0 0 320 240'");
+    expect(html.replaceAll("&#x27;", "'")).toContain("href='data:image/jpeg;base64,abc'");
+  });
+
+  it("keeps a data:image placeholder as-is and follows object-fit", () => {
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Image, {
+        alt: "inline",
+        src: "/photo.jpg",
+        width: 400,
+        height: 300,
+        placeholder: "data:image/png;base64,xyz",
+        style: { objectFit: "contain", objectPosition: "top" },
+      }),
+    );
+    expect(html).toContain(
+      "background-size:contain;background-position:top;background-repeat:no-repeat;background-image:url(&quot;data:image/png;base64,xyz&quot;)",
+    );
   });
 
   it("renders with custom loader", () => {
@@ -483,7 +527,9 @@ describe("getImageProps", () => {
       blurDataURL: "data:image/png;base64,test",
     });
 
-    expect((props.style as any)?.backgroundImage).toBe("url(data:image/png;base64,test)");
+    expect((props.style as any)?.backgroundImage).toBe(
+      `url("${BLUR_SVG_400x300.replace("abc123", "test")}")`,
+    );
     expect((props.style as any)?.backgroundSize).toBe("cover");
   });
 
@@ -775,7 +821,7 @@ describe("unoptimized remote images", () => {
     expect(html).toContain('height="100"');
     expect(html).toContain('loading="lazy"');
     expect(html).toContain('data-nimg="1"');
-    expect(html).toContain("background-image:url(data:image/png;base64,test)");
+    expect(html.replaceAll("&#x27;", "'")).toContain("href='data:image/png;base64,test'");
     expect(html).toContain("border-radius:8px");
     expect(html).not.toContain("public=undefined");
     expect(html).not.toContain("srcSet");
@@ -795,7 +841,7 @@ describe("unoptimized remote images", () => {
     expect(props.srcSet).toBeUndefined();
     expect(props.sizes).toBeUndefined();
     expect(props.style).toMatchObject({
-      backgroundImage: "url(data:image/png;base64,test)",
+      backgroundImage: expect.stringContaining("href='data:image/png;base64,test'"),
       borderRadius: 8,
     });
   });

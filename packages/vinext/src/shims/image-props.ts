@@ -145,6 +145,11 @@ export function validateRemoteUrl(src: string): { allowed: boolean; reason?: str
 export function sanitizeBlurDataURL(url: string): string | undefined {
   // Must be a data: image URL
   if (!url.startsWith("data:image/")) return undefined;
+  return sanitizeCssUrl(url);
+}
+
+/** A URL safe inside CSS `url("...")`, or undefined. */
+function sanitizeCssUrl(url: string): string | undefined {
   // Reject characters that can break out of CSS url():
   //   ) - closes url()
   //   ( - could open nested functions
@@ -194,7 +199,14 @@ export function resolveImageSource(v: {
   width?: number | `${number}`;
   height?: number | `${number}`;
   blurDataURL?: string;
-}): { src: string; width?: number; height?: number; blurDataURL?: string } {
+}): {
+  src: string;
+  width?: number;
+  height?: number;
+  blurDataURL?: string;
+  blurWidth?: number;
+  blurHeight?: number;
+} {
   const staticData = typeof v.src === "object" && "default" in v.src ? v.src.default : v.src;
   const src = typeof staticData === "string" ? staticData : staticData.src;
   const sourceWidth = v.width ?? (typeof staticData === "object" ? staticData.width : undefined);
@@ -203,7 +215,115 @@ export function resolveImageSource(v: {
   const imgHeight = typeof sourceHeight === "string" ? Number(sourceHeight) : sourceHeight;
   const imgBlurDataURL =
     v.blurDataURL ?? (typeof staticData === "object" ? staticData.blurDataURL : undefined);
-  return { src, width: imgWidth, height: imgHeight, blurDataURL: imgBlurDataURL };
+  return {
+    src,
+    width: imgWidth,
+    height: imgHeight,
+    blurDataURL: imgBlurDataURL,
+    blurWidth: typeof staticData === "object" ? staticData.blurWidth : undefined,
+    blurHeight: typeof staticData === "object" ? staticData.blurHeight : undefined,
+  };
+}
+
+/**
+ * Next.js' blur placeholder: the blur image scaled up behind an SVG Gaussian
+ * blur, sized from the static import's blur size or the image's own size.
+ *
+ * Ported from Next.js: packages/next/src/shared/lib/image-blur-svg.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/image-blur-svg.ts
+ */
+function getImageBlurSvg({
+  widthInt,
+  heightInt,
+  blurWidth,
+  blurHeight,
+  blurDataURL,
+  objectFit,
+}: {
+  widthInt?: number;
+  heightInt?: number;
+  blurWidth?: number;
+  blurHeight?: number;
+  blurDataURL: string;
+  objectFit?: string;
+}): string {
+  const std = 20;
+  const svgWidth = blurWidth ? blurWidth * 40 : widthInt;
+  const svgHeight = blurHeight ? blurHeight * 40 : heightInt;
+  const viewBox = svgWidth && svgHeight ? `viewBox='0 0 ${svgWidth} ${svgHeight}'` : "";
+  const preserveAspectRatio = viewBox
+    ? "none"
+    : objectFit === "contain"
+      ? "xMidYMid"
+      : objectFit === "cover"
+        ? "xMidYMid slice"
+        : "none";
+  return `%3Csvg xmlns='http://www.w3.org/2000/svg' ${viewBox}%3E%3Cfilter id='b' color-interpolation-filters='sRGB'%3E%3CfeGaussianBlur stdDeviation='${std}'/%3E%3CfeColorMatrix values='1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 100 -1' result='s'/%3E%3CfeFlood x='0' y='0' width='100%25' height='100%25'/%3E%3CfeComposite operator='out' in='s'/%3E%3CfeComposite in2='SourceGraphic'/%3E%3CfeGaussianBlur stdDeviation='${std}'/%3E%3C/filter%3E%3Cimage width='100%25' height='100%25' x='0' y='0' preserveAspectRatio='${preserveAspectRatio}' style='filter: url(%23b);' href='${blurDataURL}'/%3E%3C/svg%3E`;
+}
+
+const INVALID_BACKGROUND_SIZE_VALUES = new Set(["-moz-initial", "fill", "none", "scale-down"]);
+
+/**
+ * The placeholder style Next.js' getImgProps gives an image still loading:
+ * the blur SVG for `placeholder="blur"` (in development, a `/_next/image`
+ * blur URL from a static import as-is), or a `data:image/` placeholder as-is,
+ * sized and positioned like the image's object-fit and object-position.
+ * Undefined once loaded, without a placeholder, or for an unsafe URL.
+ */
+export function getBlurPlaceholderStyle({
+  placeholder,
+  blurDataURL,
+  blurWidth,
+  blurHeight,
+  width,
+  height,
+  style,
+}: {
+  placeholder?: string;
+  blurDataURL?: string;
+  blurWidth?: number;
+  blurHeight?: number;
+  width?: number;
+  height?: number;
+  style?: React.CSSProperties;
+}): React.CSSProperties | undefined {
+  let backgroundImage: string | undefined;
+  if (placeholder === "blur") {
+    const devBlurURL =
+      __isDev && blurDataURL?.startsWith("/") && !blurDataURL.startsWith("//")
+        ? sanitizeCssUrl(blurDataURL)
+        : undefined;
+    const blur = devBlurURL ?? (blurDataURL ? sanitizeBlurDataURL(blurDataURL) : undefined);
+    if (!blur) return undefined;
+    backgroundImage = devBlurURL
+      ? `url("${devBlurURL}")`
+      : `url("data:image/svg+xml;charset=utf-8,${getImageBlurSvg({
+          widthInt: width,
+          heightInt: height,
+          blurWidth,
+          blurHeight,
+          blurDataURL: blur,
+          objectFit: style?.objectFit,
+        })}")`;
+  } else if (placeholder?.startsWith("data:image/")) {
+    const dataURL = sanitizeBlurDataURL(placeholder);
+    if (!dataURL) return undefined;
+    backgroundImage = `url("${dataURL}")`;
+  } else {
+    return undefined;
+  }
+  const objectFit = style?.objectFit;
+  return {
+    backgroundSize:
+      objectFit && !INVALID_BACKGROUND_SIZE_VALUES.has(objectFit)
+        ? objectFit
+        : objectFit === "fill"
+          ? "100% 100%"
+          : "cover",
+    backgroundPosition: (style?.objectPosition as string | undefined) || "50% 50%",
+    backgroundRepeat: "no-repeat",
+    backgroundImage,
+  };
 }
 
 /**
@@ -379,6 +499,8 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     width: imgWidth,
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
+    blurWidth,
+    blurHeight,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL: blurDataURLProp });
   const shouldPreload = _preload === true || priority === true;
 
@@ -386,16 +508,15 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     // As in the component path, unoptimized images never reach the server-side
     // optimizer, so remote URL validation is intentionally unnecessary.
     const renderedSrc = overrideSrc || src;
-    const sanitizedBlurURL = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-    const blurStyle =
-      placeholder === "blur" && sanitizedBlurURL
-        ? {
-            backgroundImage: `url(${sanitizedBlurURL})`,
-            backgroundSize: "cover",
-            backgroundRepeat: "no-repeat" as const,
-            backgroundPosition: "center" as const,
-          }
-        : undefined;
+    const blurStyle = getBlurPlaceholderStyle({
+      placeholder,
+      blurDataURL: imgBlurDataURL,
+      blurWidth,
+      blurHeight,
+      width: imgWidth,
+      height: imgHeight,
+      style,
+    });
     const imageProps: ImgProps = {
       src: renderedSrc,
       alt,
@@ -455,16 +576,15 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
   const srcSet = optimizedAttributes?.srcSet;
 
   // Blur placeholder styles — sanitize to prevent CSS injection
-  const sanitizedBlurURL = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-  const blurStyle =
-    placeholder === "blur" && sanitizedBlurURL
-      ? {
-          backgroundImage: `url(${sanitizedBlurURL})`,
-          backgroundSize: "cover",
-          backgroundRepeat: "no-repeat" as const,
-          backgroundPosition: "center" as const,
-        }
-      : undefined;
+  const blurStyle = getBlurPlaceholderStyle({
+    placeholder,
+    blurDataURL: imgBlurDataURL,
+    blurWidth,
+    blurHeight,
+    width: imgWidth,
+    height: imgHeight,
+    style,
+  });
 
   const imageProps: ImgProps = {
     src: optimizedSrc,

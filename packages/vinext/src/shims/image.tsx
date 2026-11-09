@@ -37,7 +37,7 @@ import {
   isSvgUrl,
   parseImageQuality,
   resolveImageSource,
-  sanitizeBlurDataURL,
+  getBlurPlaceholderStyle,
   validateRemoteUrl,
 } from "./image-props.js";
 import { useMergedRef } from "./use-merged-ref.js";
@@ -183,6 +183,8 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
     width: imgWidth,
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
+    blurWidth,
+    blurHeight,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL });
   const shouldPreload = preload === true || priority === true;
   const priorityFetchPriority = priority ? "high" : undefined;
@@ -190,9 +192,22 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
 
   const [completedBlurSrc, setCompletedBlurSrc] = useState<string | undefined>(undefined);
   const blurComplete = completedBlurSrc === src;
+  const placeholderStyle = blurComplete
+    ? undefined
+    : getBlurPlaceholderStyle({
+        placeholder,
+        blurDataURL: imgBlurDataURL,
+        blurWidth,
+        blurHeight,
+        width: imgWidth,
+        height: imgHeight,
+        style,
+      });
 
+  // Like Next.js, any placeholder but "empty" is removed once the image loads.
+  const hasPlaceholder = placeholder !== undefined && placeholder !== "empty";
   const markBlurComplete = () => {
-    if (placeholder !== "blur") return;
+    if (!hasPlaceholder) return;
     setCompletedBlurSrc((current) => (current === src ? current : src));
   };
 
@@ -250,7 +265,7 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
           markBlurComplete();
           onLoad(e);
         }
-      : placeholder === "blur"
+      : hasPlaceholder
         ? () => {
             if (lastLoadedSrcRef.current === src) return;
             lastLoadedSrcRef.current = src;
@@ -265,7 +280,7 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
         markBlurComplete();
         onError(e);
       }
-    : placeholder === "blur"
+    : hasPlaceholder
       ? () => {
           if (lastErrorSrcRef.current === src) return;
           lastErrorSrcRef.current = src;
@@ -278,16 +293,7 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
     // skip remote URL validation: there is no server-side optimizer fetch and
     // therefore no SSRF surface. This matches Next.js behavior.
     const renderedSrc = overrideSrc || src;
-    const sanitizedBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-    const blurStyle =
-      !blurComplete && placeholder === "blur" && sanitizedBlur
-        ? {
-            backgroundImage: `url(${sanitizedBlur})`,
-            backgroundSize: "cover",
-            backgroundRepeat: "no-repeat",
-            backgroundPosition: "center",
-          }
-        : undefined;
+    const blurStyle = placeholderStyle;
     preloadImageResource({
       shouldPreload,
       src: renderedSrc,
@@ -358,17 +364,8 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
       }
     }
 
-    const sanitizedBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-    const showBlur = !blurComplete && placeholder === "blur" && sanitizedBlur;
-    const blurStyle = showBlur
-      ? {
-          backgroundImage: `url(${sanitizedBlur})`,
-          backgroundSize: "cover",
-          backgroundRepeat: "no-repeat",
-          backgroundPosition: "center",
-        }
-      : undefined;
-    const bg = showBlur ? `url(${sanitizedBlur})` : undefined;
+    const blurStyle = placeholderStyle;
+    const bg = placeholderStyle?.backgroundImage;
 
     if (fill) {
       const imageSizes = sizes ?? "100vw";
@@ -470,16 +467,7 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
 
   // Blur placeholder: show a low-quality background while the image loads.
   // Sanitize blurDataURL to prevent CSS injection via crafted data URLs.
-  const sanitizedLocalBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-  const blurStyle =
-    !blurComplete && placeholder === "blur" && sanitizedLocalBlur
-      ? {
-          backgroundImage: `url(${sanitizedLocalBlur})`,
-          backgroundSize: "cover",
-          backgroundRepeat: "no-repeat",
-          backgroundPosition: "center",
-        }
-      : undefined;
+  const blurStyle = placeholderStyle;
 
   const imageSizes = sizes ?? (fill ? "100vw" : undefined);
   preloadImageResource({
