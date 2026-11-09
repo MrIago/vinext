@@ -1,5 +1,14 @@
 import React from "react";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vite-plus/test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vite-plus/test";
 import { AppElementsWire } from "../packages/vinext/src/server/app-elements.js";
 import { dispatchAppPage } from "../packages/vinext/src/server/app-page-dispatch.js";
 import {
@@ -24,6 +33,9 @@ import {
   APP_RSC_RENDER_MODE_NAVIGATION,
   APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
   APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+  APP_RSC_RENDER_MODE_PREFETCH_APP_SHELL,
+  APP_RSC_RENDER_MODE_PREFETCH_PARTIAL,
+  APP_RSC_RENDER_MODE_PREFETCH_PARTIAL_NAVIGATION,
   APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
 } from "../packages/vinext/src/server/app-rsc-render-mode.js";
 import { createPprFallbackShellSuspensePromise } from "../packages/vinext/src/shims/ppr-fallback-shell.js";
@@ -99,7 +111,7 @@ import {
 } from "../packages/vinext/src/shims/navigation.js";
 import { notFound } from "../packages/vinext/src/shims/navigation-errors.js";
 import { SIBLING_PAGE_INTERCEPT_SLOT_KEY } from "../packages/vinext/src/server/app-rsc-route-matching.js";
-import { cacheLife, io } from "../packages/vinext/src/shims/cache.js";
+import { cacheLife, io, navigation, prefetch } from "../packages/vinext/src/shims/cache.js";
 import {
   setCurrentFetchCacheMode,
   setCurrentFetchRevalidate,
@@ -1836,6 +1848,97 @@ describe("app page dispatch", () => {
         });
       },
     );
+
+    // Next.js's Partial Prefetching (vercel/next.js#94448, #94510): a link's
+    // automatic prefetch gets the App Shell, `prefetch={true}` the page's
+    // cached content rendered for the request, and `prefetch="navigation"`
+    // what follows `navigation()` too.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/cache-stages.ts
+    describe("Partial Prefetching", () => {
+      beforeEach(() => {
+        vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
+      });
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      const stagedPage = (seen: string[]) => async () => {
+        void prefetch().then(() => seen.push("prefetch"));
+        void navigation().then(() => seen.push("navigation"));
+        return React.createElement("main", null, "page");
+      };
+
+      it("stores and serves an App Shell without what follows prefetch() and navigation()", async () => {
+        const seen: string[] = [];
+        const { options, isrSetFallbackShell } = createStaticShellOptions({
+          buildPageElement: stagedPage(seen),
+          renderMode: APP_RSC_RENDER_MODE_PREFETCH_APP_SHELL,
+        });
+
+        const response = await runWithRequestContext(createRequestContext(), () =>
+          dispatchAppPage(options),
+        );
+        expect(response.headers.get("x-vinext-static-shell")).toBe("partial");
+        expect(seen).toEqual([]);
+        expect(isrSetFallbackShell).toHaveBeenCalledTimes(1);
+        expect(isrSetFallbackShell.mock.calls[0]?.[0]).toContain("app-app-shell");
+      });
+
+      it("keeps both in the static shell", async () => {
+        const seen: string[] = [];
+        const { options, isrSetFallbackShell } = createStaticShellOptions({
+          buildPageElement: stagedPage(seen),
+        });
+
+        const response = await runWithRequestContext(createRequestContext(), () =>
+          dispatchAppPage(options),
+        );
+        expect(response.headers.get("x-vinext-static-shell")).toBe("complete");
+        expect(seen.sort()).toEqual(["navigation", "prefetch"]);
+        expect(isrSetFallbackShell.mock.calls[0]?.[0]).toContain("app-static-shell");
+      });
+
+      it("renders a prefetch for the request, without what follows navigation()", async () => {
+        const seen: string[] = [];
+        const request = new Request("https://example.test/posts", {
+          headers: { cookie: "theme=dark" },
+        });
+        const { options, isrSetFallbackShell } = createStaticShellOptions({
+          async buildPageElement() {
+            seen.push(`theme ${(await cookies()).get("theme")?.value}`);
+            return stagedPage(seen)();
+          },
+          renderMode: APP_RSC_RENDER_MODE_PREFETCH_PARTIAL,
+          request,
+        });
+        const requestContext = createRequestContext({
+          headersContext: headersContextFromRequest(request),
+        });
+
+        const response = await runWithRequestContext(requestContext, () =>
+          dispatchAppPage(options),
+        );
+        expect(response.headers.get("x-vinext-static-shell")).toBe("partial");
+        expect(seen).toEqual(["theme dark", "prefetch"]);
+        // It holds the request's data, so it's never stored.
+        expect(isrSetFallbackShell).not.toHaveBeenCalled();
+      });
+
+      it("renders a navigation-stage prefetch through navigation()", async () => {
+        const seen: string[] = [];
+        const { options, isrSetFallbackShell } = createStaticShellOptions({
+          buildPageElement: stagedPage(seen),
+          renderMode: APP_RSC_RENDER_MODE_PREFETCH_PARTIAL_NAVIGATION,
+        });
+
+        const response = await runWithRequestContext(createRequestContext(), () =>
+          dispatchAppPage(options),
+        );
+        expect(response.headers.get("x-vinext-static-shell")).toBe("complete");
+        expect(seen.sort()).toEqual(["navigation", "prefetch"]);
+        expect(isrSetFallbackShell).not.toHaveBeenCalled();
+      });
+    });
   });
 
   it("seeds a PPR fallback shell's final render with what its warmup collected", async () => {

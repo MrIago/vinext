@@ -11,7 +11,10 @@ import {
 } from "vinext/shims/cache-request-state";
 import { createResumeDataCache } from "vinext/shims/resume-data-cache";
 import type { RootParams } from "vinext/shims/root-params";
-import type { PprFallbackShellState } from "vinext/shims/ppr-fallback-shell";
+import type {
+  PprFallbackShellPrefetchStage,
+  PprFallbackShellState,
+} from "vinext/shims/ppr-fallback-shell";
 import {
   consumeDynamicUsage,
   consumeInvalidDynamicUsageError,
@@ -100,8 +103,8 @@ import {
 import {
   APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
   APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
-  APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
   APP_RSC_RENDER_MODE_NAVIGATION,
+  getStaticShellPrefetchStage,
   VINEXT_VARY_PARAMS_HEADER,
   type AppRscRenderMode,
 } from "./app-rsc-render-mode.js";
@@ -480,6 +483,7 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   pprFallbackShell?: {
     fallbackParamNames: readonly string[];
     isRuntimePrefetch?: boolean;
+    prefetchStage?: PprFallbackShellPrefetchStage;
     routePattern: string;
     varyParams?: Set<string>;
   };
@@ -815,7 +819,9 @@ function withRenderMode<TRoute extends AppPageDispatchRoute>(
 export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
 ): Promise<Response> {
-  if (options.renderMode === APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL) {
+  const prefetchStage =
+    options.renderMode === undefined ? undefined : getStaticShellPrefetchStage(options.renderMode);
+  if (prefetchStage !== undefined) {
     const {
       markRuntimePrefetchResponse,
       prefetchesAtRuntime,
@@ -823,8 +829,19 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
       serveAppPageStaticShellPrefetch,
     } = await import("./app-page-static-shell-prefetch.js");
     const isDraftMode = isDraftModeRequest(options.request, options.draftModeSecret);
-    if (prefetchesAtRuntime(options.route)) {
-      const runtimePrefetchResponse = await serveAppPageRuntimePrefetch(options, isDraftMode);
+    // Like Next.js with Partial Prefetching, a prefetch past the shell stage
+    // renders for the request: it holds the page's cached content, private
+    // caches included, and leaves its dynamic data out.
+    if (
+      prefetchStage === "prefetch" ||
+      prefetchStage === "navigation" ||
+      prefetchesAtRuntime(options.route)
+    ) {
+      const runtimePrefetchResponse = await serveAppPageRuntimePrefetch(
+        options,
+        isDraftMode,
+        prefetchStage ?? undefined,
+      );
       if (runtimePrefetchResponse) return runtimePrefetchResponse;
       // A prefetch that can't be prerendered, such as a draft mode one, gets
       // the page's navigation payload.
@@ -832,7 +849,11 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
         await dispatchAppPage(withRenderMode(options, APP_RSC_RENDER_MODE_NAVIGATION)),
       );
     }
-    const staticShellResponse = await serveAppPageStaticShellPrefetch(options, isDraftMode);
+    const staticShellResponse = await serveAppPageStaticShellPrefetch(
+      options,
+      isDraftMode,
+      prefetchStage === "shell" ? "shell" : undefined,
+    );
     if (staticShellResponse) return staticShellResponse;
     // A prefetch that can't have a static shell gets the route's loading
     // shell, without the static-shell header.
@@ -988,11 +1009,13 @@ export async function renderAppPageFallbackShell<TRoute extends AppPageDispatchR
  *
  * With `isRuntimePrefetch`, it's the page's runtime prefetch instead, as
  * Next.js's `prerender-runtime`: the request's cookies, headers and private
- * caches render too.
+ * caches render too. `prefetchStage` is how far it renders, as
+ * `PprFallbackShellState.prefetchStage`.
  */
 export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
   isRuntimePrefetch = false,
+  prefetchStage?: PprFallbackShellPrefetchStage,
 ): Promise<{ isPartial: boolean; response: Response }> {
   const pprRuntime = options.pprRuntime;
   if (!pprRuntime) throw new Error("[vinext] A static shell needs cacheComponents.");
@@ -1003,6 +1026,7 @@ export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRou
   const pprFallbackShell = {
     fallbackParamNames: [],
     ...(isRuntimePrefetch ? { isRuntimePrefetch: true } : {}),
+    ...(prefetchStage ? { prefetchStage } : {}),
     routePattern: route.pattern,
     varyParams,
   };

@@ -590,6 +590,15 @@ export function appIsrStaticShellRscKey(
   return buildCacheKey(prefix, pathname, "rsc");
 }
 
+/** A Partial Prefetching page's App Shell, stored beside its static shell. */
+export function appIsrAppShellRscKey(
+  pathname: string,
+  buildId = process.env.__VINEXT_BUILD_ID,
+): string {
+  const prefix = buildId ? `app-app-shell:v1:${buildId}` : "app-app-shell:v1";
+  return buildCacheKey(prefix, pathname, "rsc");
+}
+
 export function appIsrHtmlKey(pathname: string): string {
   return appIsrCacheKey(pathname, "html");
 }
