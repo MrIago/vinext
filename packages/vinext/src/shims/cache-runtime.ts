@@ -77,7 +77,10 @@ import {
   recordRouteCacheabilityProbeBailout,
 } from "./cacheability-classification.js";
 import { workUnitAsyncStorage } from "./internal/work-unit-async-storage.js";
-import { suppressHangingPromiseAbortRejections } from "./internal/make-hanging-promise.js";
+import {
+  makeHangingPromise,
+  suppressHangingPromiseAbortRejections,
+} from "./internal/make-hanging-promise.js";
 import type { VinextCacheFunctionInvocation } from "../server/multi-stage.js";
 import { shareIsolatePromise } from "../server/isolate-shared-promise.js";
 import { isInsideWorkStoreScope } from "./internal/work-store-scope.js";
@@ -643,6 +646,20 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
   const isDev = typeof process !== "undefined" && process.env.NODE_ENV === "development";
 
   const invoke = (args: TArgs, replay?: CacheFlightArguments): Promise<TResult> => {
+    // Like Next.js (vercel/next.js#96426), a cache read reached only after uncached IO
+    // outlived the prerender is not part of it. Reject instead of running the function
+    // and filling an entry the ended prerender can no longer use.
+    const outerWorkUnit = workUnitAsyncStorage.getStore();
+    if (
+      (outerWorkUnit?.type === "prerender" || outerWorkUnit?.type === "prerender-runtime") &&
+      outerWorkUnit.renderSignal.aborted
+    ) {
+      return makeHangingPromise<TResult>(
+        outerWorkUnit.renderSignal,
+        outerWorkUnit.route ?? "unknown",
+        '"use cache" called after prerender ended',
+      );
+    }
     if (cacheVariant === "private") {
       const parentCtx = cacheContextStorage.getStore();
       if (parentCtx && parentCtx.variant !== "private") {

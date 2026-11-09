@@ -7095,6 +7095,34 @@ describe("next/cache shim", () => {
     expect(r1).toBe(r2);
   });
 
+  // Ported from Next.js test/e2e/app-dir/use-cache-after-uncached-io:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache-after-uncached-io/use-cache-after-uncached-io.test.ts
+  // A cache read reached only after uncached IO outlived the prerender is not part of it:
+  // it must reject without running the function or filling the entry.
+  it("does not fill a use cache entry after the prerender has ended", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+    const handler = new MemoryCacheHandler();
+    const set = vi.spyOn(handler, "set");
+    setCacheHandler(handler);
+    let callCount = 0;
+    const cached = registerCachedFunction(async () => ++callCount, "test:after-prerender-abort");
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      workUnitAsyncStorage.run({ type: "prerender", renderSignal: controller.signal }, () =>
+        cached(),
+      ),
+    ).rejects.toThrow('"use cache" called after prerender ended');
+    expect(callCount).toBe(0);
+    expect(set).not.toHaveBeenCalled();
+  });
+
   // Ported from Next.js: packages/next/src/server/request/io.ts
   // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/io.ts
   it("io returns a hanging promise during prerender", async () => {
