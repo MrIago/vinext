@@ -3777,6 +3777,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           openTelemetryPackages,
         );
         resolvedServerExternalPackages = nextServerExternal;
+        const userServerExternalPackages = [...(nextConfig?.serverExternalPackages ?? [])];
         // React is externalized from the SSR build by default, like every
         // other server external, but `transpilePackages` opts a package back
         // into the bundle (#3485): a server compiled to a single file must not
@@ -4568,15 +4569,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     },
                   }),
               optimizeDeps: {
-                // `serverExternalPackages` are loaded by the runtime resolver,
-                // never pre-bundled: a dual CJS/ESM package such as `file-type`
-                // breaks Rolldown's pre-bundle interop (MISSING_EXPORT) while
-                // the runtime loads it fine (#3236). The client optimizer
-                // already excludes them.
+                // Packages the app lists in `serverExternalPackages` are
+                // loaded by the runtime resolver, never pre-bundled: a dual
+                // CJS/ESM package such as `file-type` breaks Rolldown's
+                // pre-bundle interop (MISSING_EXPORT) while the runtime loads
+                // it fine (#3236). Next.js's default external list stays
+                // optimized, so CommonJS defaults keep their conversion.
                 exclude: mergeOptimizeDepsExclude(
                   incomingExclude,
                   shimOptimizeDepsExclude,
-                  nextServerExternal,
+                  userServerExternalPackages,
                 ),
                 entries: optimizeEntries,
                 // plugin-rsc pre-includes server.edge and static.edge for the
@@ -4652,8 +4654,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 exclude: mergeOptimizeDepsExclude(
                   incomingExclude,
                   shimOptimizeDepsExclude,
-                  // As in the RSC environment: never pre-bundle server externals.
-                  nextServerExternal,
+                  // As in the RSC environment: never pre-bundle the app's
+                  // declared server externals.
+                  userServerExternalPackages,
                   ["ipaddr.js"],
                   userSsrExternal === true || externalizeSsrReactInDev
                     ? SSR_EXTERNAL_REACT_ENTRIES
