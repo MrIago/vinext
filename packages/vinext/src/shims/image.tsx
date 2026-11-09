@@ -34,6 +34,7 @@ import {
   getFillStyle,
   imageOptimizationUrl,
   isRemoteUrl,
+  isServerOptimizedRemoteUrl,
   isSvgUrl,
   parseImageQuality,
   resolveImageSource,
@@ -351,7 +352,7 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
   // For remote URLs, validate against remotePatterns. Non-fill images use
   // @unpic/react for CDN URL transforms; fill uses a plain img so the DOM
   // element keeps Next.js's absolute-positioned fill contract.
-  if (isRemoteUrl(src)) {
+  if (isRemoteUrl(src) && !isServerOptimizedRemoteUrl(src)) {
     const validation = validateRemoteUrl(src);
     if (!validation.allowed) {
       if (__isDev) {

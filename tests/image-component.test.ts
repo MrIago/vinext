@@ -1290,3 +1290,51 @@ describe("dangerouslyAllowLocalIP private-IP guard", () => {
     warnSpy.mockRestore();
   });
 });
+
+// Ported from Next.js: the default loader in packages/next/src/shared/lib/image-loader.ts
+// sends an absolute src through /_next/image, as checked by
+// test/e2e/next-image-new/default/default.test.ts ("should work with remote images").
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/image-loader.ts
+describe("remote images on the Node.js server", () => {
+  afterEach(() => {
+    delete process.env.__VINEXT_IMAGE_REMOTE_PATTERNS;
+    delete process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION;
+    vi.resetModules();
+  });
+
+  async function load(optimized: boolean) {
+    process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([
+      { protocol: "https", hostname: "images.example.com" },
+    ]);
+    process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION = String(optimized);
+    vi.resetModules();
+    return import("../packages/vinext/src/shims/image.js");
+  }
+
+  it("routes an allowed remote src through /_next/image with a srcSet", async () => {
+    const { default: RemoteImage, getImageProps: getRemoteImageProps } = await load(true);
+    const src = "https://images.example.com/photo.jpg";
+    const encoded = encodeURIComponent(src);
+    const html = ReactDOMServer.renderToString(
+      React.createElement(RemoteImage, { alt: "remote", src, width: 300, height: 200 }),
+    );
+    expect(html).toContain(`src="/_next/image?url=${encoded}&amp;w=640&amp;q=75"`);
+    expect(html).toContain(`/_next/image?url=${encoded}&amp;w=384&amp;q=75 1x`);
+    const { props } = getRemoteImageProps({ alt: "remote", src, width: 300, height: 200 });
+    expect(props.src).toBe(`/_next/image?url=${encoded}&w=640&q=75`);
+    expect(props.srcSet).toContain(`/_next/image?url=${encoded}&w=384&q=75 1x`);
+  });
+
+  it("keeps an unmatched remote src, and every remote src on Workers, as-is", async () => {
+    const node = await load(true);
+    const other = "https://elsewhere.example.com/photo.jpg";
+    expect(
+      node.getImageProps({ alt: "remote", src: other, width: 300, height: 200 }).props.src,
+    ).toBe(other);
+    const workers = await load(false);
+    const allowed = "https://images.example.com/photo.jpg";
+    expect(
+      workers.getImageProps({ alt: "remote", src: allowed, width: 300, height: 200 }).props.src,
+    ).toBe(allowed);
+  });
+});

@@ -160,6 +160,28 @@ function sanitizeCssUrl(url: string): string | undefined {
   return url;
 }
 
+/** Whether the server optimizes remote sources (the Node.js server; not Workers). */
+const __remoteImagesOptimized = process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION === "true";
+
+/**
+ * Whether `/_next/image` optimizes this remote src: the build serves from the
+ * Node.js server, which fetches remote sources safely, and images.remotePatterns
+ * (or images.domains) allows it. Next.js' default loader sends such a src
+ * through the endpoint; elsewhere vinext keeps rendering it as-is.
+ */
+export function isServerOptimizedRemoteUrl(src: string): boolean {
+  if (!__remoteImagesOptimized || !/^https?:\/\//i.test(src)) return false;
+  try {
+    const url = new URL(src);
+    return (
+      hasRemoteMatch(__imageDomains, __imageRemotePatterns, url) &&
+      (__dangerouslyAllowLocalIP || !isPrivateIp(url.hostname))
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Determine if a src is a remote URL (CDN-optimizable) or local.
  */
@@ -561,7 +583,10 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
   // SVG sources auto-skip unless dangerouslyAllowSVG is enabled.
   const isSvg = isSvgUrl(resolvedSrc);
   const skipOpt =
-    (isSvg && !__dangerouslyAllowSVG) || blockedInProd || !!loader || isRemoteUrl(resolvedSrc);
+    (isSvg && !__dangerouslyAllowSVG) ||
+    blockedInProd ||
+    !!loader ||
+    (isRemoteUrl(resolvedSrc) && !isServerOptimizedRemoteUrl(resolvedSrc));
   const optimizedAttributes =
     imgWidth && !fill && !skipOpt
       ? generateImageAttributes(resolvedSrc, imgWidth, imgQuality, sizes)

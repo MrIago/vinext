@@ -3592,6 +3592,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             typeof p.name === "string" &&
             (p.name === "nitro" || p.name.startsWith("nitro:")),
         );
+        // Only the Node.js server fetches remote image sources (with DNS
+        // pinning); Workers and Nitro keep rendering them as-is.
+        defines["process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION"] = JSON.stringify(
+          String(!hasCloudflarePlugin && !hasNitroPlugin),
+        );
 
         // Resolve PostCSS string plugin names that Vite can't handle.
         // Next.js projects commonly use array-form plugins like
