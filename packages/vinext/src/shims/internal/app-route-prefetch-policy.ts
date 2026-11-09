@@ -287,7 +287,7 @@ export function resolvePartialAppRoutePrefetch(
   ) {
     return null;
   }
-  if (!isPartialPrefetchingAppRoute(href)) return null;
+  if (readAppRoutePartialPrefetching(href) !== true) return null;
   return {
     cacheForNavigation: false,
     dynamicStaleTime: "ignore",
@@ -299,16 +299,38 @@ export function resolvePartialAppRoutePrefetch(
   };
 }
 
-/** Whether the href's route opts into Partial Prefetching. */
-export function isPartialPrefetchingAppRoute(href: string): boolean {
-  if (typeof window === "undefined") return false;
+/**
+ * Whether the href's App route opts into Partial Prefetching, or null when
+ * the manifest has no route for it.
+ */
+export function readAppRoutePartialPrefetching(href: string): boolean | null {
+  if (typeof window === "undefined") return null;
   const routes = window.__VINEXT_LINK_PREFETCH_ROUTES__;
-  if (!routes) return false;
+  if (!routes) return null;
   const routeHref = toSameOriginRouteHref(href);
-  if (routeHref === null) return false;
-  return (
-    matchRouteWithTrie(routeHref, routes, linkPrefetchRouteTrieCache)?.route.partialPrefetching ===
-    true
+  if (routeHref === null) return null;
+  const match = matchRouteWithTrie(routeHref, routes, linkPrefetchRouteTrieCache);
+  if (!match || match.route.documentOnly === true) return null;
+  return match.route.partialPrefetching === true;
+}
+
+/**
+ * The dev error for a navigation from a `<Link>` that asks for more than the
+ * shell to a route without Partial Prefetching, whose prefetch includes the
+ * route's dynamic data.
+ *
+ * Ported from Next.js: packages/next/src/shared/lib/instant-messages.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/instant-messages.ts
+ */
+export function createLinkPrefetchPartialError(pathname: string): Error {
+  return new Error(
+    `Next.js encountered dynamic data during prefetching for "${pathname}".\n\n` +
+      `This will lead to slower, more expensive prefetches.\n\n` +
+      `Ways to fix this:\n` +
+      `  - [upgrade] Opt into Partial Prefetching by exporting \`const prefetch = 'partial'\` from the page or layout, or by setting \`partialPrefetching: true\` in next.config to opt the whole app in\n` +
+      `  - [disable] Remove \`prefetch={true}\` or \`prefetch="navigation"\` from the <Link> to use the default prefetch\n` +
+      `  - [ignore] Set \`export const instant = false\` to opt the route out of instant-navigation validation\n\n` +
+      `Learn more: https://nextjs.org/docs/messages/instant-link-prefetch-partial`,
   );
 }
 

@@ -63,6 +63,8 @@ import {
   hasAppRouteInstantConfig,
   resolveAutoAppRoutePrefetch,
   resolveFullAppRoutePrefetch,
+  createLinkPrefetchPartialError,
+  readAppRoutePartialPrefetching,
   resolvePartialAppRoutePrefetch,
 } from "./internal/app-route-prefetch-policy.js";
 import { RouterContext } from "./internal/router-context.js";
@@ -1761,6 +1763,22 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     // hash-only changes, RSC fetch, and two-phase URL commit.
     if (hasAppNavigationRuntime) {
       const { navigateClientSide } = loadedNavigationModule ?? (await loadNavigationModule());
+      // Like Next.js in development with Cache Components, warn when a link
+      // that asks for more than the shell navigates to a route without
+      // Partial Prefetching: its prefetch is a legacy full one, with the
+      // route's dynamic data. It fires at navigation rather than prefetch
+      // time, so a page full of such links isn't one warning per link, and
+      // dev doesn't prefetch anyway (vercel/next.js#94672).
+      if (
+        process.env.NODE_ENV !== "production" &&
+        String(process.env.__NEXT_CACHE_COMPONENTS) === "true" &&
+        (prefetchMode === "full" || prefetchMode === "navigation") &&
+        readAppRoutePartialPrefetching(navigateHref) === false
+      ) {
+        console.error(
+          createLinkPrefetchPartialError(new URL(navigateHref, window.location.href).pathname),
+        );
+      }
       const setter = setPendingRef.current;
       // Register this link as the one driving the current navigation. This
       // resets any previously-pending link (e.g. a different link clicked
