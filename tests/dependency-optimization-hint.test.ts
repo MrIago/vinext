@@ -17,9 +17,19 @@ describe("describeDependencyOptimizationFailure", () => {
 
   it("keeps scoped package names whole", () => {
     const hint = describeDependencyOptimizationFailure(
-      "Error during dependency optimization: node_modules/@scope/pkg/index.js",
+      "Error during dependency optimization:\n[MISSING_EXPORT] x in node_modules/@scope/pkg/index.js",
     );
     expect(hint).toContain('"@scope/pkg"');
+  });
+
+  it("blames the failing file's package, not the import chain", () => {
+    const hint = describeDependencyOptimizationFailure(
+      "Error during dependency optimization:\n" +
+        "[UNRESOLVED_IMPORT] Could not resolve '../..' in node_modules/superagent/lib/node/agent.js\n" +
+        "  Help: imported by node_modules/wpapi/lib/http-transport.js",
+    );
+    expect(hint).toContain('"superagent"');
+    expect(hint).not.toContain('"wpapi"');
   });
 
   it("ignores other errors", () => {

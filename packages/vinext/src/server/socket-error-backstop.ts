@@ -239,9 +239,14 @@ export function isSocketErrorBackstopInstalled(): boolean {
 export function describeDependencyOptimizationFailure(err: unknown): string | null {
   const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
   if (!message.includes("Error during dependency optimization")) return null;
+  // Each Rolldown error line names the file that failed (`[CODE] ... in
+  // node_modules/<pkg>/...`); the "imported by" chain that follows lists
+  // innocent packages too, so only the failing files' packages count.
   const packages = new Set<string>();
-  for (const match of message.matchAll(/node_modules\/((?:@[^/\s]+\/)?[^/\s]+)\//g)) {
-    packages.add(match[1]!);
+  for (const line of message.split("\n")) {
+    if (!/^\s*\[[A-Z_]+\]/.test(line)) continue;
+    const match = line.match(/node_modules\/((?:@[^/\s]+\/)?[^/\s]+)\//);
+    if (match) packages.add(match[1]!);
   }
   if (packages.size === 0) return null;
   const names = [...packages].map((name) => `"${name}"`).join(", ");
