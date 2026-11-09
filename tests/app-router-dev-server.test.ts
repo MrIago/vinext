@@ -2433,9 +2433,9 @@ describe("App Router integration", () => {
       },
       body: "[]",
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await res.text()).toBe("Server action not found.");
+    expect(await res.text()).toBe("Server Action unavailable.");
   });
 
   it("allows server action POST without Origin header (non-fetch navigation)", async () => {
@@ -2448,7 +2448,7 @@ describe("App Router integration", () => {
       },
       body: "[]",
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
   });
 
@@ -2510,7 +2510,7 @@ describe("App Router integration", () => {
         headers: { "Content-Type": "text/plain;charset=UTF-8", "Next-Action": actionId },
         body: JSON.stringify(["victim"]),
       });
-      expect(fetchAction.status).toBe(404);
+      expect(fetchAction.status).toBe(409);
       expect(fetchAction.headers.get("x-nextjs-action-not-found")).toBe("1");
       expect(await fetchAction.text()).not.toContain(secret);
 
@@ -2519,7 +2519,7 @@ describe("App Router integration", () => {
         headers: { "Content-Type": "text/plain", "x-rsc-action": actionId },
         body: JSON.stringify(["victim"]),
       });
-      expect(rscAction.status).toBe(404);
+      expect(rscAction.status).toBe(409);
       expect(rscAction.headers.get("x-nextjs-action-not-found")).toBe("1");
       expect(await rscAction.text()).not.toContain(secret);
 
@@ -2537,7 +2537,7 @@ describe("App Router integration", () => {
       if (actionId.endsWith("#$$hoist_0_readInlineRecord")) {
         expect(formAction.status).toBe(500);
       } else {
-        expect(formAction.status).toBe(404);
+        expect(formAction.status).toBe(409);
         expect(formAction.headers.get("x-nextjs-action-not-found")).toBe("1");
       }
       expect(await formAction.text()).not.toContain(secret);
@@ -2560,9 +2560,9 @@ describe("App Router integration", () => {
       headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
       body,
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await res.text()).toBe("Server action not found.");
+    expect(await res.text()).toBe("Server Action unavailable.");
   });
 
   // Next.js only runs Server Action handling for App pages, so a Route
@@ -2634,9 +2634,9 @@ describe("App Router integration", () => {
       signal: AbortSignal.timeout(5_000),
     });
 
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await res.text()).toBe("Server action not found.");
+    expect(await res.text()).toBe("Server Action unavailable.");
   });
 
   it("blocks server action POST with Origin 'null' (CSRF via sandboxed context)", async () => {

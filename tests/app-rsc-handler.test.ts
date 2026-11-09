@@ -9168,7 +9168,7 @@ describe("createAppRscHandler", () => {
 
       const response = await handler(actionPost("/about-alias"), null);
 
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(409);
       expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
     });
 
@@ -12592,9 +12592,9 @@ describe("createAppRscHandler", () => {
       null,
     );
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(409);
     expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await response.text()).toBe("Server action not found.");
+    expect(await response.text()).toBe("Server Action unavailable.");
     expect(clearRequestContext).toHaveBeenCalledTimes(1);
   });
 

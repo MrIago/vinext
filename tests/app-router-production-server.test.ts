@@ -3899,7 +3899,7 @@ describe("App Router Production server (startProdServer)", () => {
       expect(actionRes.status).toBe(200);
       expect(actionRes.headers.get("x-nextjs-action-not-found")).toBeNull();
       const text = await actionRes.text();
-      expect(text).not.toContain("Server action not found");
+      expect(text).not.toContain("Server Action unavailable");
       return text;
     };
 
@@ -3976,7 +3976,7 @@ describe("App Router Production server (startProdServer)", () => {
     });
     const payload = await response.text();
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(409);
     expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(payload).not.toContain("VICTIM_PRIVATE_RECORD");
   });
@@ -4054,7 +4054,7 @@ describe("App Router Production server (startProdServer)", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("x-nextjs-action-not-found")).toBeNull();
-    expect(text).not.toContain("Server action not found");
+    expect(text).not.toContain("Server Action unavailable");
     expect(text).toContain("echo:world");
   });
 
