@@ -144,3 +144,22 @@ export function combineStrictRouteMatchingErrors(errors: readonly Error[]): Erro
   if (errors.length === 1) return errors[0]!;
   return new Error(errors.map((error) => error.message).join("\n\n"));
 }
+
+/**
+ * Route pathnames (Next.js format, such as `/blog/[...slug]`) whose every page
+ * matcher strict route matching prunes: catch-all-derived matchers, and
+ * static ones, that could only ever render a permanent not-found tree because
+ * a sibling slot has neither a matching page nor a `default`. Next.js removes
+ * them from its matcher set (normalize-catchall-routes.ts), so a request for
+ * such a URL falls through to the next matcher or the not-found page.
+ */
+export function findPrunedRoutePathnames(appDir: string, matcher: ValidFileMatcher): Set<string> {
+  const { appPagePaths, defaultAppPaths } = collectAppStructure(appDir, matcher);
+  const before = new Set(Object.keys(appPagePaths));
+  normalizeCatchAllRoutes(appPagePaths, { strictRouteMatching: true, defaultAppPaths });
+  const pruned = new Set<string>();
+  for (const route of before) {
+    if (!(route in appPagePaths)) pruned.add(route);
+  }
+  return pruned;
+}

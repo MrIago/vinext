@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createValidFileMatcher } from "../packages/vinext/src/routing/file-matcher.js";
 import {
   collectAppStructure,
+  findPrunedRoutePathnames,
   findStrictRouteMatchingErrors,
 } from "../packages/vinext/src/routing/strict-route-matching-check.js";
 
@@ -85,5 +86,20 @@ describe("strict route matching check", () => {
     const errors = findStrictRouteMatchingErrors({ appDir, root, matcher });
     expect(errors.map((error) => error.name)).toContain("MissingCanonicalInterceptionRoutesError");
     expect(errors[0]?.message).toContain("(expected /photo/[id])");
+  });
+
+  it("prunes a matcher a sibling slot can't complete, keeping complete ones", () => {
+    const { appDir } = app({
+      "layout.tsx": component,
+      "page.tsx": component,
+      "@sidebar/page.tsx": component,
+      "@sidebar/settings/page.tsx": component,
+      "about/page.tsx": component,
+      "@sidebar/default.tsx": component,
+    });
+    const pruned = findPrunedRoutePathnames(appDir, matcher);
+    expect(pruned.has("/settings")).toBe(true);
+    expect(pruned.has("/about")).toBe(false);
+    expect(pruned.has("/")).toBe(false);
   });
 });

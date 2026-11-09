@@ -438,6 +438,7 @@ import commonjs from "vite-plugin-commonjs";
 import { createIgnoreDynamicRequestsPlugin } from "./plugins/ignore-dynamic-requests.js";
 import { createTransformCache } from "./plugins/transform-cache.js";
 import { omitUnusedBuildSourcemap } from "./plugins/transform-result.js";
+import { setStrictRouteMatching } from "./routing/app-route-graph.js";
 import {
   combineStrictRouteMatchingErrors,
   findStrictRouteMatchingErrors,
@@ -3240,6 +3241,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               : randomBytes(16).toString("hex");
         }
         fileMatcher = createValidFileMatcher(nextConfig.pageExtensions);
+        // The route graph prunes strict-matching matchers (#3365). Its cache
+        // was invalidated at the start of this config lifecycle above.
+        setStrictRouteMatching(nextConfig.strictRouteMatching);
         globalNotFoundCssIsolationPath =
           env?.command === "build" && nextConfig.globalNotFound
             ? findFileWithExts(appDir, "global-not-found", fileMatcher)
