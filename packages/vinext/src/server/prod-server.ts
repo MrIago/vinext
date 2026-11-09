@@ -34,6 +34,7 @@ import {
   staticFileCacheControl,
 } from "./static-file-cache.js";
 import { signalFromNodeResponse } from "./node-response-signal.js";
+import { optimizeNodeImage, resolveNodeImageOptimizer } from "./node-image-optimization.js";
 import {
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,
@@ -842,6 +843,51 @@ async function detectStaticImageContentType(
   } finally {
     await file.close();
   }
+}
+
+/**
+ * Answer an image request for a file in the static cache through the Node
+ * optimizer (the registered backend, else the application's `sharp`), as
+ * Next.js does. False when there is no optimizer, so the file is served as-is.
+ * A public file passes the Cache-Control a direct request gets, or null; a
+ * build asset passes undefined.
+ */
+async function serveNodeOptimizedImage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  imageRequest: Request,
+  cache: StaticFileCache,
+  sourcePath: string,
+  contentType: string,
+  publicFileCacheControl: string | null | undefined,
+  allowedWidths: number[],
+  imageConfig: ImageConfig | undefined,
+  optimizerRoots: readonly string[],
+): Promise<boolean> {
+  const lookupPath = staticCacheLookupPath(sourcePath);
+  const file = lookupPath === null ? undefined : cache.lookup(lookupPath)?.original;
+  if (!file) return false;
+  const optimizer = await resolveNodeImageOptimizer(optimizerRoots);
+  if (!optimizer) return false;
+  const response = await optimizeNodeImage(
+    imageRequest,
+    {
+      buffer: file.buffer,
+      path: file.path,
+      contentType,
+      isBuildAsset: publicFileCacheControl === undefined,
+      cacheControl: publicFileCacheControl ?? staticFileCacheControl(false),
+    },
+    optimizer,
+    allowedWidths,
+    imageConfig,
+  );
+  if (imageRequest.signal.aborted) {
+    cancelResponseBody(response, imageRequest.signal.reason);
+    return true;
+  }
+  await sendWebResponse(response, req, res, false);
+  return true;
 }
 
 /**
@@ -2085,6 +2131,8 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   // stat() calls — all lookups are pure in-memory Map.get(). Precompressed
   // .br/.gz/.zst variants (generated at build time) are detected automatically.
   const staticCache = await StaticFileCache.create(clientDir);
+  // Like `next`, which lists `sharp` as an optional dependency, the app owns it.
+  const imageOptimizerRoots = [serverDir, process.cwd()];
 
   // Image optimization passthrough (Node.js prod server has no Images binding;
   // serves the original file with cache headers and security headers). Runs
@@ -2124,6 +2172,13 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       sendBadRequest("Bad Request");
       return;
     }
+    // The endpoint request middleware and rewrites produced, for the optimizer.
+    const imageRequestUrl = new URL(request.url);
+    imageRequestUrl.search = signal.search;
+    const imageRequest = new Request(imageRequestUrl, {
+      headers: signal.requestHeaders ?? request.headers,
+      signal: request.signal,
+    });
     // Block SVG and other unsafe content types by checking the file extension
     // of the file actually served, not the `url` text, whose query or hash
     // could carry an image extension. SVG is only allowed when
@@ -2156,6 +2211,22 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       }
       if (!isSafeImageContentType(contentType, imageConfig?.dangerouslyAllowSVG)) {
         sendUnsafeContentType();
+        return true;
+      }
+      if (
+        await serveNodeOptimizedImage(
+          req,
+          res,
+          imageRequest,
+          staticCache,
+          sourcePath,
+          contentType,
+          publicFileCacheControl,
+          appImageAllowedWidths,
+          imageConfig,
+          imageOptimizerRoots,
+        )
+      ) {
         return true;
       }
       return tryServeStatic(
@@ -2649,6 +2720,8 @@ async function createPagesRouterRequestHandler(
 
   // Build the static file metadata cache at startup (same as App Router).
   const staticCache = await StaticFileCache.create(clientDir);
+  // Like `next`, which lists `sharp` as an optional dependency, the app owns it.
+  const imageOptimizerRoots = [serverDir, process.cwd()];
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stripNodeRequestUrlFragment(req);
@@ -3137,6 +3210,25 @@ async function createPagesRouterRequestHandler(
               }
               if (!isSafeImageContentType(contentType, pagesImageConfig?.dangerouslyAllowSVG)) {
                 sendUnsafeContentType();
+                return true;
+              }
+              if (
+                await serveNodeOptimizedImage(
+                  req,
+                  res,
+                  new Request(new URL(resolvedUrl, webRequest.url), {
+                    headers: filesystemRequest.headers,
+                    signal: webRequest.signal,
+                  }),
+                  staticCache,
+                  sourcePath,
+                  contentType,
+                  publicFileCacheControl,
+                  allowedImageWidths,
+                  pagesImageConfig,
+                  imageOptimizerRoots,
+                )
+              ) {
                 return true;
               }
               return tryServeStatic(
