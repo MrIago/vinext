@@ -675,10 +675,29 @@ describe("ppr fallback shell short-lived caches", () => {
     expect(settled).toBe("value");
     expect(hasDynamicBoundary).toBe(false);
   });
+
+  // Ported from Next.js's `cache-life-short-stale` fixture (vercel/next.js#94678):
+  // a long-lived cache about to go stale is left out of the static shell too,
+  // as it is from a runtime prefetch.
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache/use-cache.test.ts
+  it("leaves a long-lived cache about to go stale out of the final render", async () => {
+    setCacheHandler(new MemoryCacheHandler());
+    const cached = registerCachedFunction(async () => {
+      cacheLife({ stale: 18, revalidate: 100, expire: 1000 });
+      return "value";
+    }, "shell-short-stale-final");
+    const state = createPprFallbackShellState({ fallbackParamNames: [], routePattern: "/page" });
+    preparePprFallbackShellFinalRender(state);
+    const result = runWithPprFallbackShellState(state, () => cached());
+    const settled = await Promise.race([result, delay(20).then(() => "pending")]);
+    state.abortController.abort();
+    expect(settled).toBe("pending");
+    expect(state.hasDynamicBoundary).toBe(true);
+  });
 });
 
 // Like Next.js's runtime prerender (use-cache-wrapper.ts,
-// `RUNTIME_PREFETCH_DYNAMIC_STALE`), a runtime prefetch renders private and
+// `MIN_PREFETCHABLE_STALE`), a runtime prefetch renders private and
 // short-lived caches, and leaves out only those about to go stale.
 describe("ppr fallback shell runtime prefetch caches", () => {
   async function renderRuntimeCached(
