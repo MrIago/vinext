@@ -4,8 +4,12 @@ import type { NavigationContext } from "vinext/shims/navigation";
 import { runInWorkStoreScope } from "vinext/shims/internal/work-store-scope";
 import {
   _captureRequestScopedCacheLifeAccessors,
+  _getResumeDataCacheSeed,
   _isOnDemandRevalidate,
+  _setResumeDataCacheCollector,
+  _setResumeDataCacheSeed,
 } from "vinext/shims/cache-request-state";
+import { createResumeDataCache } from "vinext/shims/resume-data-cache";
 import type { RootParams } from "vinext/shims/root-params";
 import type { PprFallbackShellState } from "vinext/shims/ppr-fallback-shell";
 import {
@@ -14,6 +18,7 @@ import {
   getAndClearPendingCookies,
   getDraftModeCookieHeader,
   getHeadersContext,
+  type HeadersContext,
   isDraftModeRequest,
   peekDynamicUsage,
   peekRenderRequestApiUsage,
@@ -94,11 +99,18 @@ import {
 } from "./app-rsc-cache-busting.js";
 import {
   APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
+  APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+  APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
   APP_RSC_RENDER_MODE_NAVIGATION,
+  VINEXT_VARY_PARAMS_HEADER,
   type AppRscRenderMode,
 } from "./app-rsc-render-mode.js";
 import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
-import { createAppPageRscErrorTracker, type AppPageSsrHandler } from "./app-page-stream.js";
+import {
+  createAppPageRscErrorTracker,
+  type AppPagePprShellResume,
+  type AppPageSsrHandler,
+} from "./app-page-stream.js";
 import {
   NEXT_ROUTER_PREFETCH_HEADER,
   VINEXT_INTERCEPTION_ID_HEADER,
@@ -124,10 +136,14 @@ import {
 import {
   cacheabilityManifestPageState,
   type CacheabilityManifest,
+  type CacheabilityManifestRouteState,
   type CacheabilityRepresentation,
 } from "./cacheability-manifest.js";
 import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
 import { traceResponseStart } from "./response-start-tracing.js";
+import { encodePrerenderRouteParams } from "./prerender-route-params.js";
+import { runWithPrerenderWorkUnit } from "./prerender-work-unit-setup.js";
+import { normalizePregeneratedPathname } from "./pregenerated-concrete-paths.js";
 import { getFrameworkLinkHeader } from "./app-response-header-provenance.js";
 
 type AppPageParams = Record<string, string | string[]>;
@@ -313,13 +329,33 @@ export type AppPagePprRuntime<TRoute extends AppPageDispatchRoute> = {
   beginFinalRender(state: AppPagePprState): void;
   getState(): AppPagePprState | null;
   run<T>(shell: NonNullable<DispatchAppPageOptions<TRoute>["pprFallbackShell"]>, fn: () => T): T;
+  /** Run a shell's one render, which stops at its holes once its caches settle. */
+  runSinglePass<T>(
+    shell: NonNullable<DispatchAppPageOptions<TRoute>["pprFallbackShell"]>,
+    fn: () => T,
+  ): T;
   tryServe(
     options: DispatchAppPageOptions<TRoute>,
     currentRevalidateSeconds: number | null,
     isDraftMode: boolean,
     isForceStatic: boolean,
     isForceDynamic: boolean,
-  ): Promise<Response | null>;
+  ): Promise<Response | AppPagePprShellResume | null>;
+  /**
+   * After a page rendered dynamically, produce in the background the shell of
+   * its path that later requests resume.
+   */
+  produceConcreteShell(
+    options: DispatchAppPageOptions<TRoute>,
+    currentRevalidateSeconds: number | null,
+    isDraftMode: boolean,
+    isForceDynamic: boolean,
+  ): void;
+  /** Produce the missing shells of a generated path rendered for the cache. */
+  produceMissingShells(
+    options: DispatchAppPageOptions<TRoute>,
+    currentRevalidateSeconds: number | null,
+  ): Promise<void>;
   warm(options: WarmPprFallbackShellCachesOptions): Promise<void>;
 };
 
@@ -402,6 +438,11 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   hasPageDefaultExport: boolean;
   hasPageModule: boolean;
   handlerStart: number;
+  /**
+   * The pathname the page's cache entries key by: a rewrite's source rather
+   * than its destination. Defaults to `cleanPathname`.
+   */
+  cachePathname?: string;
   htmlLimitedBots?: string;
   interceptionContext: string | null;
   isEdgeRuntime?: boolean;
@@ -418,6 +459,10 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   isrDebug?: AppPageDebugLogger;
   isrGet: AppPageCacheGetter;
   isrFallbackShellHtmlKey: (pathname: string) => string;
+  /** Read a fallback shell from the data cache. Defaults to `isrGet`. */
+  isrGetFallbackShell?: AppPageCacheGetter;
+  /** Store a fallback shell a request rendered. Without it, shells are only read. */
+  isrSetFallbackShell?: AppPageCacheSetter;
   isrHtmlKey: (pathname: string) => string;
   isrRscKey: (
     pathname: string,
@@ -434,7 +479,9 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   pprFallbackCacheShells?: readonly AppPagePprFallbackCacheShell[] | null;
   pprFallbackShell?: {
     fallbackParamNames: readonly string[];
+    isRuntimePrefetch?: boolean;
     routePattern: string;
+    varyParams?: Set<string>;
   };
   pprRuntime?: AppPagePprRuntime<TRoute>;
   /**
@@ -500,6 +547,8 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   route: TRoute;
   runWithSuppressedHookWarning<T>(probe: () => Promise<T>): Promise<T>;
   scheduleBackgroundRegeneration: AppPageBackgroundRegenerator;
+  /** Regenerate a stale fallback shell. Defaults to `scheduleBackgroundRegeneration`. */
+  scheduleFallbackShellRegeneration?: AppPageBackgroundRegenerator;
   scriptNonce?: string;
   searchParams: URLSearchParams;
   setNavigationContext: (context: {
@@ -514,6 +563,43 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
    * render no client is waiting on, such as its regeneration or a warm-up.
    */
   renderWholeDocument?: boolean;
+  /**
+   * These options rebuilt for another request, such as a fallback shell's, or
+   * with some of this request's fields replaced, so every callback that closes
+   * over the request renders that one instead.
+   */
+  withRequest?: (request: Partial<AppPageDispatchRequest>) => DispatchAppPageOptions<TRoute>;
+};
+
+/** The request a page dispatch's options are built from. */
+export type AppPageDispatchRequest = {
+  actionError?: unknown;
+  actionFailed?: boolean;
+  bypassInterceptionContextCache: boolean;
+  cachePathname: string;
+  cleanPathname: string;
+  displayPathname: string;
+  formState: ReactFormState | null;
+  interceptionContext: string | null;
+  interceptionId: string | null;
+  interceptionPathname: string;
+  isProgressiveActionRender: boolean;
+  isRscRequest: boolean;
+  middlewareContext: AppPageMiddlewareContext;
+  mountedSlotsHeader: string | null;
+  params: AppPageParams;
+  pprFallbackCacheShells: readonly AppPagePprFallbackCacheShell[] | null;
+  pprFallbackShell?: NonNullable<DispatchAppPageOptions<AppPageDispatchRoute>["pprFallbackShell"]>;
+  renderedConcreteUrlPaths?: ReadonlySet<string>;
+  renderedPathAndSearch: string | null;
+  renderMode: AppRscRenderMode;
+  renderWholeDocument: boolean;
+  request: Request;
+  rootParams?: RootParams;
+  scriptNonce?: string;
+  searchParams: URLSearchParams;
+  skipStaticParamsValidation?: boolean;
+  staticParamsValidationParams?: AppPageParams;
 };
 
 export function shouldReadAppPageCache(options: {
@@ -553,12 +639,7 @@ export function hasSearchParams(searchParams: URLSearchParams | null | undefined
   return searchParams !== null && searchParams !== undefined && searchParams.size > 0;
 }
 
-async function runAppPageRevalidationContext<
-  TResult extends {
-    html: string;
-    tags: string[];
-  },
->(
+async function runAppPageRevalidationContext<TResult>(
   options: {
     cleanPathname: string;
     displayPathname?: string;
@@ -566,7 +647,11 @@ async function runAppPageRevalidationContext<
     currentFetchRevalidate?: number | null;
     draftModeSecret: string;
     dynamicConfig?: string;
+    /** The render's request data; a static generation has none. */
+    headersContext?: HeadersContext;
     params: AppPageParams;
+    /** Refresh stale fetches before rendering, as a prerender does. */
+    refreshStaleFetchesInForeground?: boolean;
     rootParams?: RootParams;
     routePattern: string;
     routeSegments: readonly string[];
@@ -575,13 +660,15 @@ async function runAppPageRevalidationContext<
   renderFn: () => Promise<TResult>,
 ): Promise<TResult> {
   const { createStaticGenerationHeadersContext } = await import("./app-static-generation.js");
-  const headersContext = createStaticGenerationHeadersContext({
-    draftModeEnabled: false,
-    draftModeSecret: options.draftModeSecret,
-    dynamicConfig: options.dynamicConfig,
-    routeKind: "page",
-    routePattern: options.routePattern,
-  });
+  const headersContext =
+    options.headersContext ??
+    createStaticGenerationHeadersContext({
+      draftModeEnabled: false,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      routeKind: "page",
+      routePattern: options.routePattern,
+    });
   const requestContext = createRequestContext({
     headersContext,
     currentFetchCacheMode: options.currentFetchCacheMode ?? null,
@@ -595,7 +682,9 @@ async function runAppPageRevalidationContext<
   const revalidation = runWithRequestContext(requestContext, () =>
     runInWorkStoreScope(async () => {
       ensureFetchPatch();
-      setRefreshStaleFetchesInForeground(process.env.VINEXT_PRERENDER === "1");
+      setRefreshStaleFetchesInForeground(
+        options.refreshStaleFetchesInForeground ?? process.env.VINEXT_PRERENDER === "1",
+      );
       setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], options.routeSegments));
       options.setNavigationContext({
         pathname: options.displayPathname ?? options.cleanPathname,
@@ -610,6 +699,31 @@ async function runAppPageRevalidationContext<
   } finally {
     await closeAfterResponse(requestContext);
   }
+}
+
+/**
+ * Run work a request needs that the build runs apart from any render, such as
+ * asking generateStaticParams which paths it produces, so the request's render
+ * state neither reaches it nor sees what it does.
+ */
+export function runAppPageStaticGenerationWork<TRoute extends AppPageDispatchRoute, TResult>(
+  options: DispatchAppPageOptions<TRoute>,
+  work: () => Promise<TResult>,
+): Promise<TResult> {
+  return runAppPageRevalidationContext(
+    {
+      cleanPathname: options.cleanPathname,
+      currentFetchCacheMode: options.fetchCache ?? null,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      params: options.params,
+      rootParams: options.rootParams,
+      routePattern: options.route.pattern,
+      routeSegments: options.route.routeSegments,
+      setNavigationContext: options.setNavigationContext,
+    },
+    work,
+  );
 }
 
 function toInterceptOptions(
@@ -655,25 +769,85 @@ function toInterceptOptions(
  * and every path keeps candidate mode, as on core.
  */
 function hasNoManifestAdmissionState(routePattern: string): boolean {
-  const admission = readRouteCacheabilityState()?.admission;
+  return readManifestAdmissionState(routePattern) === null;
+}
+
+/**
+ * Whether the Workers Cache request stage dropped the query from this
+ * dispatch, as it does for a path its deploy manifest gives the
+ * `static-candidate` state unless a next.config cache policy applies.
+ */
+export function isQueryFreeManifestDispatch(routePattern: string): boolean {
   return (
-    admission?.policy === "manifest" &&
-    admission.representation !== undefined &&
-    admission.routePathname !== undefined &&
-    cacheabilityManifestPageState(
-      admission.manifest as CacheabilityManifest,
-      { kind: "app-page", pattern: routePattern },
-      admission.representation as CacheabilityRepresentation,
-      admission.routePathname,
-    ) === null
+    readRouteCacheabilityState()?.dropsStaticCandidateQuery === true &&
+    readManifestAdmissionState(routePattern) === "static-candidate"
   );
+}
+
+/** The deploy manifest's state for the request's path, or `undefined` without one. */
+function readManifestAdmissionState(
+  routePattern: string,
+): CacheabilityManifestRouteState | null | undefined {
+  const admission = readRouteCacheabilityState()?.admission;
+  if (
+    admission?.policy !== "manifest" ||
+    admission.representation === undefined ||
+    admission.routePathname === undefined
+  ) {
+    return undefined;
+  }
+  return cacheabilityManifestPageState(
+    admission.manifest as CacheabilityManifest,
+    { kind: "app-page", pattern: routePattern },
+    admission.representation as CacheabilityRepresentation,
+    admission.routePathname,
+  );
+}
+
+/** The options rebuilt for another render mode, `buildPageElement` included. */
+function withRenderMode<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  renderMode: AppRscRenderMode,
+): DispatchAppPageOptions<TRoute> {
+  return options.withRequest?.({ renderMode }) ?? { ...options, renderMode };
 }
 
 export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
 ): Promise<Response> {
+  if (options.renderMode === APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL) {
+    const {
+      markRuntimePrefetchResponse,
+      prefetchesAtRuntime,
+      serveAppPageRuntimePrefetch,
+      serveAppPageStaticShellPrefetch,
+    } = await import("./app-page-static-shell-prefetch.js");
+    const isDraftMode = isDraftModeRequest(options.request, options.draftModeSecret);
+    if (prefetchesAtRuntime(options.route)) {
+      const runtimePrefetchResponse = await serveAppPageRuntimePrefetch(options, isDraftMode);
+      if (runtimePrefetchResponse) return runtimePrefetchResponse;
+      // A prefetch that can't be prerendered, such as a draft mode one, gets
+      // the page's navigation payload.
+      return markRuntimePrefetchResponse(
+        await dispatchAppPage(withRenderMode(options, APP_RSC_RENDER_MODE_NAVIGATION)),
+      );
+    }
+    const staticShellResponse = await serveAppPageStaticShellPrefetch(options, isDraftMode);
+    if (staticShellResponse) return staticShellResponse;
+    // A prefetch that can't have a static shell gets the route's loading
+    // shell, without the static-shell header.
+    return dispatchAppPage(withRenderMode(options, APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL));
+  }
   const dispatch = () =>
-    runWithFetchDedupe(async () => dispatchAppPageInner(await withResolvedIntercept(options)));
+    runWithFetchDedupe(async () => {
+      const response = await dispatchAppPageInner(await withResolvedIntercept(options));
+      // Like Next.js, a document resumed from a fallback shell is marked as
+      // having postponed.
+      if (!options.isRscRequest && _getResumeDataCacheSeed() !== null) {
+        response.headers.set("x-nextjs-postponed", "1");
+      }
+      return response;
+    });
   let response: Response;
   if (!options.pprFallbackShell || !options.pprRuntime) {
     response = await dispatch();
@@ -721,6 +895,196 @@ async function withResolvedIntercept<TRoute extends AppPageDispatchRoute>(
     isStaticGenerationEdgeRuntime: config.isStaticGenerationEdgeRuntime,
     revalidateSeconds: config.revalidateSeconds,
   };
+}
+
+/**
+ * Render a fallback shell as the build prerenders it, for a request that found
+ * none stored: an isolated static generation of the shell's pathname whose
+ * fallback params suspend. The response is buffered, with the shell's resume
+ * data cache after its HTML.
+ */
+export async function renderAppPageFallbackShell<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  shell: AppPagePprFallbackCacheShell,
+): Promise<Response> {
+  const pprRuntime = options.pprRuntime;
+  if (!pprRuntime) throw new Error("[vinext] A fallback shell needs cacheComponents.");
+  const route = options.route;
+  // The params the build's prerender request carries for this shell.
+  const params =
+    encodePrerenderRouteParams(route.pattern, shell.params, shell.fallbackParamNames)?.params ?? {};
+  const pathname = normalizePregeneratedPathname(shell.pathname);
+  const pprFallbackShell = {
+    fallbackParamNames: shell.fallbackParamNames,
+    routePattern: route.pattern,
+  };
+  if (!options.withRequest) throw new Error("[vinext] A fallback shell needs its own request.");
+  // The build's prerender request for the shell. A shell keeps every root param.
+  const shellOptions = options.withRequest({
+    actionError: undefined,
+    actionFailed: false,
+    bypassInterceptionContextCache: false,
+    cachePathname: pathname,
+    cleanPathname: pathname,
+    displayPathname: pathname,
+    formState: null,
+    interceptionContext: null,
+    interceptionId: null,
+    interceptionPathname: pathname,
+    isProgressiveActionRender: false,
+    isRscRequest: false,
+    middlewareContext: { headers: null, status: null },
+    mountedSlotsHeader: null,
+    params,
+    pprFallbackCacheShells: null,
+    pprFallbackShell,
+    renderedConcreteUrlPaths: undefined,
+    renderedPathAndSearch: shell.pathname,
+    renderMode: APP_RSC_RENDER_MODE_NAVIGATION,
+    renderWholeDocument: false,
+    request: new Request(
+      new URL(`${options.basePath ?? ""}${shell.pathname}`, options.request.url),
+    ),
+    rootParams: options.rootParams,
+    scriptNonce: undefined,
+    searchParams: new URLSearchParams(),
+    skipStaticParamsValidation: true,
+    staticParamsValidationParams: undefined,
+  });
+  return runAppPageRevalidationContext(
+    {
+      cleanPathname: pathname,
+      currentFetchCacheMode: options.fetchCache ?? null,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      params,
+      refreshStaleFetchesInForeground: true,
+      rootParams: options.rootParams,
+      routePattern: route.pattern,
+      routeSegments: route.routeSegments,
+      setNavigationContext: options.setNavigationContext,
+    },
+    () =>
+      runWithPrerenderWorkUnit(
+        () =>
+          pprRuntime.run(pprFallbackShell, async () => {
+            const response = await dispatchAppPageInner(shellOptions);
+            return new Response(response.body ? await response.text() : null, {
+              headers: response.headers,
+              status: response.status,
+              statusText: response.statusText,
+            });
+          }),
+        { cacheComponents: true, prerender: true, route: route.pattern },
+      ),
+  );
+}
+
+/**
+ * Render a Cache Components page's static shell as Next.js prefetches it: the
+ * page's navigation payload prerendered, with its dynamic parts left at their
+ * Suspense fallbacks. `isPartial` tells whether it left any. The response is
+ * buffered.
+ *
+ * With `isRuntimePrefetch`, it's the page's runtime prefetch instead, as
+ * Next.js's `prerender-runtime`: the request's cookies, headers and private
+ * caches render too.
+ */
+export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  isRuntimePrefetch = false,
+): Promise<{ isPartial: boolean; response: Response }> {
+  const pprRuntime = options.pprRuntime;
+  if (!pprRuntime) throw new Error("[vinext] A static shell needs cacheComponents.");
+  if (!options.withRequest) throw new Error("[vinext] A static shell needs its own request.");
+  const route = options.route;
+  const pathname = options.cleanPathname;
+  const varyParams = new Set<string>();
+  const pprFallbackShell = {
+    fallbackParamNames: [],
+    ...(isRuntimePrefetch ? { isRuntimePrefetch: true } : {}),
+    routePattern: route.pattern,
+    varyParams,
+  };
+  const requestOptions = options.withRequest({
+    actionError: undefined,
+    actionFailed: false,
+    bypassInterceptionContextCache: false,
+    cachePathname: options.cachePathname ?? pathname,
+    cleanPathname: pathname,
+    displayPathname: options.displayPathname ?? pathname,
+    formState: null,
+    interceptionContext: null,
+    interceptionId: null,
+    interceptionPathname: pathname,
+    isProgressiveActionRender: false,
+    isRscRequest: true,
+    // The shell is shared: each request's middleware merges over it when served.
+    middlewareContext: { headers: null, status: null },
+    mountedSlotsHeader: options.mountedSlotsHeader ?? null,
+    params: options.params,
+    pprFallbackCacheShells: null,
+    pprFallbackShell,
+    renderedConcreteUrlPaths: options.renderedConcreteUrlPaths,
+    renderedPathAndSearch: options.renderedPathAndSearch ?? null,
+    renderMode: APP_RSC_RENDER_MODE_NAVIGATION,
+    renderWholeDocument: false,
+    request: options.request,
+    rootParams: options.rootParams,
+    scriptNonce: undefined,
+    searchParams: isRuntimePrefetch ? options.searchParams : new URLSearchParams(),
+    skipStaticParamsValidation: options.skipStaticParamsValidation,
+    staticParamsValidationParams: options.staticParamsValidationParams,
+  });
+  // The shell renders as the page's payload, but it's never stored as one: a
+  // navigation would replay it with its dynamic parts left out.
+  const shellOptions: DispatchAppPageOptions<TRoute> = {
+    ...requestOptions,
+    isrSet: async () => {},
+  };
+  let isPartial = false;
+  const response = await runAppPageRevalidationContext(
+    {
+      cleanPathname: pathname,
+      currentFetchCacheMode: options.fetchCache ?? null,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      displayPathname: options.displayPathname,
+      // A runtime prefetch renders with the request's cookies and headers.
+      headersContext: isRuntimePrefetch ? (getHeadersContext() ?? undefined) : undefined,
+      params: options.params,
+      refreshStaleFetchesInForeground: true,
+      rootParams: options.rootParams,
+      routePattern: route.pattern,
+      routeSegments: route.routeSegments,
+      setNavigationContext: options.setNavigationContext,
+    },
+    () =>
+      runWithPrerenderWorkUnit(
+        () =>
+          // One render, without a warmup: its abort waits for the caches it
+          // reads, so the shell holds what they resolve to.
+          pprRuntime.runSinglePass(pprFallbackShell, async () => {
+            const response = await dispatchAppPageInner(shellOptions);
+            const body = response.body ? await response.arrayBuffer() : null;
+            isPartial = pprRuntime.getState()?.hasDynamicBoundary === true;
+            const headers = new Headers(response.headers);
+            headers.set(VINEXT_VARY_PARAMS_HEADER, JSON.stringify([...varyParams].sort()));
+            return new Response(body, {
+              headers,
+              status: response.status,
+              statusText: response.statusText,
+            });
+          }),
+        {
+          cacheComponents: true,
+          prerender: true,
+          route: route.pattern,
+          runtime: isRuntimePrefetch,
+        },
+      ),
+  );
+  return { isPartial, response };
 }
 
 async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
@@ -784,7 +1148,10 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           : null;
     if (patternDynamicReason) markRouteCacheabilityPatternDynamic(patternDynamicReason);
   }
-  const isPrerender = process.env.VINEXT_PRERENDER === "1";
+  // A fallback shell renders as the build prerenders it, whether the build or
+  // a request without the shell asked for it.
+  const isPrerender =
+    process.env.VINEXT_PRERENDER === "1" || options.pprFallbackShell !== undefined;
   let traceOperation: "prerender" | "render" = isPrerender ? "prerender" : "render";
   const serveStreamingMetadata = shouldServeStreamingMetadata(
     options.request.headers.get("user-agent") ?? "",
@@ -885,7 +1252,12 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // fallback shells follow cacheComponents' model instead.
   const isNeverStoredPath =
     options.pprRuntime === undefined && hasNoManifestAdmissionState(route.pattern);
-  const isStoredRender = !isRouteCacheabilityProbe() && isCacheEligibleRender && !isNeverStoredPath;
+  // A fallback shell is never the concrete page cached under its pathname.
+  const isStoredRender =
+    !isRouteCacheabilityProbe() &&
+    isCacheEligibleRender &&
+    !isNeverStoredPath &&
+    options.pprFallbackShell === undefined;
   // Like Next.js's ResponseCache, an authorized on-demand revalidation never
   // serves the stored entry: it renders in the foreground and stores that.
   const isOnDemandRevalidate = _isOnDemandRevalidate();
@@ -1015,6 +1387,15 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               revalidationTarget.interceptOpts,
             )
           : null;
+        if (options.pprRuntime && revalidationTarget.route === route) {
+          // A regeneration fills the path's missing shells, as a stored miss
+          // does, but a failure to find them doesn't fail the page.
+          await options.pprRuntime
+            .produceMissingShells(options, currentRevalidateSeconds)
+            .catch((error: unknown) => {
+              console.error("[vinext] ISR fallback shell discovery error:", error);
+            });
+        }
 
         const revalidationDynamicConfig = revalidationInterceptConfig
           ? revalidationInterceptConfig.dynamicConfig
@@ -1283,7 +1664,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     }
   }
 
-  const fallbackShellResponse = options.pprRuntime
+  const fallbackShellResult = options.pprRuntime
     ? await options.pprRuntime.tryServe(
         options,
         currentRevalidateSeconds,
@@ -1292,9 +1673,11 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         isForceDynamic,
       )
     : null;
-  if (fallbackShellResponse) {
-    return fallbackShellResponse;
+  if (fallbackShellResult instanceof Response) {
+    return fallbackShellResult;
   }
+  // The stored shell whose prelude this request sends before its holes.
+  const pprShellResume = fallbackShellResult ?? undefined;
 
   let interceptConfig: AppPageInterceptSegmentConfig | null = null;
   // Whether the intercepted response's render is force-dynamic or
@@ -1494,7 +1877,12 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     });
 
   const fallbackShellState = options.pprRuntime?.getState() ?? null;
-  if (fallbackShellState && process.env.VINEXT_PRERENDER === "1" && !options.isRscRequest) {
+  if (fallbackShellState && isPrerender && !options.isRscRequest) {
+    // The shell's resume data cache: every cache entry its renders read or wrote.
+    const resumeDataCache = createResumeDataCache();
+    _setResumeDataCacheCollector(resumeDataCache);
+    // Its entries replay at any age, so a stale fetch refreshes first, like Next.js.
+    setRefreshStaleFetchesInForeground(true);
     const warmupBuildResult = await buildCurrentPageElement();
     if (warmupBuildResult.response) {
       return warmupBuildResult.response;
@@ -1506,6 +1894,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       state: fallbackShellState,
     });
     discardAppPageRenderState();
+    // Like Next.js, the final render reads what the warmup collected instead of
+    // running it again.
+    _setResumeDataCacheSeed(resumeDataCache);
   }
 
   const navigationParams = resolveAppPageNavigationParams(
@@ -1524,6 +1915,19 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // it answers, so `await res.revalidate()` resolves once the entry is stored.
   const onDemandCacheWrites: Promise<void>[] | null = isOnDemandRevalidate ? [] : null;
 
+  // Like Next.js, which prerenders a path's shell, a page that rendered
+  // dynamically gets one for later requests to resume. A response middleware
+  // gave another status isn't the page's.
+  const produceConcreteShell =
+    options.pprRuntime && !pprShellResume && (options.middlewareContext.status ?? 200) === 200
+      ? () =>
+          options.pprRuntime!.produceConcreteShell(
+            options,
+            currentRevalidateSeconds,
+            isDraftMode,
+            isForceDynamic,
+          )
+      : undefined;
   const lifecycleOptions: Parameters<typeof renderAppPageLifecycle>[0] = {
     basePath: options.basePath,
     bypassInterceptionContextCache: options.bypassInterceptionContextCache,
@@ -1602,6 +2006,10 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           options.pprRuntime!.beginFinalRender(activeFallbackShellState);
         }
       : undefined,
+    isPprFallbackShellPartial: activeFallbackShellState
+      ? () => activeFallbackShellState.hasDynamicBoundary
+      : undefined,
+    pprShellResume,
     rootParams: options.rootParams,
     peekRenderObservationState() {
       return {
@@ -1631,6 +2039,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     prerenderToReadableStream: options.prerenderToReadableStream,
     routePattern: route.pattern,
     scriptNonce: options.scriptNonce,
+    onDynamicRender: produceConcreteShell,
     waitUntil(cachePromise) {
       onDemandCacheWrites?.push(cachePromise);
       getRequestExecutionContext()?.waitUntil(cachePromise);

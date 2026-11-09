@@ -50,6 +50,7 @@ let disableNavigationResponsePrefetchCacheReuse: Navigation["disableNavigationRe
 let hasPrefetchCacheEntryForNavigation: Navigation["hasPrefetchCacheEntryForNavigation"];
 let hasSearchAgnosticPrefetchShellForRoute: Navigation["hasSearchAgnosticPrefetchShellForRoute"];
 let peekPrefetchResponseForNavigation: Navigation["peekPrefetchResponseForNavigation"];
+let peekStaticShellPrefetchForNavigation: Navigation["peekStaticShellPrefetchForNavigation"];
 let appRouterInstance: Navigation["appRouterInstance"];
 let consumePrefetchResponseForNavigation: Navigation["consumePrefetchResponseForNavigation"];
 let seedPrefetchResponseSnapshot: Navigation["seedPrefetchResponseSnapshot"];
@@ -91,6 +92,7 @@ beforeEach(async () => {
   hasPrefetchCacheEntryForNavigation = nav.hasPrefetchCacheEntryForNavigation;
   hasSearchAgnosticPrefetchShellForRoute = nav.hasSearchAgnosticPrefetchShellForRoute;
   peekPrefetchResponseForNavigation = nav.peekPrefetchResponseForNavigation;
+  peekStaticShellPrefetchForNavigation = nav.peekStaticShellPrefetchForNavigation;
   appRouterInstance = nav.appRouterInstance;
   consumePrefetchResponseForNavigation = nav.consumePrefetchResponseForNavigation;
   seedPrefetchResponseSnapshot = nav.seedPrefetchResponseSnapshot;
@@ -3008,6 +3010,14 @@ describe("prefetch cache eviction", () => {
 
     expect(hasSearchAgnosticPrefetchShellForRoute(secondRscUrl, null, null)).toBe(true);
     expect(hasPrefetchCacheEntryForNavigation(secondRscUrl, null, null)).toBe(false);
+    // The URL's own shell isn't another query's: a repeat prefetch asks for it again.
+    expect(
+      hasSearchAgnosticPrefetchShellForRoute(
+        "/search-params/target-page?searchParam=a_PPR&_rsc=repeat",
+        null,
+        null,
+      ),
+    ).toBe(false);
   });
 
   it("retains a zero-stale search-agnostic shell without making it navigation-reusable", async () => {
@@ -3424,5 +3434,412 @@ describe("prefetch cache eviction", () => {
     expect(cache.has("/expired-small-1.rsc")).toBe(true);
     expect(cache.has("/new.rsc")).toBe(true);
     expect(getPrefetchedUrls().size).toBe(3);
+  });
+});
+
+// Next.js prefetches a Cache Components page's static shell: a partial one is
+// shown by the navigation while the page renders, a complete one is the page.
+// Ported from Next.js: test/e2e/app-dir/segment-cache/basic/segment-cache-basic.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/segment-cache/basic/segment-cache-basic.test.ts
+describe("static-shell prefetch", () => {
+  function useCacheComponentsProduction(): void {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
+    (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+      { canPrefetchLoadingShell: false, isDynamic: false, patternParts: ["test"] },
+    ];
+  }
+
+  async function prefetchStaticShell(
+    shell: "partial" | "complete" | "runtime" | null,
+  ): Promise<string> {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      const headers = new Headers({ "content-type": "text/x-component" });
+      if (shell !== null) headers.set("X-Vinext-Static-Shell", shell);
+      return new Response("0:shell", { headers });
+    });
+    (globalThis as any).fetch = fetch;
+    (globalThis as any).window[Symbol.for("vinext.navigationRuntime")] = {
+      bootstrap: { routeManifest: null, rsc: undefined },
+      functions: {
+        getPrefetchRouterState: () => ({ pathAndSearch: "/current", routeId: "route:/current" }),
+        navigate: vi.fn(),
+      },
+    };
+    appRouterInstance.prefetch("/test");
+    await waitForPrefetchSetup(() => fetch.mock.calls.length === 1);
+    const headers = fetch.mock.calls[0]?.[1]?.headers as Headers | undefined;
+    expect(headers?.get("X-Vinext-Rsc-Render-Mode")).toBe("prefetch-static-shell");
+    // The shell is the same from any page, so the router state stays out of
+    // its request and cache key.
+    expect(headers?.get("Next-Router-State-Tree")).toBeNull();
+    expect(headers?.get("X-Vinext-Rsc-State-Fingerprint")).toBeNull();
+    const rscUrl = toRscUrlString(fetch.mock.calls[0]![0]);
+    const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, null);
+    await waitForPrefetchSetup(() => getPrefetchCache().get(cacheKey)?.outcome === "cache-seeded");
+    return rscUrl;
+  }
+
+  it("prefetches a Cache Components page's static shell in production", async () => {
+    useCacheComponentsProduction();
+    const { resolveAutoAppRoutePrefetch } =
+      await import("../packages/vinext/src/shims/internal/app-route-prefetch-policy.js");
+
+    expect(resolveAutoAppRoutePrefetch("/test")).toMatchObject({
+      cacheForNavigation: false,
+      dynamicStaleTime: "ignore",
+      staticShell: true,
+    });
+    // An intercepted page is never prerendered, so it has no static shell.
+    expect(resolveAutoAppRoutePrefetch("/test", "/feed").staticShell).toBeUndefined();
+    vi.stubEnv("NODE_ENV", "development");
+    expect(resolveAutoAppRoutePrefetch("/test").staticShell).toBeUndefined();
+  });
+
+  it("prefetches a runtime prefetch route's search-param and root-param hrefs as static shells", async () => {
+    useCacheComponentsProduction();
+    (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+      {
+        canPrefetchLoadingShell: false,
+        instant: "runtime",
+        isDynamic: false,
+        patternParts: ["runtime"],
+      },
+      {
+        canPrefetchLoadingShell: false,
+        hasRootParams: true,
+        instant: "runtime",
+        isDynamic: true,
+        patternParts: [":lang", "runtime-root"],
+      },
+      { canPrefetchLoadingShell: false, isDynamic: false, patternParts: ["test"] },
+    ];
+    const { resolveAutoAppRoutePrefetch } =
+      await import("../packages/vinext/src/shims/internal/app-route-prefetch-policy.js");
+
+    // Next.js renders a runtime prefetch with the request's search params and
+    // root params, so those hrefs prefetch it too.
+    expect(resolveAutoAppRoutePrefetch("/runtime?q=1")).toMatchObject({
+      cacheForNavigation: false,
+      staticShell: true,
+    });
+    expect(resolveAutoAppRoutePrefetch("/en/runtime-root")).toMatchObject({
+      cacheForNavigation: false,
+      staticShell: true,
+    });
+    expect(resolveAutoAppRoutePrefetch("/test?q=1").staticShell).toBeUndefined();
+    expect(resolveAutoAppRoutePrefetch("/runtime?q=1", "/feed").staticShell).toBeUndefined();
+  });
+
+  it("prefetches a route with an unstable_instant config automatically, even when asked for a full prefetch", async () => {
+    useCacheComponentsProduction();
+    (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+      {
+        canPrefetchLoadingShell: false,
+        instant: "static",
+        isDynamic: false,
+        patternParts: ["test"],
+      },
+    ];
+    // Like Next.js (`SubtreeHasInstant`), the route's instant config decides
+    // what's prefetched, so the full prefetch gets the static shell.
+    const fetch = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response("0:shell", { headers: { "content-type": "text/x-component" } }),
+    );
+    (globalThis as any).fetch = fetch;
+    (globalThis as any).window[Symbol.for("vinext.navigationRuntime")] = {
+      bootstrap: { routeManifest: null, rsc: undefined },
+      functions: {
+        getPrefetchRouterState: () => ({ pathAndSearch: "/current", routeId: "route:/current" }),
+        navigate: vi.fn(),
+      },
+    };
+    appRouterInstance.prefetch("/test", { kind: "full" } as never);
+    await waitForPrefetchSetup(() => fetch.mock.calls.length === 1);
+    const headers = fetch.mock.calls[0]?.[1]?.headers as Headers | undefined;
+    expect(headers?.get("X-Vinext-Rsc-Render-Mode")).toBe("prefetch-static-shell");
+    expect(headers?.get("Next-Router-Prefetch")).toBe("1");
+  });
+
+  it("reads an intercepting page's unstable_instant config under its interception context", async () => {
+    useCacheComponentsProduction();
+    (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+      {
+        canPrefetchLoadingShell: false,
+        intercepts: [
+          {
+            instant: "static",
+            sourcePatternParts: ["feed"],
+            targetPatternParts: ["photos", ":id"],
+          },
+          { sourcePatternParts: ["gallery"], targetPatternParts: ["photos", ":id"] },
+          { sourcePatternParts: ["other"], targetPatternParts: ["photos", ":id"] },
+        ],
+        isDynamic: true,
+        patternParts: ["photos", ":id"],
+      },
+      { canPrefetchLoadingShell: false, isDynamic: false, patternParts: ["feed"] },
+      {
+        canPrefetchLoadingShell: false,
+        instant: "static",
+        isDynamic: false,
+        patternParts: ["gallery"],
+      },
+      { canPrefetchLoadingShell: false, isDynamic: false, patternParts: ["other"] },
+    ];
+    const { hasAppRouteInstantConfig } =
+      await import("../packages/vinext/src/shims/internal/app-route-prefetch-policy.js");
+
+    expect(hasAppRouteInstantConfig("/photos/1")).toBe(false);
+    // The intercepting page renders instead, so its config counts...
+    expect(hasAppRouteInstantConfig("/photos/1", "/feed")).toBe(true);
+    // ...with the route the interception context renders it in.
+    expect(hasAppRouteInstantConfig("/photos/1", "/gallery")).toBe(true);
+    expect(hasAppRouteInstantConfig("/photos/1", "/other")).toBe(false);
+  });
+
+  it("keeps a partial shell for navigations to show, never to consume", async () => {
+    useCacheComponentsProduction();
+    const rscUrl = await prefetchStaticShell("partial");
+
+    expect(hasPrefetchCacheEntryForNavigation(rscUrl)).toBe(false);
+    const shell = peekStaticShellPrefetchForNavigation(rscUrl);
+    expect(shell?.staticShell).toBe("partial");
+    // It stays cached for the next navigation.
+    expect(peekStaticShellPrefetchForNavigation(rscUrl)).toBe(shell);
+
+    // Its stream never ends, so the shell's holes suspend instead of failing.
+    const reader = restoreRscResponse(shell!).body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe("0:shell");
+    const next = await Promise.race([
+      reader.read().then(() => "read"),
+      new Promise((resolve) => setTimeout(() => resolve("open"), 20)),
+    ]);
+    expect(next).toBe("open");
+    void reader.cancel();
+  });
+
+  it("lets a navigation consume a complete shell", async () => {
+    useCacheComponentsProduction();
+    const rscUrl = await prefetchStaticShell("complete");
+
+    expect(peekStaticShellPrefetchForNavigation(rscUrl)).toBeNull();
+    const consumed = consumePrefetchResponse(rscUrl, null, null);
+    expect(consumed?.staticShell).toBe("complete");
+    await expect(restoreRscResponse(consumed!).text()).resolves.toBe("0:shell");
+  });
+
+  // A runtime prefetch is the page rendered for the request, kept for the
+  // dynamic stale time like a navigation's own payload.
+  it("lets a navigation consume a runtime prefetch", async () => {
+    useCacheComponentsProduction();
+    const rscUrl = await prefetchStaticShell("runtime");
+    const entry = getPrefetchCache().get(AppElementsWire.encodeCacheKey(rscUrl, null));
+
+    expect(entry?.cacheForNavigation).toBe(true);
+    expect(peekStaticShellPrefetchForNavigation(rscUrl)).toBeNull();
+    expect(consumePrefetchResponse(rscUrl, null, null)?.staticShell).toBe("runtime");
+  });
+
+  describe("vary params", () => {
+    function setUpShopRoute(): void {
+      vi.stubEnv("NODE_ENV", "production");
+      vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
+      (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+        {
+          canPrefetchLoadingShell: false,
+          // A runtime prefetch reads search params, so it's asked for with them.
+          instant: "runtime",
+          isDynamic: true,
+          patternParts: ["shop", ":category", ":item"],
+        },
+      ];
+      (globalThis as any).window[Symbol.for("vinext.navigationRuntime")] = {
+        bootstrap: {
+          routeManifest: decodeBrowserRouteManifest({
+            graphVersion: "graph:test",
+            routes: [
+              {
+                isDynamic: true,
+                layoutIds: ["layout:/"],
+                pageId: "page:/shop/:category/:item",
+                paramNames: ["category", "item"],
+                patternParts: ["shop", ":category", ":item"],
+                rootBoundaryId: null,
+                slotIds: [],
+              },
+            ],
+            layouts: [],
+            slotBindings: [],
+            interceptions: [],
+            interceptionsBySlotId: [],
+            rootBoundaries: [],
+          }),
+          rsc: undefined,
+        },
+        functions: { navigate: vi.fn() },
+      };
+    }
+
+    function mockShellFetch(
+      shell: {
+        renderedPathAndSearch?: string;
+        staticShell?: "complete";
+        varyParams: readonly string[];
+      } | null = null,
+    ) {
+      const fetch = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+        const url = new URL(toRscUrlString(input), "http://localhost");
+        const [, , category, item] = url.pathname.split("/");
+        const headers = new Headers({
+          "content-type": "text/x-component",
+          "X-Vinext-Static-Shell": shell?.staticShell ?? "partial",
+          "X-Vinext-Params": encodeURIComponent(JSON.stringify({ category, item })),
+          "X-Vinext-Rendered-Path-And-Search": encodeURIComponent(
+            shell?.renderedPathAndSearch ??
+              `${url.pathname}${url.search}`.replace(/[?&]_rsc=[^&]*/, ""),
+          ),
+          "X-Vinext-Vary-Params": JSON.stringify(shell?.varyParams ?? ["category"]),
+        });
+        return new Response(`0:${category}`, { headers });
+      });
+      (globalThis as any).fetch = fetch;
+      return fetch;
+    }
+
+    function findEntry(pathAndSearch: string): PrefetchCacheEntry | undefined {
+      for (const [cacheKey, entry] of getPrefetchCache()) {
+        const url = new URL(cacheKey, "http://localhost");
+        url.searchParams.delete("_rsc");
+        if (`${url.pathname}${url.search}` === pathAndSearch) return entry;
+      }
+      return undefined;
+    }
+
+    async function prefetch(href: string, fetch: ReturnType<typeof mockShellFetch>, calls: number) {
+      appRouterInstance.prefetch(href);
+      await waitForPrefetchSetup(
+        () => fetch.mock.calls.length === calls && findEntry(href)?.outcome === "cache-seeded",
+      );
+    }
+
+    // Like Next.js's segment cache, a shell is shared by the URLs of its route
+    // that agree on the params its render read.
+    it("reuses a partial shell for a URL with the same values for the params it read", async () => {
+      setUpShopRoute();
+      const fetch = mockShellFetch();
+
+      await prefetch("/shop/electronics/phone", fetch, 1);
+      await prefetch("/shop/electronics/tablet", fetch, 1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      const alias = findEntry("/shop/electronics/tablet");
+      expect(alias?.prefetchKind).toBe("static-shell");
+      expect(alias?.snapshot?.staticShell).toBe("partial");
+      // The shell renders with the URL's own params.
+      expect(JSON.parse(decodeURIComponent(alias!.snapshot!.paramsHeader!))).toEqual({
+        category: "electronics",
+        item: "tablet",
+      });
+      expect(alias?.snapshot?.renderedPathAndSearch).toBe("/shop/electronics/tablet");
+      expect(new TextDecoder().decode(alias!.snapshot!.buffer)).toBe("0:electronics");
+
+      await prefetch("/shop/clothing/shirt", fetch, 2);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("reuses a complete shell as the page of a URL with another query string", async () => {
+      setUpShopRoute();
+      const fetch = mockShellFetch({ staticShell: "complete", varyParams: ["category"] });
+
+      await prefetch("/shop/electronics/phone", fetch, 1);
+      await prefetch("/shop/electronics/phone?q=1", fetch, 1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(findEntry("/shop/electronics/phone?q=1")?.cacheForNavigation).toBe(true);
+
+      const consumed = consumePrefetchResponse("/shop/electronics/phone?q=1");
+      expect(consumed?.staticShell).toBe("complete");
+      expect(consumed?.renderedPathAndSearch).toBe("/shop/electronics/phone?q=1");
+      expect(new TextDecoder().decode(consumed!.buffer)).toBe("0:electronics");
+      // The shell it was reused from stays cached for its own URL.
+      expect(findEntry("/shop/electronics/phone")?.cacheForNavigation).toBe(true);
+
+      // Its tree keeps the segment values of its own path.
+      await prefetch("/shop/electronics/tablet", fetch, 2);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("hands a superseded pending prefetch's invalidation subscribers to the reused shell", async () => {
+      setUpShopRoute();
+      const fetch = mockShellFetch();
+      await prefetch("/shop/electronics/phone", fetch, 1);
+
+      // The URL's own prefetch is still in flight when a navigation reuses
+      // another URL's shell for it.
+      const rscUrl = "/shop/electronics/tablet?_rsc=pending";
+      const onInvalidate = vi.fn();
+      prefetchRscResponse(rscUrl, new Promise<Response>(() => {}), null, null, { onInvalidate });
+      const { seedStaticShellPrefetchFromVaryingShell } =
+        await import("../packages/vinext/src/shims/navigation.js");
+      const { createVaryingStaticShellResolver } =
+        await import("../packages/vinext/src/shims/internal/app-static-shell-vary-params.js");
+      expect(
+        seedStaticShellPrefetchFromVaryingShell(
+          rscUrl,
+          null,
+          null,
+          createVaryingStaticShellResolver("/shop/electronics/tablet"),
+        ),
+      ).toBe(true);
+      expect(findEntry("/shop/electronics/tablet")?.outcome).toBe("cache-seeded");
+
+      invalidatePrefetchCache();
+      expect(onInvalidate).toHaveBeenCalledTimes(1);
+    });
+
+    it("compares search strings only when the shell read them", async () => {
+      setUpShopRoute();
+      const fetch = mockShellFetch({ varyParams: ["?"] });
+
+      await prefetch("/shop/electronics/phone?q=1", fetch, 1);
+      await prefetch("/shop/clothing/shirt?q=1", fetch, 1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await prefetch("/shop/clothing/shirt?q=2", fetch, 2);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("doesn't reuse a rewritten URL's shell", async () => {
+      setUpShopRoute();
+      const fetch = mockShellFetch({
+        renderedPathAndSearch: "/shop/electronics/other",
+        varyParams: [],
+      });
+
+      await prefetch("/shop/electronics/phone", fetch, 1);
+      await prefetch("/shop/electronics/tablet", fetch, 2);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("doesn't reuse the shell of a URL rewritten to another query", async () => {
+      setUpShopRoute();
+      const fetch = mockShellFetch({
+        renderedPathAndSearch: "/shop/electronics/phone?q=2",
+        varyParams: ["?"],
+      });
+
+      await prefetch("/shop/electronics/phone?q=1", fetch, 1);
+      await prefetch("/shop/electronics/tablet?q=1", fetch, 2);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("treats a prefetch the server answered without a shell as a loading shell", async () => {
+    useCacheComponentsProduction();
+    const rscUrl = await prefetchStaticShell(null);
+    const entry = getPrefetchCache().get(AppElementsWire.encodeCacheKey(rscUrl, null));
+
+    expect(entry?.prefetchKind).toBe("loading-shell");
+    expect(entry?.cacheForNavigation).toBe(false);
+    expect(peekStaticShellPrefetchForNavigation(rscUrl)).toBeNull();
   });
 });

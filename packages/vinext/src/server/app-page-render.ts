@@ -4,6 +4,8 @@ import type { NavigationContext } from "vinext/shims/navigation";
 import type { AppPageCacheSetter } from "./isr-cache.js";
 import type { RootParams } from "vinext/shims/root-params";
 import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
+import { _getResumeDataCacheCollector } from "vinext/shims/cache-request-state";
+import { isResumeDataCacheEmpty, stringifyResumeDataCache } from "vinext/shims/resume-data-cache";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { getCdnCacheAdapter } from "vinext/shims/cdn-cache";
 import { resolveClientStaleTimeSeconds } from "../utils/cache-control-metadata.js";
@@ -50,6 +52,7 @@ import {
   deferUntilStreamConsumed,
   renderAppPageHtmlStream,
   renderAppPageHtmlStreamWithRecovery,
+  type AppPagePprShellResume,
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
 import { APP_RSC_RENDER_MODE_NAVIGATION, type AppRscRenderMode } from "./app-rsc-render-mode.js";
@@ -217,6 +220,10 @@ type RenderAppPageLifecycleOptionsBase = {
   pprFallbackShellSignal?: AbortSignal;
   pprFallbackShellReactSignal?: AbortSignal;
   abortPprFallbackShell?: () => void;
+  /** Whether the fallback shell's payload left holes. */
+  isPprFallbackShellPartial?: () => boolean;
+  /** A stored shell this render resumes. */
+  pprShellResume?: AppPagePprShellResume;
   rootParams?: RootParams;
   peekRenderObservationState?: () => AppPageRenderObservationState;
   expireSeconds?: number;
@@ -243,6 +250,11 @@ type RenderAppPageLifecycleOptionsBase = {
   mountedSlotsHeader?: string | null;
   renderedPathAndSearch?: string | null;
   renderMode?: AppRscRenderMode;
+  /**
+   * Called when the page's render is dynamic: from its start, or, for a
+   * document that might have been stored, once it has rendered whole.
+   */
+  onDynamicRender?: () => void;
   waitUntil?: (promise: Promise<void>) => void;
 };
 
@@ -840,7 +852,9 @@ async function renderAppPageLifecycleImpl(
     });
   const rscCapture = pprFallbackShellRsc
     ? {
-        ssrStream: createBufferedRscStream(false),
+        // A static shell's RSC response ends with its prelude. Its unfinished
+        // parts stay pending for the client, as in a Next.js prefetch.
+        ssrStream: createBufferedRscStream(options.isRscRequest),
         ...(shouldCaptureRscForCacheMetadata ? { sideStream: createBufferedRscStream(true) } : {}),
       }
     : teeAppPageRscStreamForCapture(rscStream, shouldCaptureRscForCacheMetadata);
@@ -1003,6 +1017,8 @@ async function renderAppPageLifecycleImpl(
             expireSeconds,
             revalidateSeconds,
           });
+    // The page's own policy, as middleware may replace the response's header.
+    if (rscResponsePolicy.cacheControl === NEVER_CACHE_CONTROL) options.onDynamicRender?.();
     if (shouldBypassRscCache) {
       options.isrDebug?.(
         isPartialPayload
@@ -1283,6 +1299,8 @@ async function renderAppPageLifecycleImpl(
         revalidateSeconds,
       }),
       linkHeader: write.linkHeader,
+      // A special error's document isn't the page's.
+      onDynamicRender: write.status === undefined ? options.onDynamicRender : undefined,
       status: write.status,
       waitUntil(cachePromise) {
         options.waitUntil?.(cachePromise);
@@ -1506,6 +1524,8 @@ async function renderAppPageLifecycleImpl(
         reactMaxHeadersLength: options.reactMaxHeadersLength,
         rootParams: options.rootParams,
         pprFallbackShellSignal: options.pprFallbackShellSignal,
+        isPprFallbackShellPartial: options.isPprFallbackShellPartial,
+        pprShellResume: options.pprShellResume,
         preloadRoutePattern: options.routePattern,
         formState: options.formState ?? null,
         rscStream: rscForResponse,
@@ -1607,14 +1627,29 @@ async function renderAppPageLifecycleImpl(
   if (!htmlStream) {
     throw new Error("[vinext] Expected an HTML stream when no fallback response was returned");
   }
+  if (options.isPrerender === true && options.pprFallbackShellSignal) {
+    // The shell's cache entries are all settled once its body ends.
+    const resumeDataCache = _getResumeDataCacheCollector();
+    const { appendAppPprFallbackShellState } = await import("./app-ppr-fallback-shell.js");
+    const prelude = htmlRender.pprShellPrelude;
+    htmlStream = appendAppPprFallbackShellState(htmlStream, () => ({
+      prelude: prelude !== undefined,
+      postponed: prelude?.postponed ?? null,
+      resumeDataCache:
+        resumeDataCache && !isResumeDataCacheEmpty(resumeDataCache)
+          ? stringifyResumeDataCache(resumeDataCache)
+          : null,
+      // The build and shell production record the generated params themselves.
+      generated: null,
+    }));
+  }
 
   // Combine React's preload `Link` header (captured via onHeaders during SSR)
-  // with the font preload `Link` header, capped to `reactMaxHeadersLength`.
-  const linkHeader = buildAppPageLinkHeader(
-    htmlRender.linkHeader,
-    fontLinkHeader,
-    options.reactMaxHeadersLength,
-  );
+  // with the font preload `Link` header, capped to `reactMaxHeadersLength`. A
+  // resumed shell sends the header its render sent.
+  const linkHeader =
+    options.pprShellResume?.linkHeader ??
+    buildAppPageLinkHeader(htmlRender.linkHeader, fontLinkHeader, options.reactMaxHeadersLength);
 
   if (options.isPrerender === true) {
     await htmlRender.metadataReady;
@@ -1709,6 +1744,7 @@ async function renderAppPageLifecycleImpl(
     return response;
   }
 
+  if (htmlResponsePolicy.cacheControl === NEVER_CACHE_CONTROL) options.onDynamicRender?.();
   if (shouldWriteHtmlCache) {
     const isrResponse = buildAppPageHtmlResponse(safeHtmlStream, {
       cacheTags: options.isPrerender === true ? options.getPageTags() : undefined,
