@@ -55,6 +55,12 @@ type BuildAppPageCacheRenderObservation = (input: {
   state: AppPageRenderObservationState;
 }) => RenderObservation;
 
+/**
+ * A notFound(), forbidden(), unauthorized() or redirect() a Suspense boundary
+ * caught while the document streamed, known once the render finishes.
+ */
+export type AppPageCaughtHttpError = { status: number; headers?: Record<string, string> };
+
 type FinalizeAppPageCacheabilityEvaluationOptions = {
   capturedDynamicUsageBeforeContextCleanup?: () => boolean;
   consumeDynamicUsage: () => boolean;
@@ -67,6 +73,11 @@ type FinalizeAppPageCacheabilityEvaluationOptions = {
    * cacheable even when a cacheLife resolves during the render.
    */
   isStaticEligible: boolean;
+  /**
+   * The HTTP error a Suspense boundary caught in an HTML render, read once the
+   * document finished, as Next.js stores its status beside the document.
+   */
+  getCaughtHttpError?: () => AppPageCaughtHttpError | undefined;
   /** An RSC render's status, from its document's shell. */
   resolveRscRenderStatus?: () => Promise<AppPageRscRenderStatus>;
   revalidateSeconds: number | null;
@@ -105,6 +116,12 @@ type FinalizeAppPageHtmlCacheResponseOptions = {
    */
   status?: number;
   headers?: Record<string, string>;
+  /**
+   * The HTTP error a Suspense boundary caught, once the streamed document is
+   * read. Its status and headers are stored in place of the 200 the client was
+   * already sent, as Next.js's ISR entry stores them.
+   */
+  getCaughtHttpError?: () => AppPageCaughtHttpError | undefined;
   /** Called when the render turns out dynamic, so its document isn't stored. */
   onDynamicRender?: () => void;
   waitUntil?: (promise: Promise<void>) => void;
@@ -288,7 +305,16 @@ function finalizeEvaluatedAppPageResponse(
           tags: options.getPageTags(),
         }
       : { cacheable: false, reason: "render did not produce a cache policy" };
-    const admitted = renderStatus ? applyRscRenderStatus(outcome, renderStatus) : outcome;
+    const caughtHttpError = renderStatus ? undefined : options.getCaughtHttpError?.();
+    const admitted = renderStatus
+      ? applyRscRenderStatus(outcome, renderStatus)
+      : caughtHttpError && outcome.cacheable
+        ? {
+            ...outcome,
+            status: caughtHttpError.status,
+            ...(caughtHttpError.headers ? { headers: caughtHttpError.headers } : {}),
+          }
+        : outcome;
     // Every query shares the document's entry too.
     settleAdmittedDocument(
       options.captureAdmittedDocument,
@@ -456,7 +482,10 @@ export function finalizeAppPageHtmlCacheResponse(
         state: observationState,
       });
       const linkHeader = options.linkHeader;
-      const status = options.status ?? 200;
+      const caughtHttpError =
+        options.status === undefined ? options.getCaughtHttpError?.() : undefined;
+      const status = options.status ?? caughtHttpError?.status ?? 200;
+      const storedHeaders = options.headers ?? caughtHttpError?.headers;
       // Every query shares these entries, so a render not proven to leave the
       // query unread is never stored.
       if (
@@ -474,7 +503,7 @@ export function finalizeAppPageHtmlCacheResponse(
             undefined,
             status,
             htmlRenderObservation,
-            linkHeader ? { ...options.headers, link: linkHeader } : options.headers,
+            linkHeader ? { ...storedHeaders, link: linkHeader } : storedHeaders,
           ),
           { cacheControl, tags: pageTags },
         ),
@@ -484,7 +513,7 @@ export function finalizeAppPageHtmlCacheResponse(
         writes.push(
           options.isrSet(
             rscKey,
-            buildAppPageCacheValue("", rscData, status, rscRenderObservation, options.headers),
+            buildAppPageCacheValue("", rscData, status, rscRenderObservation, storedHeaders),
             { cacheControl, tags: pageTags },
           ),
         );

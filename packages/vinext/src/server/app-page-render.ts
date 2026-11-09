@@ -16,6 +16,7 @@ import { internalServerErrorResponse } from "./http-error-responses.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
 import { isBailoutToCSRError } from "vinext/shims/navigation-errors";
 import {
+  type AppPageCaughtHttpError,
   finalizeAppPageCacheabilityEvaluationResponse,
   finalizeAppPageHtmlCacheResponse,
   finalizeAppPageRscCacheResponse,
@@ -25,6 +26,7 @@ import {
   readAppPageBinaryStream,
   resolveAppPageCaughtNotFoundBoundaries,
   resolveAppPageShellSpecialError,
+  preferAppPageHttpError,
   resolveAppPageSpecialError,
   resolveAppPageSpecialErrorStoredHeaders,
   teeAppPageRscStreamForCapture,
@@ -417,19 +419,6 @@ export function applyIneligibleRouteCachePolicy(
     stamped.headers.set(VINEXT_DYNAMIC_STALE_TIME_HEADER, String(dynamicStaleTimeSeconds));
   }
   return stamped;
-}
-
-/**
- * The HTTP error a prerendered document answers with: a redirect wins over an
- * access fallback, and otherwise the error seen first does.
- */
-function preferPrerenderHttpError(
-  current: AppPageSpecialError | null,
-  specialError: AppPageSpecialError | null,
-): AppPageSpecialError | null {
-  if (specialError === null) return current;
-  if (current === null) return specialError;
-  return specialError.kind === "redirect" && current.kind !== "redirect" ? specialError : current;
 }
 
 function withPrerenderHttpErrorCapture(
@@ -1254,17 +1243,25 @@ async function renderAppPageLifecycleImpl(
   // document's status, and a redirect its `location`, while the document keeps
   // the layout and the boundary's fallback for the browser to recover from. A
   // redirect wins over an access fallback; otherwise the first one seen does.
-  // A request-time render streams a 200 before the error, so it keeps it.
+  // A request-time render streams a 200 before the error, so it keeps it, but
+  // the ISR entry it writes stores the error's status as Next.js's does, for
+  // the requests the entry serves.
   // Ported from Next.js: packages/next/src/server/app-render/app-render.tsx
   // (setHTTPAccessFallbackOrRedirectStatus in prerenderToStream)
   // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
   let prerenderHttpError: AppPageSpecialError | null = null;
   const capturePrerenderHttpError = (error: unknown): void => {
-    if (options.isPrerender !== true || options.pprFallbackShellSignal !== undefined) return;
-    prerenderHttpError = preferPrerenderHttpError(
+    if (options.pprFallbackShellSignal !== undefined) return;
+    prerenderHttpError = preferAppPageHttpError(
       prerenderHttpError,
       resolveAppPageSpecialError(error),
     );
+  };
+
+  const getCaughtHttpError = (): AppPageCaughtHttpError | undefined => {
+    if (prerenderHttpError === null) return undefined;
+    const headers = resolveAppPageSpecialErrorStoredHeaders(prerenderHttpError, options.basePath);
+    return { status: prerenderHttpError.statusCode, ...(headers ? { headers } : {}) };
   };
 
   const resolveHtmlCacheWrite = (dynamicUsedDuringRender: boolean) => {
@@ -1302,6 +1299,7 @@ async function renderAppPageLifecycleImpl(
     response: Response,
     write: {
       capturedDynamicUsageBeforeContextCleanup: () => boolean;
+      getCaughtHttpError?: () => AppPageCaughtHttpError | undefined;
       headers?: Record<string, string>;
       htmlResponsePolicy: ReturnType<typeof resolveAppPageHtmlResponsePolicy>;
       linkHeader: string | null;
@@ -1314,6 +1312,7 @@ async function renderAppPageLifecycleImpl(
       capturedRscDataPromise: capturedRscDataRef.value,
       cleanPathname: options.cleanPathname,
       clientTraceMetadataMarker,
+      getCaughtHttpError: write.getCaughtHttpError,
       consumeDynamicUsage: consumeRenderDynamicUsage,
       consumeRenderObservationState,
       createHtmlRenderObservation(input) {
@@ -1418,8 +1417,7 @@ async function renderAppPageLifecycleImpl(
     }
     // A redirect a Suspense boundary caught before the shell rejected keeps
     // its status and location, and an earlier access fallback its status.
-    const responseError =
-      preferPrerenderHttpError(prerenderHttpError, specialError) ?? specialError;
+    const responseError = preferAppPageHttpError(prerenderHttpError, specialError) ?? specialError;
     // The boundary renders as its document streams, so its tagged fetches,
     // cacheLife() and dynamic API use are known once the document is read.
     const body = await response.arrayBuffer();
@@ -1840,6 +1838,7 @@ async function renderAppPageLifecycleImpl(
 
     return finalizeHtmlCacheWrite(isrResponse, {
       capturedDynamicUsageBeforeContextCleanup: () => dynamicUsedBeforeContextCleanup,
+      getCaughtHttpError,
       htmlResponsePolicy,
       linkHeader: linkHeader ?? null,
     });
@@ -1861,6 +1860,7 @@ async function renderAppPageLifecycleImpl(
     },
     consumeDynamicUsage: consumeRenderDynamicUsage,
     consumeRenderObservationState,
+    getCaughtHttpError,
     getPageTags() {
       return options.getPageTags();
     },
