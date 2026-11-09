@@ -29920,8 +29920,14 @@ describe("next/image enhancements", () => {
       height: 600,
       loader: ({ src, width, quality }) => `https://cdn.example.com${src}?w=${width}&q=${quality}`,
     });
-    // Custom loader bypasses the /_next/image endpoint
-    expect(result.props.src).toBe("https://cdn.example.com/photo.jpg?w=800&q=75");
+    // Custom loader bypasses the /_next/image endpoint and gets the same
+    // per-width srcSet treatment as the built-in loader: src is the 2x
+    // (larger) breakpoint, with quality passed through as given
+    // (undefined here, since no quality prop was set).
+    expect(result.props.src).toBe("https://cdn.example.com/photo.jpg?w=1920&q=undefined");
+    expect(result.props.srcSet).toBe(
+      "https://cdn.example.com/photo.jpg?w=828&q=undefined 1x, https://cdn.example.com/photo.jpg?w=1920&q=undefined 2x",
+    );
     expect(result.props.src).not.toContain("/_next/image");
   });
 
@@ -30076,7 +30082,13 @@ describe("next/image component rendering", () => {
           `https://cdn.example.com${src}?w=${width}&q=${quality}`,
       }),
     );
-    expect(html).toContain('src="https://cdn.example.com/photo.jpg?w=800&amp;q=75"');
+    // Per-width srcSet treatment: src is the 2x breakpoint, srcSet carries
+    // both the 1x and 2x breakpoints; quality passed through as given
+    // (undefined here, since no quality prop was set).
+    expect(html).toContain('src="https://cdn.example.com/photo.jpg?w=1920&amp;q=undefined"');
+    expect(html).toContain(
+      'srcSet="https://cdn.example.com/photo.jpg?w=828&amp;q=undefined 1x, https://cdn.example.com/photo.jpg?w=1920&amp;q=undefined 2x"',
+    );
   });
 
   it("renders with custom sizes attribute", async () => {
@@ -30809,22 +30821,41 @@ describe("image optimization request parsing", () => {
     expect(params!.width).toBe(16);
   });
 
-  it("negotiateImageFormat prefers AVIF over WebP", async () => {
+  // Ported from Next.js: getSupportedMimeType and the upstream-type fallback in
+  // packages/next/src/server/image-optimizer/transform.ts, as exercised by
+  // test/e2e/image-optimizer/util.ts ("should maintain png format for old
+  // Safari", "should downlevel webp format to jpeg for old Safari").
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/image-optimizer/util.ts
+  it("negotiateImageFormat serves WebP, not AVIF, under the default images.formats", async () => {
     const { negotiateImageFormat } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(negotiateImageFormat("image/avif,image/webp,image/jpeg")).toBe("image/avif");
+    expect(negotiateImageFormat("image/avif,image/webp,image/jpeg")).toBe("image/webp");
+    expect(negotiateImageFormat("image/avif,image/jpeg", undefined, "image/png")).toBe("image/png");
   });
 
-  it("negotiateImageFormat selects WebP when no AVIF", async () => {
+  it("negotiateImageFormat prefers AVIF when images.formats lists it first", async () => {
     const { negotiateImageFormat } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(negotiateImageFormat("image/webp,image/jpeg")).toBe("image/webp");
+    const formats = ["image/avif", "image/webp"];
+    expect(negotiateImageFormat("image/avif,image/webp,image/jpeg", formats)).toBe("image/avif");
+    expect(negotiateImageFormat("image/webp,image/jpeg", formats)).toBe("image/webp");
+    // The Accept header's q-values outrank the listed order.
+    expect(negotiateImageFormat("image/avif;q=0.5,image/webp", formats)).toBe("image/webp");
+    expect(negotiateImageFormat("image/avif;q=0,image/jpeg", formats, "image/png")).toBe(
+      "image/png",
+    );
   });
 
-  it("negotiateImageFormat falls back to JPEG", async () => {
+  it("negotiateImageFormat keeps the source type when no format is accepted", async () => {
     const { negotiateImageFormat } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(negotiateImageFormat("image/png,image/jpeg")).toBe("image/jpeg");
+    expect(negotiateImageFormat("image/png,image/jpeg", undefined, "image/png")).toBe("image/png");
+    expect(negotiateImageFormat("*/*", undefined, "image/jpeg")).toBe("image/jpeg");
+    // A WebP or AVIF source goes to a client that accepts neither as JPEG.
+    expect(negotiateImageFormat("image/png,image/jpeg", undefined, "image/webp")).toBe(
+      "image/jpeg",
+    );
+    expect(negotiateImageFormat(null, undefined, "image/avif")).toBe("image/jpeg");
     expect(negotiateImageFormat(null)).toBe("image/jpeg");
   });
 
@@ -31001,6 +31032,74 @@ describe("handleImageOptimization", () => {
     // Next.js's image policy at the default `images.minimumCacheTTL`.
     expect(response.headers.get("Cache-Control")).toBe("public, max-age=14400, must-revalidate");
     expect(response.headers.get("Vary")).toBe("Accept");
+  });
+
+  // Ported from Next.js: test/e2e/image-optimizer/util.ts ("should maintain
+  // png format for old Safari", and avif with `formats: ['image/avif', ...]`).
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/image-optimizer/util.ts
+  it("asks transformImage for the format images.formats and Accept select", async () => {
+    const { handleImageOptimization } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const formatFor = async (accept: string, formats?: string[]) => {
+      let format = "";
+      await handleImageOptimization(
+        new Request("http://localhost/_next/image?url=%2Fimg.png&w=640&q=75", {
+          headers: { Accept: accept },
+        }),
+        {
+          fetchAsset: async () => new Response(PNG, { headers: { "Content-Type": "image/png" } }),
+          transformImage: async (_body, options) => {
+            format = options.format;
+            return new Response("x", { headers: { "Content-Type": options.format } });
+          },
+        },
+        undefined,
+        { formats },
+      );
+      return format;
+    };
+    expect(await formatFor("image/avif,image/webp,*/*")).toBe("image/webp");
+    expect(await formatFor("image/avif,image/webp,*/*", ["image/avif", "image/webp"])).toBe(
+      "image/avif",
+    );
+    expect(await formatFor("image/png,*/*")).toBe("image/png");
+  });
+
+  // Ported from Next.js: test/e2e/image-optimizer/minimum-cache-ttl.test.ts and
+  // the optimized-response expectations in test/e2e/image-optimizer/util.ts
+  // (`public, max-age=${minimumCacheTTL}, must-revalidate`).
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/image-optimizer/util.ts
+  it("revalidates an optimized public image after images.minimumCacheTTL", async () => {
+    const { handleImageOptimization, markImageBuildAsset } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const optimize = (sourceCacheControl: string | null, isBuildAsset = false) =>
+      handleImageOptimization(
+        new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75", {
+          headers: { Accept: "image/webp" },
+        }),
+        {
+          fetchAsset: async () => {
+            const headers = new Headers({ "Content-Type": "image/jpeg" });
+            if (sourceCacheControl) headers.set("Cache-Control", sourceCacheControl);
+            const source = new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), { headers });
+            return isBuildAsset ? markImageBuildAsset(source) : source;
+          },
+          transformImage: async (_body, { format }) =>
+            new Response("x", { headers: { "Content-Type": format } }),
+        },
+        undefined,
+        { minimumCacheTTL: 5 },
+      );
+    expect((await optimize(null)).headers.get("Cache-Control")).toBe(
+      "public, max-age=5, must-revalidate",
+    );
+    expect((await optimize("public, max-age=600")).headers.get("Cache-Control")).toBe(
+      "public, max-age=600, must-revalidate",
+    );
+    expect((await optimize(null, true)).headers.get("Cache-Control")).toBe(
+      "public, max-age=31536000, immutable",
+    );
   });
 
   it("calls transformImage when provided", async () => {
@@ -31217,7 +31316,8 @@ describe("handleImageOptimization", () => {
     const response = await handleImageOptimization(request, handlers);
     expect(fetchCount).toBe(2);
     expect(response.status).toBe(400);
-    expect(await response.text()).toBe('"url" parameter is valid but image type is not allowed');
+    // Like Next.js, markup is no image at all.
+    expect(await response.text()).toBe("The requested resource isn't a valid image.");
   });
 
   it("returns 400 for backslash open redirect (/\\evil.com)", async () => {

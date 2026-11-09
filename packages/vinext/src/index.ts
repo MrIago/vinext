@@ -386,6 +386,11 @@ import {
 } from "./plugins/import-meta-url.js";
 import { createWorkerImageImportsPlugin } from "./plugins/worker-image-imports.js";
 import {
+  BLUR_QUALITY,
+  getStaticImageBlur,
+  type StaticImageBlur,
+} from "./build/static-image-blur.js";
+import {
   createWorkerServerOnlyImportsPlugin,
   SERVER_ONLY_SPECIFIER_RE,
 } from "./plugins/worker-server-only-imports.js";
@@ -1507,6 +1512,9 @@ const RESOLVED_IMAGE_ADAPTERS = VIRTUAL_PREFIX + VIRTUAL_IMAGE_ADAPTERS;
 /** Virtual module for composed instrumentation-client bootstrap. */
 const VIRTUAL_INSTRUMENTATION_CLIENT = "private-next-instrumentation-client";
 const RESOLVED_INSTRUMENTATION_CLIENT = `${VIRTUAL_PREFIX}${VIRTUAL_INSTRUMENTATION_CLIENT}.mjs`;
+/** What a static image import resolves to, beside its URL (Next.js' StaticImageData). */
+type StaticImageMeta = { width: number; height: number } & StaticImageBlur;
+
 /** Image file extensions handled by the vinext:image-imports plugin.
  *  Shared between the Rolldown hook filter and the transform handler regex. */
 const IMAGE_EXTS = "png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?";
@@ -1539,11 +1547,34 @@ const _appBrowserServerActionClientPath = resolveShimModulePath(
 const _appRscCombinedHandlerPath = resolveShimModulePath(_serverDir, "app-rsc-combined-handler");
 const _appRscHandlerPath = resolveShimModulePath(_serverDir, "app-rsc-handler");
 const _pagesClientAssetsPath = resolveShimModulePath(_serverDir, "pages-client-assets");
+const _imageLoaderFilePath = resolveShimModulePath(_shimsDir, "image-loader-file");
 // Source checkouts resolve to TypeScript and must stay in Vite's graph so tests
 // do not execute a stale dist build. Published packages resolve to emitted JS,
 // which Node can load natively outside the RSC transform graph.
 const _canExternalizeAppRscHandler =
   _appRscHandlerPath.endsWith(".js") && _appRscCombinedHandlerPath.endsWith(".js");
+
+/**
+ * Resolve the module behind `vinext/shims/image-loader-file`. Ported from
+ * Next.js's `images.loaderFile` normalization in server/config.ts: the file
+ * is used when `images.loader` is unset, "default" or "custom", and must exist.
+ */
+function resolveImageLoaderFile(images: NextConfig["images"], root: string): string {
+  const loaderFile = images?.loaderFile;
+  if (!loaderFile) return _imageLoaderFilePath;
+  const loader = images.loader ?? "default";
+  if (loader !== "default" && loader !== "custom") {
+    throw new Error(
+      `Specified images.loader property (${loader}) cannot be used with images.loaderFile property. Please set images.loader to "custom".`,
+    );
+  }
+  // path.join (not resolve), as in Next.js: "/loader.js" is project-relative.
+  const absolutePath = path.join(root, loaderFile);
+  if (!fs.existsSync(absolutePath)) {
+    throw new Error(`Specified images.loaderFile does not exist at "${absolutePath}".`);
+  }
+  return absolutePath;
+}
 
 function isValidExportIdentifier(name: string): boolean {
   return /^[$A-Z_a-z][$\w]*$/.test(name);
@@ -2351,7 +2382,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     );
   }
 
-  const imageImportDimCache = new Map<string, { width: number; height: number }>();
+  const imageImportDimCache = new Map<string, StaticImageMeta>();
   const staticImageAssets = new Map<string, { fileName: string; source: Buffer }>();
   const staticImageImportsByModule = new Map<string, Set<string>>();
   const writtenStaticImageFiles = new Set<string>();
@@ -3307,6 +3338,14 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         defines["process.env.__VINEXT_IMAGE_UNOPTIMIZED"] = JSON.stringify(
           String(nextConfig.images?.unoptimized === true),
         );
+        // images.loader / images.loaderFile modes the next/image shim validates
+        // against at render time (shims/image-props.ts, shims/image.tsx).
+        defines["process.env.__VINEXT_IMAGE_CUSTOM_LOADER"] = JSON.stringify(
+          String(nextConfig.images?.loader === "custom"),
+        );
+        defines["process.env.__VINEXT_IMAGE_LOADER_FILE"] = JSON.stringify(
+          String(Boolean(nextConfig.images?.loaderFile)),
+        );
         // Build ID — resolved from next.config generateBuildId() or random UUID.
         // Server entries read it, and it namespaces ISR cache keys so a
         // previous deploy's entries are never served. The real value is a
@@ -3584,6 +3623,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             typeof p.name === "string" &&
             (p.name === "nitro" || p.name.startsWith("nitro:")),
         );
+        // Only the Node.js server fetches remote image sources (with DNS
+        // pinning); Workers and Nitro keep rendering them as-is.
+        defines["process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION"] = JSON.stringify(
+          String(!hasCloudflarePlugin && !hasNitroPlugin),
+        );
 
         // Resolve PostCSS string plugin names that Vite can't handle.
         // Next.js projects commonly use array-form plugins like
@@ -3734,6 +3778,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           ...nextConfig.aliases,
           ...nextShimMap,
           "vinext/server/pages-client-assets": _pagesClientAssetsPath,
+          // shims/image-props.ts imports this slot for `images.loaderFile`.
+          // Like Next.js (which aliases next/dist/shared/lib/image-loader
+          // to the file), point it at the user's file, resolved against
+          // the project root; otherwise keep vinext's `undefined` default.
+          "vinext/shims/image-loader-file": resolveImageLoaderFile(nextConfig.images, root),
         };
         if (config.resolve) {
           // Vite retains the inline resolve object for server.restart(). Do not
@@ -5552,6 +5601,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   deviceSizes: nextConfig?.images?.deviceSizes,
                   imageSizes: nextConfig?.images?.imageSizes,
                   qualities: nextConfig?.images?.qualities,
+                  formats: nextConfig?.images?.formats,
+                  remotePatterns: nextConfig?.images?.remotePatterns,
+                  domains: nextConfig?.images?.domains,
+                  maximumRedirects: nextConfig?.images?.maximumRedirects,
+                  maximumDiskCacheSize: nextConfig?.images?.maximumDiskCacheSize,
                   localPatterns: nextConfig?.images?.localPatterns,
                   dangerouslyAllowSVG: nextConfig?.images?.dangerouslyAllowSVG,
                   dangerouslyAllowLocalIP: nextConfig?.images?.dangerouslyAllowLocalIP,
@@ -7665,6 +7719,13 @@ export const loadServerActionClient = ${
                       imageRequestUrl,
                       allowedWidths,
                       nextConfig.images?.qualities,
+                      {
+                        isDev: true,
+                        remote: {
+                          remotePatterns: nextConfig.images?.remotePatterns,
+                          domains: nextConfig.images?.domains,
+                        },
+                      },
                     );
                     return encodedLocation
                       ? new Response(null, {
@@ -8425,23 +8486,52 @@ export const loadServerActionClient = ${
         if (!id.startsWith("\0vinext-image-meta:")) return null;
         const imagePath = id.replace("\0vinext-image-meta:", "");
         this.addWatchFile(imagePath);
+        const isDev = this.environment.config.command === "serve";
 
         // Read from cache first
         const cache = imageImportDimCache;
-        let dims = cache.get(imagePath);
-        if (!dims) {
+        let meta = cache.get(imagePath);
+        if (!meta) {
+          // Like Next.js' next-image-loader: the dimensions, and a blur
+          // placeholder for still JPEG, PNG, WebP and AVIF images.
+          let buffer: Buffer | undefined;
+          let dims = { width: 0, height: 0 };
           try {
             const { imageSize } = await import("image-size");
-            const buffer = fs.readFileSync(imagePath);
+            buffer = fs.readFileSync(imagePath);
             const result = imageSize(buffer);
             dims = { width: result.width ?? 0, height: result.height ?? 0 };
-            cache.set(imagePath, dims);
           } catch {
-            dims = { width: 0, height: 0 };
+            buffer = undefined;
           }
+          let blur: StaticImageBlur = { blurWidth: 0, blurHeight: 0 };
+          if (buffer) {
+            let extension = path.extname(imagePath).slice(1).toLowerCase();
+            if (extension === "jpg") extension = "jpeg";
+            try {
+              blur = await getStaticImageBlur(buffer, extension, dims, {
+                isDev,
+                root: root ?? process.cwd(),
+              });
+            } catch (error) {
+              console.warn(`[vinext] Failed to make the blur placeholder of ${imagePath}:`, error);
+            }
+          }
+          meta = { ...dims, ...blur };
+          if (buffer) cache.set(imagePath, meta);
         }
 
-        return `export default ${JSON.stringify(dims)};`;
+        if (isDev && meta.blurWidth > 0) {
+          // As in `next dev`, the dev server makes the placeholder on request.
+          return [
+            `import url from ${JSON.stringify(imagePath + "?vinext-image-url")};`,
+            `const meta = ${JSON.stringify(meta)};`,
+            `meta.blurDataURL = ${JSON.stringify(`${nextConfig.basePath}/_next/image?`)} + ` +
+              `new URLSearchParams({ url, w: String(meta.blurWidth), q: "${BLUR_QUALITY}" });`,
+            "export default meta;",
+          ].join("\n");
+        }
+        return `export default ${JSON.stringify(meta)};`;
       },
 
       transform: {
@@ -8517,7 +8607,7 @@ export const loadServerActionClient = ${
             // 1. URL module. In dev it delegates to Vite's asset server; in a
             //    production build it returns a stable Next-shaped URL and the
             //    client build writes the registered source under static/media.
-            // 2. Meta import (we provide { width, height })
+            // 2. Meta import (we provide { width, height } and the blur placeholder)
             // Combined into a StaticImageData object.
             //
             // The binding is `var`, not `const`: the `import X` it replaces is a
@@ -8533,7 +8623,8 @@ export const loadServerActionClient = ${
             const replacement =
               `import ${urlVar} from ${JSON.stringify(absImagePath + "?vinext-image-url")};\n` +
               `import ${metaVar} from ${JSON.stringify(absImagePath + "?vinext-meta")};\n` +
-              `var ${varName} = { src: ${urlVar}, width: ${metaVar}.width, height: ${metaVar}.height };`;
+              `var ${varName} = { src: ${urlVar}, height: ${metaVar}.height, width: ${metaVar}.width, ` +
+              `blurDataURL: ${metaVar}.blurDataURL, blurWidth: ${metaVar}.blurWidth, blurHeight: ${metaVar}.blurHeight };`;
 
             s.overwrite(importNode.start, importNode.end, replacement);
             hasChanges = true;
@@ -8580,7 +8671,7 @@ export const loadServerActionClient = ${
           for (const outputPath of nextWrittenFiles) writtenStaticImageFiles.add(outputPath);
         },
       },
-    } as Plugin & { _dimCache: Map<string, { width: number; height: number }> },
+    } as Plugin & { _dimCache: Map<string, StaticImageMeta> },
     // Google Fonts import rewrite + self-hosting — see src/plugins/fonts.ts
     createGoogleFontsPlugin(_fontGoogleShimPath, _shimsDir),
     // Local font path resolution — see src/plugins/fonts.ts

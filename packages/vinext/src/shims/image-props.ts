@@ -12,10 +12,15 @@
  */
 import type React from "react";
 import type {
+  ImageLoader,
   ImageProps,
   ImgProps,
   StaticImport,
 } from "@vinext/types/next/upstream/dist/shared/lib/get-img-props";
+// The vinext plugin aliases this specifier to the user's `images.loaderFile`.
+// A namespace import, so a file without a default export reaches the
+// diagnostic in withConfiguredLoader instead of failing module linking.
+import * as imageLoaderFileModule from "vinext/shims/image-loader-file";
 import { getDeploymentId } from "../utils/deployment-id.js";
 import { hasRemoteMatch, isPrivateIp, type RemotePattern } from "./image-config.js";
 
@@ -80,6 +85,8 @@ export const __dangerouslyAllowSVG = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLO
  */
 const __dangerouslyAllowLocalIP = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP === "true";
 export const __globallyUnoptimized = process.env.__VINEXT_IMAGE_UNOPTIMIZED === "true";
+/** `images.loader: "custom"`: optimized images need a loader prop. */
+export const __customImageLoader = process.env.__VINEXT_IMAGE_CUSTOM_LOADER === "true";
 
 /**
  * Validate that a remote URL is allowed by the configured remote patterns.
@@ -145,6 +152,11 @@ export function validateRemoteUrl(src: string): { allowed: boolean; reason?: str
 export function sanitizeBlurDataURL(url: string): string | undefined {
   // Must be a data: image URL
   if (!url.startsWith("data:image/")) return undefined;
+  return sanitizeCssUrl(url);
+}
+
+/** A URL safe inside CSS `url("...")`, or undefined. */
+function sanitizeCssUrl(url: string): string | undefined {
   // Reject characters that can break out of CSS url():
   //   ) - closes url()
   //   ( - could open nested functions
@@ -153,6 +165,28 @@ export function sanitizeBlurDataURL(url: string): string | undefined {
   //   newlines - break CSS parsing
   if (/[)(}{\\'"\n\r]/.test(url)) return undefined;
   return url;
+}
+
+/** Whether the server optimizes remote sources (the Node.js server; not Workers). */
+const __remoteImagesOptimized = process.env.__VINEXT_IMAGE_REMOTE_OPTIMIZATION === "true";
+
+/**
+ * Whether `/_next/image` optimizes this remote src: the build serves from the
+ * Node.js server, which fetches remote sources safely, and images.remotePatterns
+ * (or images.domains) allows it. Next.js' default loader sends such a src
+ * through the endpoint; elsewhere vinext keeps rendering it as-is.
+ */
+export function isServerOptimizedRemoteUrl(src: string): boolean {
+  if (!__remoteImagesOptimized || !/^https?:\/\//i.test(src)) return false;
+  try {
+    const url = new URL(src);
+    return (
+      hasRemoteMatch(__imageDomains, __imageRemotePatterns, url) &&
+      (__dangerouslyAllowLocalIP || !isPrivateIp(url.hostname))
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -194,7 +228,14 @@ export function resolveImageSource(v: {
   width?: number | `${number}`;
   height?: number | `${number}`;
   blurDataURL?: string;
-}): { src: string; width?: number; height?: number; blurDataURL?: string } {
+}): {
+  src: string;
+  width?: number;
+  height?: number;
+  blurDataURL?: string;
+  blurWidth?: number;
+  blurHeight?: number;
+} {
   const staticData = typeof v.src === "object" && "default" in v.src ? v.src.default : v.src;
   const src = typeof staticData === "string" ? staticData : staticData.src;
   const sourceWidth = v.width ?? (typeof staticData === "object" ? staticData.width : undefined);
@@ -203,7 +244,115 @@ export function resolveImageSource(v: {
   const imgHeight = typeof sourceHeight === "string" ? Number(sourceHeight) : sourceHeight;
   const imgBlurDataURL =
     v.blurDataURL ?? (typeof staticData === "object" ? staticData.blurDataURL : undefined);
-  return { src, width: imgWidth, height: imgHeight, blurDataURL: imgBlurDataURL };
+  return {
+    src,
+    width: imgWidth,
+    height: imgHeight,
+    blurDataURL: imgBlurDataURL,
+    blurWidth: typeof staticData === "object" ? staticData.blurWidth : undefined,
+    blurHeight: typeof staticData === "object" ? staticData.blurHeight : undefined,
+  };
+}
+
+/**
+ * Next.js' blur placeholder: the blur image scaled up behind an SVG Gaussian
+ * blur, sized from the static import's blur size or the image's own size.
+ *
+ * Ported from Next.js: packages/next/src/shared/lib/image-blur-svg.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/image-blur-svg.ts
+ */
+function getImageBlurSvg({
+  widthInt,
+  heightInt,
+  blurWidth,
+  blurHeight,
+  blurDataURL,
+  objectFit,
+}: {
+  widthInt?: number;
+  heightInt?: number;
+  blurWidth?: number;
+  blurHeight?: number;
+  blurDataURL: string;
+  objectFit?: string;
+}): string {
+  const std = 20;
+  const svgWidth = blurWidth ? blurWidth * 40 : widthInt;
+  const svgHeight = blurHeight ? blurHeight * 40 : heightInt;
+  const viewBox = svgWidth && svgHeight ? `viewBox='0 0 ${svgWidth} ${svgHeight}'` : "";
+  const preserveAspectRatio = viewBox
+    ? "none"
+    : objectFit === "contain"
+      ? "xMidYMid"
+      : objectFit === "cover"
+        ? "xMidYMid slice"
+        : "none";
+  return `%3Csvg xmlns='http://www.w3.org/2000/svg' ${viewBox}%3E%3Cfilter id='b' color-interpolation-filters='sRGB'%3E%3CfeGaussianBlur stdDeviation='${std}'/%3E%3CfeColorMatrix values='1 0 0 0 0 0 1 0 0 0 0 0 1 0 0 0 0 0 100 -1' result='s'/%3E%3CfeFlood x='0' y='0' width='100%25' height='100%25'/%3E%3CfeComposite operator='out' in='s'/%3E%3CfeComposite in2='SourceGraphic'/%3E%3CfeGaussianBlur stdDeviation='${std}'/%3E%3C/filter%3E%3Cimage width='100%25' height='100%25' x='0' y='0' preserveAspectRatio='${preserveAspectRatio}' style='filter: url(%23b);' href='${blurDataURL}'/%3E%3C/svg%3E`;
+}
+
+const INVALID_BACKGROUND_SIZE_VALUES = new Set(["-moz-initial", "fill", "none", "scale-down"]);
+
+/**
+ * The placeholder style Next.js' getImgProps gives an image still loading:
+ * the blur SVG for `placeholder="blur"` (in development, a `/_next/image`
+ * blur URL from a static import as-is), or a `data:image/` placeholder as-is,
+ * sized and positioned like the image's object-fit and object-position.
+ * Undefined once loaded, without a placeholder, or for an unsafe URL.
+ */
+export function getBlurPlaceholderStyle({
+  placeholder,
+  blurDataURL,
+  blurWidth,
+  blurHeight,
+  width,
+  height,
+  style,
+}: {
+  placeholder?: string;
+  blurDataURL?: string;
+  blurWidth?: number;
+  blurHeight?: number;
+  width?: number;
+  height?: number;
+  style?: React.CSSProperties;
+}): React.CSSProperties | undefined {
+  let backgroundImage: string | undefined;
+  if (placeholder === "blur") {
+    const devBlurURL =
+      __isDev && blurDataURL?.startsWith("/") && !blurDataURL.startsWith("//")
+        ? sanitizeCssUrl(blurDataURL)
+        : undefined;
+    const blur = devBlurURL ?? (blurDataURL ? sanitizeBlurDataURL(blurDataURL) : undefined);
+    if (!blur) return undefined;
+    backgroundImage = devBlurURL
+      ? `url("${devBlurURL}")`
+      : `url("data:image/svg+xml;charset=utf-8,${getImageBlurSvg({
+          widthInt: width,
+          heightInt: height,
+          blurWidth,
+          blurHeight,
+          blurDataURL: blur,
+          objectFit: style?.objectFit,
+        })}")`;
+  } else if (placeholder?.startsWith("data:image/")) {
+    const dataURL = sanitizeBlurDataURL(placeholder);
+    if (!dataURL) return undefined;
+    backgroundImage = `url("${dataURL}")`;
+  } else {
+    return undefined;
+  }
+  const objectFit = style?.objectFit;
+  return {
+    backgroundSize:
+      objectFit && !INVALID_BACKGROUND_SIZE_VALUES.has(objectFit)
+        ? objectFit
+        : objectFit === "fill"
+          ? "100% 100%"
+          : "cover",
+    backgroundPosition: (style?.objectPosition as string | undefined) || "50% 50%",
+    backgroundRepeat: "no-repeat",
+    backgroundImage,
+  };
 }
 
 /**
@@ -308,12 +457,18 @@ function getImageWidths(width: number): number[] {
 }
 
 export function generateImageAttributes(
+  resolveUrl: (src: string, width: number, quality?: number) => string,
   src: string,
-  width: number,
-  quality: number = 75,
+  width: number | undefined,
+  quality: number | undefined,
   sizes?: string,
-): { src: string; srcSet: string } {
-  if (sizes) {
+  legacyLayout?: string,
+): { src: string; srcSet: string; sizes?: string } {
+  // next/legacy/image (client/legacy/image.tsx getWidths): "responsive" and
+  // "fill" layouts always get `w` candidates, while "fixed" and "intrinsic"
+  // keep 1x/2x candidates and ignore `sizes` when choosing widths.
+  const legacyFluid = legacyLayout === "responsive" || legacyLayout === "fill";
+  if (sizes && (!legacyLayout || legacyFluid)) {
     const viewportWidthPattern = /(^|\s)(1?\d?\d)vw/g;
     const viewportPercentages = Array.from(sizes.matchAll(viewportWidthPattern), (match) =>
       Number.parseInt(match[2], 10),
@@ -324,33 +479,113 @@ export function generateImageAttributes(
         : 0;
     const candidates = ALL_IMAGE_WIDTHS.filter((candidateWidth) => candidateWidth >= minimumWidth);
     return {
-      src: imageOptimizationUrl(src, candidates[candidates.length - 1], quality),
+      src: resolveUrl(src, candidates[candidates.length - 1], quality),
       srcSet: candidates
-        .map(
-          (candidateWidth) =>
-            `${imageOptimizationUrl(src, candidateWidth, quality)} ${candidateWidth}w`,
-        )
+        .map((candidateWidth) => `${resolveUrl(src, candidateWidth, quality)} ${candidateWidth}w`)
         .join(", "),
+      sizes,
+    };
+  }
+
+  // No intrinsic width (e.g. `fill`): Next.js's getWidths() offers every
+  // device size and defaults `sizes` to 100vw.
+  if (width === undefined || legacyFluid) {
+    return {
+      src: resolveUrl(src, RESPONSIVE_WIDTHS[RESPONSIVE_WIDTHS.length - 1], quality),
+      srcSet: RESPONSIVE_WIDTHS.map(
+        (candidateWidth) => `${resolveUrl(src, candidateWidth, quality)} ${candidateWidth}w`,
+      ).join(", "),
+      sizes: "100vw",
     };
   }
 
   const widths = getImageWidths(width);
   return {
-    src: imageOptimizationUrl(src, widths[widths.length - 1], quality),
+    src: resolveUrl(src, widths[widths.length - 1], quality),
     srcSet: widths
-      .map(
-        (candidateWidth, index) =>
-          `${imageOptimizationUrl(src, candidateWidth, quality)} ${index + 1}x`,
-      )
+      .map((candidateWidth, index) => `${resolveUrl(src, candidateWidth, quality)} ${index + 1}x`)
       .join(", "),
+    sizes,
   };
+}
+
+/**
+ * Same per-width srcSet treatment as the built-in loader, but routed
+ * through a user-supplied loader (the `loader` prop or `images.loaderFile`)
+ * instead of the built-in /_next/image endpoint. Unlike the built-in loader,
+ * `quality` is passed through as given, including `undefined`, so a custom
+ * loader's own default (if any) applies, matching Next.js: the forced
+ * quality=75 default is specific to the built-in loader.
+ */
+export function generateLoaderAttributes(
+  loader: ImageLoader,
+  src: string,
+  width: number | undefined,
+  quality: number | undefined,
+  sizes?: string,
+  legacyLayout?: string,
+): { src: string; srcSet: string; sizes?: string } {
+  return generateImageAttributes(
+    (loaderSrc, loaderWidth, loaderQuality) =>
+      loader({ src: loaderSrc, width: loaderWidth, quality: loaderQuality }),
+    src,
+    width,
+    quality,
+    sizes,
+    legacyLayout,
+  );
+}
+
+/**
+ * Internal prop set only by shims/legacy-image.tsx so custom-loader srcSet
+ * candidates follow next/legacy/image's layout rules instead of next/image's.
+ */
+export type LegacyLayoutProp = { __vinextLegacyLayout?: string };
+
+/** Internal: also thrown by shims/image-external.tsx for next/image. */
+export function missingLoaderError(src: string): Error {
+  return new Error(
+    `Image with src "${src}" is missing "loader" prop.` +
+      "\nRead more: https://nextjs.org/docs/messages/next-image-missing-loader",
+  );
+}
+
+const configuredImageLoader: ImageLoader | undefined = imageLoaderFileModule.default;
+/** `images.loaderFile` is set, so `configuredImageLoader` must be its default export. */
+const __hasImageLoaderFile = process.env.__VINEXT_IMAGE_LOADER_FILE === "true";
+
+/**
+ * next/image only (next/legacy/image never evaluates `images.loaderFile`):
+ * fall back to the configured loader file when no `loader` prop is given.
+ * Ported from the loader checks at the top of Next.js's getImgProps.
+ */
+export function withConfiguredLoader(props: ImageProps): ImageProps {
+  if (__hasImageLoaderFile && typeof configuredImageLoader === "undefined") {
+    throw new Error(
+      "images.loaderFile detected but the file is missing default export.\nRead more: https://nextjs.org/docs/messages/invalid-images-config",
+    );
+  }
+  const loader = props.loader || configuredImageLoader;
+  if (!loader && __customImageLoader) {
+    const { src } = props;
+    throw missingLoaderError(
+      typeof src === "string" ? src : ("default" in src ? src.default : src).src,
+    );
+  }
+  return loader === props.loader ? props : { ...props, loader };
+}
+
+/** Sources Next.js always treats as unoptimized (empty, data: and blob:). */
+export function isInlineSrc(src: string): boolean {
+  return !src || src.startsWith("data:") || src.startsWith("blob:");
 }
 
 /**
  * getImageProps — for advanced use cases (picture elements, background images).
  * Returns the props that would be passed to the underlying <img> element.
  */
-export function getImageProps(props: ImageProps): { props: ImgProps } {
+export function getImageProps(imagePropsInput: ImageProps): { props: ImgProps } {
+  const props = withConfiguredLoader(imagePropsInput);
   const {
     src: srcProp,
     alt,
@@ -373,29 +608,31 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     loading,
     ...rest
   } = props;
+  delete (rest as { srcSet?: unknown }).srcSet;
 
   const {
     src,
     width: imgWidth,
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
+    blurWidth,
+    blurHeight,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL: blurDataURLProp });
   const shouldPreload = _preload === true || priority === true;
 
-  if (_unoptimized === true || __globallyUnoptimized) {
+  if (_unoptimized === true || __globallyUnoptimized || isInlineSrc(src)) {
     // As in the component path, unoptimized images never reach the server-side
     // optimizer, so remote URL validation is intentionally unnecessary.
     const renderedSrc = overrideSrc || src;
-    const sanitizedBlurURL = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-    const blurStyle =
-      placeholder === "blur" && sanitizedBlurURL
-        ? {
-            backgroundImage: `url(${sanitizedBlurURL})`,
-            backgroundSize: "cover",
-            backgroundRepeat: "no-repeat" as const,
-            backgroundPosition: "center" as const,
-          }
-        : undefined;
+    const blurStyle = getBlurPlaceholderStyle({
+      placeholder,
+      blurDataURL: imgBlurDataURL,
+      blurWidth,
+      blurHeight,
+      width: imgWidth,
+      height: imgHeight,
+      style,
+    });
     const imageProps: ImgProps = {
       src: renderedSrc,
       alt,
@@ -413,9 +650,17 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     return { props: Object.assign(imageProps, { "data-nimg": fill ? "fill" : "1" }) };
   }
 
-  // Validate remote URLs against configured patterns
+  // A custom loader (the `loader` prop, or `images.loaderFile` from
+  // next.config.js when no per-image prop was given) gets `quality` as given,
+  // including `undefined` — only the built-in /_next/image loader below
+  // defaults it to 75.
+  const imgQuality = parseImageQuality(_quality);
+
+  // Validate remote URLs against configured patterns. As in the component
+  // path (and Next.js's default loader), a custom loader owns the URL, so
+  // remotePatterns don't apply to it.
   let blockedInProd = false;
-  if (isRemoteUrl(src)) {
+  if (!loader && isRemoteUrl(src)) {
     const validation = validateRemoteUrl(src);
     if (!validation.allowed) {
       if (__isDev) {
@@ -427,47 +672,55 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     }
   }
 
-  // Resolve src through custom loader if provided
-  const imgQuality = parseImageQuality(_quality) ?? 75;
-  const resolvedSrc = blockedInProd
-    ? ""
-    : loader
-      ? loader({ src, width: imgWidth ?? 0, quality: imgQuality })
-      : src;
-
-  // For local images (no loader, not remote), route through optimization endpoint.
-  // When `unoptimized` is true, bypass the endpoint entirely (Next.js compat).
-  // SVG sources auto-skip unless dangerouslyAllowSVG is enabled.
-  const isSvg = isSvgUrl(resolvedSrc);
-  const skipOpt =
-    (isSvg && !__dangerouslyAllowSVG) || blockedInProd || !!loader || isRemoteUrl(resolvedSrc);
-  const optimizedAttributes =
-    imgWidth && !fill && !skipOpt
-      ? generateImageAttributes(resolvedSrc, imgWidth, imgQuality, sizes)
-      : null;
-  const optimizedSrc = skipOpt
-    ? resolvedSrc
-    : optimizedAttributes
-      ? optimizedAttributes.src
-      : imageOptimizationUrl(resolvedSrc, RESPONSIVE_WIDTHS[0], imgQuality);
-
-  // Build srcSet for local images — each width points to /_next/image
-  const srcSet = optimizedAttributes?.srcSet;
+  let optimizedSrc: string;
+  let srcSet: string | undefined;
+  if (blockedInProd) {
+    optimizedSrc = "";
+    srcSet = undefined;
+  } else if (loader) {
+    const loaderAttributes = generateLoaderAttributes(
+      loader,
+      src,
+      fill ? undefined : imgWidth,
+      imgQuality,
+      sizes,
+    );
+    optimizedSrc = overrideSrc || loaderAttributes.src;
+    srcSet = loaderAttributes.srcSet;
+  } else {
+    // For local images (no loader, not remote), route through the
+    // optimization endpoint. When `unoptimized` is true, bypass the
+    // endpoint entirely (Next.js compat). SVG sources auto-skip unless
+    // dangerouslyAllowSVG is enabled.
+    const resolvedQuality = imgQuality ?? 75;
+    const isSvg = isSvgUrl(src);
+    const skipOpt =
+      (isSvg && !__dangerouslyAllowSVG) || (isRemoteUrl(src) && !isServerOptimizedRemoteUrl(src));
+    const optimizedAttributes =
+      imgWidth && !fill && !skipOpt
+        ? generateImageAttributes(imageOptimizationUrl, src, imgWidth, resolvedQuality, sizes)
+        : null;
+    optimizedSrc = skipOpt
+      ? src
+      : optimizedAttributes
+        ? optimizedAttributes.src
+        : imageOptimizationUrl(src, RESPONSIVE_WIDTHS[0], resolvedQuality);
+    // Build srcSet for local images — each width points to /_next/image
+    srcSet = optimizedAttributes?.srcSet;
+  }
 
   // Blur placeholder styles — sanitize to prevent CSS injection
-  const sanitizedBlurURL = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-  const blurStyle =
-    placeholder === "blur" && sanitizedBlurURL
-      ? {
-          backgroundImage: `url(${sanitizedBlurURL})`,
-          backgroundSize: "cover",
-          backgroundRepeat: "no-repeat" as const,
-          backgroundPosition: "center" as const,
-        }
-      : undefined;
+  const blurStyle = getBlurPlaceholderStyle({
+    placeholder,
+    blurDataURL: imgBlurDataURL,
+    blurWidth,
+    blurHeight,
+    width: imgWidth,
+    height: imgHeight,
+    style,
+  });
 
   const imageProps: ImgProps = {
-    src: optimizedSrc,
     alt,
     width: fill ? undefined : imgWidth,
     height: fill ? undefined : imgHeight,
@@ -476,6 +729,9 @@ export function getImageProps(props: ImageProps): { props: ImgProps } {
     decoding: "async" as const,
     srcSet,
     sizes: sizes ?? (fill ? "100vw" : undefined),
+    // After srcSet/sizes, matching Next.js's prop order (Safari fetches `src`
+    // early if React applies it first).
+    src: optimizedSrc,
     className,
     style: fill ? getFillStyle(style, blurStyle) : { ...blurStyle, ...style },
     ...rest,

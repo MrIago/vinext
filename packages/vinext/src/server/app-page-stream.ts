@@ -333,6 +333,8 @@ type AppPageRscErrorTracker = {
    * loses server-side markers such as generateMetadata()'s.
    */
   getCapturedSpecialErrors: (error: unknown) => readonly unknown[];
+  /** Every special error the RSC render threw, in the order it threw them. */
+  getAllCapturedSpecialErrors: () => readonly unknown[];
   isCapturedError: (error: unknown) => boolean;
   onRenderError: (error: unknown, requestInfo: unknown, errorContext: unknown) => unknown;
 };
@@ -538,6 +540,9 @@ export function createAppPageRscErrorTracker(
     getCapturedSpecialErrors(error) {
       const digest = getNextErrorDigest(error);
       return (digest !== null && specialErrorsByDigest.get(digest)) || [];
+    },
+    getAllCapturedSpecialErrors() {
+      return [...specialErrorsByDigest.values()].flat();
     },
     isCapturedError(error) {
       if (capturedErrors.has(error)) return true;

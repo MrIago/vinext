@@ -3609,7 +3609,9 @@ describe("ISR storage of a page's special error", () => {
       });
     });
 
-    it("stores a special error a Suspense boundary caught as a 200", async () => {
+    // Like Next.js's ISR, the entry keeps the status of a special error a
+    // Suspense boundary caught (vercel/next.js#99078).
+    it("stores the status of a special error a Suspense boundary caught", async () => {
       let cancelled = false;
       const { common, response } = await renderRscMiss({
         flightError: notFoundError,
@@ -3625,7 +3627,7 @@ describe("ISR storage of a page's special error", () => {
       await Promise.all(common.waitUntilPromises);
       expect(cancelled).toBe(true);
       expect(readStoredEntries(common.isrSet)).toEqual({
-        "rsc:/posts/post": { html: "", policy, rsc: "page-flight-with-digest", status: 200 },
+        "rsc:/posts/post": { html: "", policy, rsc: "page-flight-with-digest", status: 404 },
       });
     });
 

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vite-plus/test";
+import { afterAll, beforeAll, describe, it, expect } from "vite-plus/test";
 import path from "node:path";
 import vm from "node:vm";
 import vinext from "../packages/vinext/src/index.js";
@@ -413,4 +413,179 @@ describe("vinext:image-imports — transform", () => {
     );
     expect(() => vm.runInNewContext(exec)).not.toThrow();
   });
+});
+
+// ── blur placeholder ──────────────────────────────────────────
+// sharp is no dependency of vinext; the workspace has it in pnpm's virtual store.
+const SHARP_ROOT = path.resolve(import.meta.dirname, "../node_modules/.pnpm");
+
+// Ported from Next.js: test/unit/next-image-loader/get-blur-image.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/unit/next-image-loader/get-blur-image.test.ts
+describe("static image blur placeholder", () => {
+  it("returns an image for jpg", async () => {
+    const { getStaticImageBlur } =
+      await import("../packages/vinext/src/build/static-image-blur.js");
+    const buffer = await import("node:fs/promises").then((fs) =>
+      fs.readFile(path.join(IMAGES_DIR, "test-400x400.jpg")),
+    );
+    const result = await getStaticImageBlur(
+      buffer,
+      "jpeg",
+      { width: 400, height: 400 },
+      {
+        isDev: false,
+        root: SHARP_ROOT,
+      },
+    );
+    expect(result.blurWidth).toBe(8);
+    expect(result.blurHeight).toBe(8);
+    expect(result.blurDataURL).toMatch(/^data:image\/jpeg;base64,[A-Za-z0-9+/]+=*$/);
+  });
+
+  it("returns undefined for animated webp", async () => {
+    const { getStaticImageBlur } =
+      await import("../packages/vinext/src/build/static-image-blur.js");
+    const buffer = await import("node:fs/promises").then((fs) =>
+      fs.readFile(path.join(IMAGES_DIR, "animated.webp")),
+    );
+    const result = await getStaticImageBlur(
+      buffer,
+      "webp",
+      { width: 400, height: 400 },
+      {
+        isDev: false,
+        root: SHARP_ROOT,
+      },
+    );
+    expect(result.blurDataURL).toBeUndefined();
+    expect(result).toMatchObject({ blurWidth: 0, blurHeight: 0 });
+  });
+
+  it("shrinks the longer side to 8px, keeping at least 1px", async () => {
+    const { getStaticImageBlur } =
+      await import("../packages/vinext/src/build/static-image-blur.js");
+    const buffer = await import("node:fs/promises").then((fs) => fs.readFile(PNG_PATH));
+    const wide = await getStaticImageBlur(
+      buffer,
+      "png",
+      { width: 4, height: 3 },
+      {
+        isDev: true,
+        root: SHARP_ROOT,
+      },
+    );
+    expect(wide).toEqual({ blurWidth: 8, blurHeight: 6 });
+    const tall = await getStaticImageBlur(
+      buffer,
+      "png",
+      { width: 10, height: 1000 },
+      {
+        isDev: true,
+        root: SHARP_ROOT,
+      },
+    );
+    expect(tall).toEqual({ blurWidth: 1, blurHeight: 8 });
+    // SVG and GIF get none, as in Next.js.
+    expect(
+      await getStaticImageBlur(
+        buffer,
+        "gif",
+        { width: 4, height: 3 },
+        {
+          isDev: false,
+          root: SHARP_ROOT,
+        },
+      ),
+    ).toEqual({ blurWidth: 0, blurHeight: 0 });
+  });
+});
+
+// Ported from Next.js: packages/next/src/build/webpack/loaders/next-image-loader/index.ts
+// (StaticImageData carries blurDataURL, blurWidth and blurHeight) as checked by
+// test/integration/next-image-new/default/test/static.test.ts.
+// https://github.com/vercel/next.js/blob/canary/test/integration/next-image-new/default/test/static.test.ts
+describe("static image imports carry the blur placeholder", () => {
+  let fixtureDir: string;
+  const fsp = () => import("node:fs/promises");
+
+  beforeAll(async () => {
+    const fs = await fsp();
+    const os = await import("node:os");
+    fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-static-blur-"));
+    // An app that installed sharp: the workspace's packages plus sharp.
+    const workspaceNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    await fs.mkdir(path.join(fixtureDir, "node_modules"));
+    for (const name of await fs.readdir(workspaceNodeModules)) {
+      await fs.symlink(
+        path.join(workspaceNodeModules, name),
+        path.join(fixtureDir, "node_modules", name),
+      );
+    }
+    await fs.symlink(
+      await fs.realpath(path.join(SHARP_ROOT, "node_modules", "sharp")),
+      path.join(fixtureDir, "node_modules", "sharp"),
+    );
+    await fs.mkdir(path.join(fixtureDir, "pages"));
+    await fs.copyFile(
+      path.join(IMAGES_DIR, "test-400x400.jpg"),
+      path.join(fixtureDir, "pages", "photo.jpg"),
+    );
+    await fs.writeFile(
+      path.join(fixtureDir, "pages", "index.jsx"),
+      'import photo from "./photo.jpg";\n' +
+        "export default function Page() {\n" +
+        '  return <pre id="photo">{JSON.stringify(photo)}</pre>;\n}\n',
+    );
+  }, 60000);
+
+  afterAll(async () => {
+    await (await fsp()).rm(fixtureDir, { recursive: true, force: true });
+  });
+
+  it("points the dev blur at the image endpoint, like next dev", async () => {
+    const { startFixtureServer } = await import("./helpers.js");
+    const { server, baseUrl } = await startFixtureServer(fixtureDir, { appDir: null });
+    try {
+      const html = await (await fetch(`${baseUrl}/`)).text();
+      const json = html
+        .match(/<pre id="photo">([^<]+)<\/pre>/)?.[1]
+        ?.replaceAll("&quot;", '"')
+        .replaceAll("&amp;", "&");
+      const photo = JSON.parse(json!);
+      expect(photo).toMatchObject({ width: 400, height: 400, blurWidth: 8, blurHeight: 8 });
+      const blur = new URL(photo.blurDataURL, baseUrl);
+      expect(blur.pathname).toBe("/_next/image");
+      expect(blur.searchParams.get("url")).toBe(photo.src);
+      expect(blur.searchParams.get("w")).toBe("8");
+      expect(blur.searchParams.get("q")).toBe("70");
+    } finally {
+      await server.close();
+    }
+  }, 60000);
+
+  it("inlines the blur as a data URL in a build", async () => {
+    const fs = await fsp();
+    const { build } = await import("vite-plus");
+    const outDir = path.join(fixtureDir, "dist", "server");
+    await build({
+      root: fixtureDir,
+      configFile: false,
+      plugins: [vinext({ disableAppRouter: true })],
+      logLevel: "silent",
+      build: {
+        outDir,
+        ssr: "virtual:vinext-server-entry",
+        rolldownOptions: { output: { entryFileNames: "entry.js" } },
+      },
+    });
+    let bundle = "";
+    for (const file of await fs.readdir(outDir, { recursive: true })) {
+      if (String(file).endsWith(".js"))
+        bundle += await fs.readFile(path.join(outDir, String(file)), "utf8");
+    }
+    // The bundler inlines the meta module, so its keys come out unquoted.
+    expect(bundle).toMatch(
+      /blurDataURL"?:\s*["'`]data:image\/jpeg;base64,[A-Za-z0-9+/=]+["'`],\s*"?blurWidth"?:\s*8,\s*"?blurHeight"?:\s*8/,
+    );
+  }, 120000);
 });
