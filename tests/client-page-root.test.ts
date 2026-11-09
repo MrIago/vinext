@@ -725,6 +725,50 @@ describe("ClientPageRoot in the browser", () => {
     }
   });
 
+  // Ported from Next.js: test/e2e/app-dir/client-params-shallow-routing
+  // (vercel/next.js#99611). With Cache Components the page's searchParams
+  // promise is rebuilt whenever the URL's query changes, including on a
+  // shallow history.pushState/replaceState. It must already read as
+  // fulfilled, or use() suspends and the nearest fallback hides the page.
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/client-params-shallow-routing/client-params-shallow-routing.test.ts
+  it("does not suspend a client page's use(searchParams) with Cache Components", async () => {
+    vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
+    try {
+      await withBrowserModules(async (modules) => {
+        const { renderToString } = await import("react-dom/server");
+        const snapshot = modules.navigation.createClientNavigationRenderSnapshot(
+          "http://localhost/feed?q=typed",
+          {},
+          "/feed?q=typed",
+        );
+        modules.navigation.activateNavigationSnapshot();
+        const Context = modules.navigation.getClientNavigationRenderContext();
+        if (!Context) throw new Error("Expected client navigation render context");
+
+        // renderToString never waits: a suspending page renders the fallback.
+        const html = renderToString(
+          React.createElement(
+            React.Suspense,
+            { fallback: "fallback" },
+            React.createElement(
+              Context.Provider,
+              { value: snapshot },
+              React.createElement(modules.ClientPageRoot, {
+                Component: QueryPage as React.ComponentType<Record<string, unknown>>,
+                pageProps: { params: {} },
+              }),
+            ),
+          ),
+        );
+
+        expect(html).not.toContain("fallback");
+        expect(html).toContain("q&quot;:&quot;typed");
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("keeps a force-static page's query empty during a navigation", async () => {
     // SSR renders force-static pages with an empty query, and so does Next.js
     // in the browser, whatever the destination URL.
