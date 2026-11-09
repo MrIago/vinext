@@ -4001,6 +4001,8 @@ describe("fetch cache (extended fetch with next options)", () => {
     const { withFetchCache } = await import("../packages/vinext/src/shims/fetch-cache.js");
     const { setCacheHandler, MemoryCacheHandler } =
       await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
 
     // Fresh cache handler for isolation
     setCacheHandler(new MemoryCacheHandler());
@@ -4013,43 +4015,51 @@ describe("fetch cache (extended fetch with next options)", () => {
 
     const cleanup = withFetchCache();
     try {
-      const resp1 = await fetch(`${mockServerUrl}/swr`, {
-        next: { revalidate: 1 },
-      });
-      const data1 = await resp1.json();
-      expect(data1.count).toBe(1);
-      expect(fetchCallCount).toBe(1);
+      // An ordinary App Router request serves the stale entry and refetches
+      // it in the background, like Next.js's patch-fetch. Outside any request
+      // scope vinext refreshes in the foreground, as the function caches do.
+      await runWithRequestContext(
+        createRequestContext({ unstableCacheRevalidation: "background" }),
+        async () => {
+          const resp1 = await fetch(`${mockServerUrl}/swr`, {
+            next: { revalidate: 1 },
+          });
+          const data1 = await resp1.json();
+          expect(data1.count).toBe(1);
+          expect(fetchCallCount).toBe(1);
 
-      // Advance time past the revalidate window so the entry becomes stale.
-      now += 2000;
+          // Advance time past the revalidate window so the entry becomes stale.
+          now += 2000;
 
-      // Second fetch returns stale cached value but triggers background refetch.
-      const resp2 = await fetch(`${mockServerUrl}/swr`, {
-        next: { revalidate: 1 },
-      });
-      const data2 = await resp2.json();
-      expect(data2.count).toBe(1);
+          // Second fetch returns stale cached value but triggers background refetch.
+          const resp2 = await fetch(`${mockServerUrl}/swr`, {
+            next: { revalidate: 1 },
+          });
+          const data2 = await resp2.json();
+          expect(data2.count).toBe(1);
 
-      // Wait for the background revalidation fetch to hit the network.
-      await new Promise<void>((resolve, reject) => {
-        const start = originalNow();
-        const tick = () => {
-          if (fetchCallCount >= 2) return resolve();
-          if (originalNow() - start > 1000) {
-            return reject(new Error("timed out waiting for background revalidation"));
-          }
-          setTimeout(tick, 10);
-        };
-        tick();
-      });
+          // Wait for the background revalidation fetch to hit the network.
+          await new Promise<void>((resolve, reject) => {
+            const start = originalNow();
+            const tick = () => {
+              if (fetchCallCount >= 2) return resolve();
+              if (originalNow() - start > 1000) {
+                return reject(new Error("timed out waiting for background revalidation"));
+              }
+              setTimeout(tick, 10);
+            };
+            tick();
+          });
 
-      // Third fetch should read the refreshed cache value.
-      const resp3 = await fetch(`${mockServerUrl}/swr`, {
-        next: { revalidate: 1 },
-      });
-      const data3 = await resp3.json();
-      expect(data3.count).toBe(2);
-      expect(fetchCallCount).toBe(2);
+          // Third fetch should read the refreshed cache value.
+          const resp3 = await fetch(`${mockServerUrl}/swr`, {
+            next: { revalidate: 1 },
+          });
+          const data3 = await resp3.json();
+          expect(data3.count).toBe(2);
+          expect(fetchCallCount).toBe(2);
+        },
+      );
     } finally {
       cleanup();
       setCacheHandler(new MemoryCacheHandler());
