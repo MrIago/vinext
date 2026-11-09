@@ -102,6 +102,11 @@ export type ImageConfig = {
   contentDispositionType?: "inline" | "attachment";
   /** Content-Security-Policy header value. Default: "script-src 'none'; frame-src 'none'; sandbox;" */
   contentSecurityPolicy?: string;
+  /**
+   * Output formats the optimizer may choose from the Accept header, in
+   * preference order. Default: ["image/webp"], as in Next.js.
+   */
+  formats?: string[];
   /** Least max-age, in seconds, of an image served as-is. Default: 14400. */
   minimumCacheTTL?: number;
   /**
@@ -438,15 +443,55 @@ export function parseImageParams(
   return { imageUrl: normalizedUrl, width, quality };
 }
 
+/** Next.js's default `images.formats`. */
+export const DEFAULT_IMAGE_FORMATS: readonly string[] = ["image/webp"];
+
+/** The q-value an Accept header gives a media type, or 0 when it names none. */
+function acceptQuality(acceptHeader: string, mediaType: string): number {
+  let best = 0;
+  for (const range of acceptHeader.split(",")) {
+    const [name, ...params] = range.split(";");
+    if (name.trim().toLowerCase() !== mediaType) continue;
+    let quality = 1;
+    for (const param of params) {
+      const [key, value] = param.split("=", 2);
+      if (key.trim().toLowerCase() === "q") quality = Number.parseFloat(value ?? "");
+    }
+    if (Number.isFinite(quality)) best = Math.max(best, quality);
+  }
+  return best;
+}
+
 /**
- * Negotiate the best output format based on the Accept header.
- * Returns an IANA media type.
+ * Negotiate the output format like Next.js: the `images.formats` entry the
+ * Accept header prefers (listed order breaks ties), else the source's own
+ * type, with a WebP or AVIF source sent as JPEG to a client that accepts
+ * neither. Next.js only names an `images.formats` entry the Accept header
+ * spells out, so a wildcard alone selects none. Returns an IANA media type.
+ *
+ * Ported from Next.js: packages/next/src/server/image-optimizer.ts
+ * (getSupportedMimeType) and image-optimizer/transform.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/image-optimizer/transform.ts
  */
-export function negotiateImageFormat(acceptHeader: string | null): string {
-  if (!acceptHeader) return "image/jpeg";
-  if (acceptHeader.includes("image/avif")) return "image/avif";
-  if (acceptHeader.includes("image/webp")) return "image/webp";
-  return "image/jpeg";
+export function negotiateImageFormat(
+  acceptHeader: string | null,
+  formats: readonly string[] = DEFAULT_IMAGE_FORMATS,
+  sourceMediaType: string | null = null,
+): string {
+  let selected = "";
+  let selectedQuality = 0;
+  for (const format of formats) {
+    const quality = acceptHeader ? acceptQuality(acceptHeader, format) : 0;
+    if (quality > selectedQuality) {
+      selected = format;
+      selectedQuality = quality;
+    }
+  }
+  if (selected) return selected;
+  if (!sourceMediaType || sourceMediaType === "image/webp" || sourceMediaType === "image/avif") {
+    return "image/jpeg";
+  }
+  return sourceMediaType;
 }
 
 /**
@@ -925,9 +970,6 @@ export async function handleImageOptimization(
     return failedImageSourceResponse(source);
   }
 
-  // Negotiate output format from Accept header
-  const format = negotiateImageFormat(request.headers.get("Accept"));
-
   // Block unsafe Content-Types (e.g., SVG which can contain embedded scripts).
   // Check the source Content-Type before any processing. SVG is only allowed
   // when dangerouslyAllowSVG is explicitly enabled in next.config.js. Like
@@ -965,6 +1007,13 @@ export async function handleImageOptimization(
     }
     return response;
   }
+
+  // Negotiate the output format from the Accept header and images.formats.
+  const format = negotiateImageFormat(
+    request.headers.get("Accept"),
+    imageConfig?.formats,
+    sourceMediaType,
+  );
 
   // Transform if handler provided, otherwise serve original
   let reader: ImageSourceReader | null = null;

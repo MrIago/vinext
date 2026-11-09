@@ -30569,22 +30569,41 @@ describe("image optimization request parsing", () => {
     expect(params!.width).toBe(16);
   });
 
-  it("negotiateImageFormat prefers AVIF over WebP", async () => {
+  // Ported from Next.js: getSupportedMimeType and the upstream-type fallback in
+  // packages/next/src/server/image-optimizer/transform.ts, as exercised by
+  // test/e2e/image-optimizer/util.ts ("should maintain png format for old
+  // Safari", "should downlevel webp format to jpeg for old Safari").
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/image-optimizer/util.ts
+  it("negotiateImageFormat serves WebP, not AVIF, under the default images.formats", async () => {
     const { negotiateImageFormat } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(negotiateImageFormat("image/avif,image/webp,image/jpeg")).toBe("image/avif");
+    expect(negotiateImageFormat("image/avif,image/webp,image/jpeg")).toBe("image/webp");
+    expect(negotiateImageFormat("image/avif,image/jpeg", undefined, "image/png")).toBe("image/png");
   });
 
-  it("negotiateImageFormat selects WebP when no AVIF", async () => {
+  it("negotiateImageFormat prefers AVIF when images.formats lists it first", async () => {
     const { negotiateImageFormat } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(negotiateImageFormat("image/webp,image/jpeg")).toBe("image/webp");
+    const formats = ["image/avif", "image/webp"];
+    expect(negotiateImageFormat("image/avif,image/webp,image/jpeg", formats)).toBe("image/avif");
+    expect(negotiateImageFormat("image/webp,image/jpeg", formats)).toBe("image/webp");
+    // The Accept header's q-values outrank the listed order.
+    expect(negotiateImageFormat("image/avif;q=0.5,image/webp", formats)).toBe("image/webp");
+    expect(negotiateImageFormat("image/avif;q=0,image/jpeg", formats, "image/png")).toBe(
+      "image/png",
+    );
   });
 
-  it("negotiateImageFormat falls back to JPEG", async () => {
+  it("negotiateImageFormat keeps the source type when no format is accepted", async () => {
     const { negotiateImageFormat } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(negotiateImageFormat("image/png,image/jpeg")).toBe("image/jpeg");
+    expect(negotiateImageFormat("image/png,image/jpeg", undefined, "image/png")).toBe("image/png");
+    expect(negotiateImageFormat("*/*", undefined, "image/jpeg")).toBe("image/jpeg");
+    // A WebP or AVIF source goes to a client that accepts neither as JPEG.
+    expect(negotiateImageFormat("image/png,image/jpeg", undefined, "image/webp")).toBe(
+      "image/jpeg",
+    );
+    expect(negotiateImageFormat(null, undefined, "image/avif")).toBe("image/jpeg");
     expect(negotiateImageFormat(null)).toBe("image/jpeg");
   });
 
@@ -30761,6 +30780,38 @@ describe("handleImageOptimization", () => {
     // Next.js's image policy at the default `images.minimumCacheTTL`.
     expect(response.headers.get("Cache-Control")).toBe("public, max-age=14400, must-revalidate");
     expect(response.headers.get("Vary")).toBe("Accept");
+  });
+
+  // Ported from Next.js: test/e2e/image-optimizer/util.ts ("should maintain
+  // png format for old Safari", and avif with `formats: ['image/avif', ...]`).
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/image-optimizer/util.ts
+  it("asks transformImage for the format images.formats and Accept select", async () => {
+    const { handleImageOptimization } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const formatFor = async (accept: string, formats?: string[]) => {
+      let format = "";
+      await handleImageOptimization(
+        new Request("http://localhost/_next/image?url=%2Fimg.png&w=640&q=75", {
+          headers: { Accept: accept },
+        }),
+        {
+          fetchAsset: async () => new Response(PNG, { headers: { "Content-Type": "image/png" } }),
+          transformImage: async (_body, options) => {
+            format = options.format;
+            return new Response("x", { headers: { "Content-Type": options.format } });
+          },
+        },
+        undefined,
+        { formats },
+      );
+      return format;
+    };
+    expect(await formatFor("image/avif,image/webp,*/*")).toBe("image/webp");
+    expect(await formatFor("image/avif,image/webp,*/*", ["image/avif", "image/webp"])).toBe(
+      "image/avif",
+    );
+    expect(await formatFor("image/png,*/*")).toBe("image/png");
   });
 
   it("calls transformImage when provided", async () => {

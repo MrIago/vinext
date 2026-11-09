@@ -194,6 +194,7 @@ const configHeaders = vinextConfig?.headers ?? [];
 const imageConfig: ImageConfig | undefined = vinextConfig?.images
   ? {
       qualities: vinextConfig.images.qualities,
+      formats: vinextConfig.images.formats,
       localPatterns: vinextConfig.images.localPatterns,
       dangerouslyAllowSVG: vinextConfig.images.dangerouslyAllowSVG,
       dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,

@@ -390,6 +390,11 @@ export type NextConfig = {
     contentDispositionType?: "inline" | "attachment";
     /** Content-Security-Policy header for image responses. Defaults to "script-src 'none'; frame-src 'none'; sandbox;" */
     contentSecurityPolicy?: string;
+    /**
+     * Formats the optimizer may serve, chosen from the Accept header in this
+     * order. Defaults to `["image/webp"]`, as in Next.js.
+     */
+    formats?: Array<"image/avif" | "image/webp">;
     /** Least max-age, in seconds, of an image the endpoint serves as-is. Defaults to 14400. */
     minimumCacheTTL?: number;
     /**

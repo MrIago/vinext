@@ -249,7 +249,7 @@ describe("handleImageOptimization formats Next.js does not optimize", () => {
     const response = await handleImageOptimization(imageRequest("/still.gif"), imageHandlers);
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("transformed");
-    expect(response.headers.get("Content-Type")).toBe("image/avif");
+    expect(response.headers.get("Content-Type")).toBe("image/webp");
     expect(transformed).toEqual([new TextDecoder().decode(STATIC_GIF)]);
   });
 

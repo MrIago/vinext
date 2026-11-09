@@ -26,6 +26,7 @@ declare module "virtual:vinext-rsc-entry" {
   ): void | Promise<void>;
   export const __imageConfig: {
     qualities?: number[];
+    formats?: string[];
     localPatterns?: Array<{ pathname?: string; search?: string }>;
     dangerouslyAllowSVG?: boolean;
     dangerouslyAllowLocalIP?: boolean;
@@ -63,6 +64,7 @@ declare module "virtual:vinext-app-request-entry" {
   ): void | Promise<void>;
   export const __imageConfig: {
     qualities?: number[];
+    formats?: string[];
     localPatterns?: Array<{ pathname?: string; search?: string }>;
     dangerouslyAllowSVG?: boolean;
     dangerouslyAllowLocalIP?: boolean;
