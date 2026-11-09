@@ -3529,8 +3529,13 @@ const _appRouter: AppRouterInstance = {
       if (setup.cancelled) return;
       // Like Next.js, a route with an `unstable_instant` config ignores a full
       // prefetch: it's prefetched as an automatic one.
+      // "prefetch" is an alias for "full", and "navigation" (prefetch through
+      // `navigation()` boundaries) is the same as "full" without Partial
+      // Prefetching. "shell" is an alias for "auto".
+      const requestsFull =
+        options?.kind === "full" || options?.kind === "prefetch" || options?.kind === "navigation";
       const kind =
-        options?.kind === "full" &&
+        requestsFull &&
         !hasAppRouteInstantConfig(rewrittenPrefetchHref ?? fullHref, interceptionContext)
           ? "full"
           : "auto";
