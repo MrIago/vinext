@@ -1699,6 +1699,74 @@ describe("App Router Production server (startProdServer)", () => {
     expect(ts2).toBe(ts1);
   });
 
+  // The runtime ISR side of Next.js's prerendered-http-status-codes test
+  // (vercel/next.js#99078): an entry written at request time, not at build,
+  // stores the status of a notFound(), forbidden(), unauthorized() or
+  // redirect() a Suspense boundary caught, and a redirect's location, so the
+  // requests it serves answer with them. A redirect wins over a not-found.
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerendered-http-status-codes/index.test.ts
+  describe("runtime ISR keeps the status of an HTTP error a Suspense boundary caught", () => {
+    it.each([
+      ["not-found", 404, null],
+      ["forbidden", 403, null],
+      ["unauthorized", 401, null],
+      ["redirect", 307, "/"],
+      ["permanent-redirect", 308, "/"],
+      ["precedence", 307, "/second"],
+    ])("%s: the cached entry answers with %i", async (kind, status, location) => {
+      const pathname = `/nextjs-compat/isr-http-status-codes/${kind}`;
+      // The first request streams its document before the error, so it is a
+      // 200, and writes the entry.
+      const first = await fetch(`${baseUrl}${pathname}`, { redirect: "manual" });
+      expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+      expect(await first.text()).toContain('id="layout"');
+
+      let cached!: Response;
+      await waitForCondition(async () => {
+        cached = await fetch(`${baseUrl}${pathname}`, { redirect: "manual" });
+        return cached.headers.get("x-vinext-cache") === "HIT";
+      });
+      expect(cached.status).toBe(status);
+      expect(cached.headers.get("location")).toBe(location);
+      const html = await cached.text();
+      expect(html).toContain('id="layout"');
+    });
+
+    // An RSC miss stores the payload with the status too. Like Next.js, an RSC
+    // request for a redirect is a 200 whose payload carries it.
+    it.each([
+      ["rsc-not-found", 404, null],
+      ["rsc-forbidden", 403, null],
+      ["rsc-redirect", 200, "/"],
+    ])("%s: the cached RSC entry answers with %i", async (kind, status, location) => {
+      const pathname = `/nextjs-compat/isr-http-status-codes/${kind}`;
+      const first = await fetchRsc(baseUrl, pathname, { redirect: "manual" });
+      expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+      await first.arrayBuffer();
+
+      let cached!: Response;
+      await waitForCondition(async () => {
+        cached = await fetchRsc(baseUrl, pathname, { redirect: "manual" });
+        return cached.headers.get("x-vinext-cache") === "HIT";
+      });
+      expect(cached.status).toBe(status);
+      expect(cached.headers.get("location")).toBe(location);
+      await cached.arrayBuffer();
+    });
+
+    it("a page without an error is still a 200", async () => {
+      const pathname = "/nextjs-compat/isr-http-status-codes/none";
+      await (await fetch(`${baseUrl}${pathname}`)).text();
+      let cached!: Response;
+      await waitForCondition(async () => {
+        cached = await fetch(`${baseUrl}${pathname}`);
+        return cached.headers.get("x-vinext-cache") === "HIT";
+      });
+      expect(cached.status).toBe(200);
+      expect(await cached.text()).toContain('id="page"');
+    });
+  });
+
   // Ported from Next.js: test/e2e/app-dir/prerender-encoding/prerender-encoding.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/prerender-encoding/prerender-encoding.test.ts
   // A literal `%` survives the request's single decode as `%`. Matching the
