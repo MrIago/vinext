@@ -495,8 +495,9 @@ export function negotiateImageFormat(
 }
 
 /**
- * Standard Cache-Control header for optimized images.
- * Optimized images are immutable because the URL encodes the transform params.
+ * Cache-Control of an image made from a `_next/static` build asset, whose
+ * hashed URL never changes content. Other sources, optimized or not, follow
+ * {@link sourceImageCacheControl}, as in Next.js.
  */
 export const IMAGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
@@ -1056,7 +1057,7 @@ export async function handleImageOptimization(
         quality,
       });
       const headers = new Headers(transformed.headers);
-      setImageResponseHeaders(headers, IMAGE_CACHE_CONTROL, imageConfig);
+      setImageResponseHeaders(headers, sourceCacheControl, imageConfig);
 
       // Verify the transformed response also has a safe Content-Type.
       // A malicious or buggy transform handler could return HTML.

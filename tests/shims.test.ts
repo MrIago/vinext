@@ -30814,6 +30814,42 @@ describe("handleImageOptimization", () => {
     expect(await formatFor("image/png,*/*")).toBe("image/png");
   });
 
+  // Ported from Next.js: test/e2e/image-optimizer/minimum-cache-ttl.test.ts and
+  // the optimized-response expectations in test/e2e/image-optimizer/util.ts
+  // (`public, max-age=${minimumCacheTTL}, must-revalidate`).
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/image-optimizer/util.ts
+  it("revalidates an optimized public image after images.minimumCacheTTL", async () => {
+    const { handleImageOptimization, markImageBuildAsset } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const optimize = (sourceCacheControl: string | null, isBuildAsset = false) =>
+      handleImageOptimization(
+        new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75", {
+          headers: { Accept: "image/webp" },
+        }),
+        {
+          fetchAsset: async () => {
+            const headers = new Headers({ "Content-Type": "image/jpeg" });
+            if (sourceCacheControl) headers.set("Cache-Control", sourceCacheControl);
+            const source = new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), { headers });
+            return isBuildAsset ? markImageBuildAsset(source) : source;
+          },
+          transformImage: async (_body, { format }) =>
+            new Response("x", { headers: { "Content-Type": format } }),
+        },
+        undefined,
+        { minimumCacheTTL: 5 },
+      );
+    expect((await optimize(null)).headers.get("Cache-Control")).toBe(
+      "public, max-age=5, must-revalidate",
+    );
+    expect((await optimize("public, max-age=600")).headers.get("Cache-Control")).toBe(
+      "public, max-age=600, must-revalidate",
+    );
+    expect((await optimize(null, true)).headers.get("Cache-Control")).toBe(
+      "public, max-age=31536000, immutable",
+    );
+  });
+
   it("calls transformImage when provided", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
