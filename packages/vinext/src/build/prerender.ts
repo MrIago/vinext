@@ -26,6 +26,15 @@ import type { ResolvedNextConfig } from "../config/next-config.js";
 import { buildPregeneratedConcretePathTable } from "../server/prerender-manifest.js";
 import { BLOCKED_PAGES } from "vinext/shims/constants";
 import { classifyPagesRoute, classifyAppRoute, getAppRouteRenderEntryPath } from "./report.js";
+import { isAppPageRouteEnsureStaticNavigation } from "./app-page-static-eligibility.js";
+import {
+  createEmptyStaticParamsError,
+  createIncompleteStaticParamsErrorInStaticRoute,
+  createMissingGspErrorInStaticRoute,
+  createNonPrerenderableBodyErrorInStaticRoute,
+  findMissingStaticParamNames,
+} from "../server/app-ensure-static.js";
+import { patternToNextFormat } from "../routing/route-validation.js";
 import {
   concatUint8Arrays,
   decodeRscEmbeddedChunk,
@@ -738,7 +747,7 @@ export function validateDiscoveredParams(
 export function routeStaticParamSets(
   route: Pick<AppRoute, "pattern">,
   paramSets: readonly unknown[],
-  options: { staticExport?: boolean } = {},
+  options: { ensureStaticNavigation?: boolean; staticExport?: boolean } = {},
 ): Record<string, string | string[]>[] {
   const patternParams = getDynamicPatternParams(route.pattern);
   const objects = paramSets.map((value) => {
@@ -753,6 +762,16 @@ export function routeStaticParamSets(
     .filter(({ name }) => objects.some((params) => !(name in params)))
     .map(({ name }) => name);
   if (missingParamNames.length > 0) {
+    // Like an export, an `ensureStatic = "navigation"` page has no fallback
+    // shell to render the params generateStaticParams leaves out.
+    if (options.ensureStaticNavigation && objects.length > 0) {
+      throw new InvalidStaticParamsError(
+        createIncompleteStaticParamsErrorInStaticRoute(
+          patternToNextFormat(route.pattern),
+          missingParamNames,
+        ).message,
+      );
+    }
     if (options.staticExport && objects.length > 0) {
       throw new InvalidStaticParamsError(
         `Page "${route.pattern}" returned incomplete params from "generateStaticParams()". With "output: export", every params object must include all dynamic route parameters. Missing: ${missingParamNames.map((name) => `"${name}"`).join(", ")}. See more info here: https://nextjs.org/docs/messages/generate-static-params`,
@@ -1625,6 +1644,11 @@ export async function prerenderApp({
       isSpeculative: boolean; // 'unknown' route — mark skipped if render fails
       isFallback?: boolean;
       /**
+       * The page is `ensureStatic = "navigation"`: a render that leaves part
+       * of it for request time fails the build instead of being skipped.
+       */
+      ensureStaticNavigation?: boolean;
+      /**
        * For a fallback shell, the generated params that agree with the ones it
        * keeps. Null when the build doesn't enumerate all of them.
        */
@@ -1673,6 +1697,9 @@ export async function prerenderApp({
       routeParamSets: readonly Record<string, unknown>[] = [],
     ): void => {
       if (config.cacheComponents !== true || mode === "export") return;
+      // Like Next.js, an `ensureStatic = "navigation"` page has no fallback
+      // shells: a param it didn't generate is prerendered blocking.
+      if (ensureStaticNavigationPatterns.has(route.pattern)) return;
       for (const fallbackShell of createAppPprFallbackShells(route, params)) {
         if (queuedRouteUrls.has(fallbackShell.pathname)) continue;
         // A not-found or blocking boundary has no fallback shell: Next.js
@@ -1727,6 +1754,7 @@ export async function prerenderApp({
       }
     };
 
+    const ensureStaticNavigationPatterns = new Set<string>();
     for (const route of routes) {
       const renderEntryPath = getAppRouteRenderEntryPath(route);
 
@@ -1757,6 +1785,29 @@ export async function prerenderApp({
       // classifyAppRoute also returns 'ssr'. In that case we must still check
       // generateStaticParams before giving up.
       const isConfiguredDynamic = type === "ssr" && !route.isDynamic;
+
+      let ensureStaticNavigation = false;
+      if (config.cacheComponents === true && mode !== "export" && route.pagePath) {
+        try {
+          ensureStaticNavigation = isAppPageRouteEnsureStaticNavigation(route);
+        } catch (error) {
+          results.push({
+            route: route.pattern,
+            status: "error",
+            error: (error as Error).message,
+            fatal: true,
+          });
+          continue;
+        }
+      }
+      if (ensureStaticNavigation) ensureStaticNavigationPatterns.add(route.pattern);
+      const nextPage = patternToNextFormat(route.pattern);
+      const ensureStaticParamsError = (error: Error): PrerenderRouteResult => ({
+        route: route.pattern,
+        status: "error",
+        error: error.message,
+        fatal: true,
+      });
 
       if (isConfiguredDynamic) {
         if (mode === "export") {
@@ -1789,6 +1840,10 @@ export async function prerenderApp({
 
           // Check: no function at all (Node build where map is populated from bundle exports)
           if (typeof generateStaticParamsFn !== "function") {
+            if (ensureStaticNavigation) {
+              results.push(ensureStaticParamsError(createMissingGspErrorInStaticRoute(nextPage)));
+              continue;
+            }
             if (mode === "export") {
               results.push({
                 route: route.pattern,
@@ -1843,6 +1898,7 @@ export async function prerenderApp({
             // against the route before building its URL.
             if (paramSets !== null) {
               paramSets = routeStaticParamSets(route, paramSets, {
+                ensureStaticNavigation,
                 staticExport: mode === "export",
               });
             }
@@ -1857,6 +1913,7 @@ export async function prerenderApp({
               results === null
                 ? null
                 : routeStaticParamSets(route, Array.isArray(results) ? results : [], {
+                    ensureStaticNavigation,
                     staticExport: mode === "export",
                   });
           }
@@ -1879,6 +1936,19 @@ export async function prerenderApp({
 
           // null: route has no generateStaticParams (CF Workers Proxy returned null)
           if (paramSets === null) {
+            if (ensureStaticNavigation) {
+              // Layouts that generated some of the route's params, but not
+              // all of them, left the rest for a fallback shell.
+              const missingParamNames = findMissingStaticParamNames(route.params, parentParamSets);
+              results.push(
+                ensureStaticParamsError(
+                  parentParamSets.length > 0 && missingParamNames.length > 0
+                    ? createIncompleteStaticParamsErrorInStaticRoute(nextPage, missingParamNames)
+                    : createMissingGspErrorInStaticRoute(nextPage),
+                ),
+              );
+              continue;
+            }
             if (mode === "export") {
               results.push({
                 route: route.pattern,
@@ -1893,6 +1963,10 @@ export async function prerenderApp({
           }
 
           if (paramSets.length === 0) {
+            if (ensureStaticNavigation) {
+              results.push(ensureStaticParamsError(createEmptyStaticParamsError()));
+              continue;
+            }
             // No concrete artifact is emitted, but the route remains SSG and
             // may be generated on demand at runtime.
             results.push({
@@ -1931,6 +2005,7 @@ export async function prerenderApp({
               prerenderRouteParams: encodePrerenderRouteParams(route.pattern, params),
               revalidate,
               isSpeculative: false,
+              ...(ensureStaticNavigation ? { ensureStaticNavigation: true } : {}),
             });
 
             queueFallbackShells(route, params, revalidate, queuedRouteUrls, paramSets);
@@ -1952,7 +2027,7 @@ export async function prerenderApp({
               : {}),
           });
         }
-      } else if (type === "unknown") {
+      } else if (type === "unknown" && !ensureStaticNavigation) {
         // No explicit config, non-dynamic URL — attempt speculative static render
         urlsToRender.push({
           urlPath: route.pattern,
@@ -1962,13 +2037,14 @@ export async function prerenderApp({
           isSpeculative: true,
         });
       } else {
-        // Static or ISR
+        // Static or ISR, or a page that must be static
         urlsToRender.push({
           urlPath: route.pattern,
           routePattern: route.pattern,
           prerenderRouteParams: null,
-          revalidate,
+          revalidate: type === "unknown" ? false : revalidate,
           isSpeculative: false,
+          ...(ensureStaticNavigation ? { ensureStaticNavigation: true } : {}),
         });
       }
     }
@@ -2042,6 +2118,7 @@ export async function prerenderApp({
       isSpeculative,
       isFallback,
       generatedParams,
+      ensureStaticNavigation,
     }: UrlToRender): Promise<PrerenderRouteResult> {
       try {
         if (kind === "metadata") {
@@ -2213,6 +2290,16 @@ export async function prerenderApp({
         // generated param decides which URLs are admissible, not that the
         // render output is reusable.
         if (htmlCacheControl.includes("no-store")) {
+          // Like Next.js, an `ensureStatic = "navigation"` page that needs
+          // request-time data, even behind Suspense, fails the build.
+          if (ensureStaticNavigation) {
+            return {
+              route: routePattern,
+              status: "error",
+              error: createNonPrerenderableBodyErrorInStaticRoute(urlPath).message,
+              fatal: true,
+            };
+          }
           return { route: routePattern, status: "skipped", reason: "dynamic" };
         }
 

@@ -78,6 +78,7 @@ import {
   type AppPageInterceptState,
   buildAppPageElement,
   resolveAppPageInterceptionRerenderTarget,
+  resolveAppPageGeneratedStaticParams,
   resolveAppPageIntercept,
   resolveAppPageInterceptState,
   validateAppPageDynamicParams,
@@ -159,6 +160,15 @@ import {
   type ParamMatchingFallbackMode,
   type ParamMatchingRoute,
 } from "./app-param-matching.js";
+import { patternToNextFormat } from "../routing/route-validation.js";
+import {
+  createEmptyStaticParamsError,
+  createIncompleteStaticParamsErrorInStaticRoute,
+  createMissingGspErrorInStaticRoute,
+  createNonPrerenderableBodyErrorInStaticRoute,
+  findMissingStaticParamNames,
+  isEnsureStaticNavigationRoute,
+} from "./app-ensure-static.js";
 
 type AppPageParams = Record<string, string | string[]>;
 type AppPageElement = ReactNode | Readonly<Record<string, ReactNode>>;
@@ -1160,8 +1170,16 @@ export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRou
   // reads them, so a shell is shared only by URLs with the same values, as
   // Next.js's `PrefetchHint.IsClosedParam` keeps the client from predicting.
   const varyParams = new Set<string>(getResolvedClosedParamNames(route));
+  // Like Next.js, an App Shell is the page with every param but its root
+  // params left to holes, so it's the shell of every path that shares those.
+  // A root param stays concrete: the root layout may read it, and a locale's
+  // shell must not answer another locale (vercel/next.js@643e34a).
+  const rootParamNames = new Set(Object.keys(options.rootParams ?? {}));
   const pprFallbackShell = {
-    fallbackParamNames: [],
+    fallbackParamNames:
+      prefetchStage === "shell" && !isRuntimePrefetch
+        ? route.params.filter((name) => !rootParamNames.has(name))
+        : [],
     ...(isRuntimePrefetch ? { isRuntimePrefetch: true } : {}),
     ...(prefetchStage ? { prefetchStage } : {}),
     routePattern: route.pattern,
@@ -1247,6 +1265,31 @@ export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRou
   return { isPartial, response };
 }
 
+/**
+ * Next.js requires an `ensureStatic = "navigation"` page's dynamic params to
+ * come from generateStaticParams, every one of them in every result, so none
+ * is left for a fallback shell.
+ *
+ * Ported from Next.js: packages/next/src/build/static-paths/app.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/build/static-paths/app.ts
+ */
+async function assertEnsureStaticNavigationStaticParams<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+): Promise<void> {
+  const route = options.route;
+  const page = patternToNextFormat(route.pattern);
+  const generated = await resolveAppPageGeneratedStaticParams({
+    generateStaticParams: options.generateStaticParams,
+    params: options.staticParamsValidationParams ?? options.params,
+  });
+  if (generated === null) throw createMissingGspErrorInStaticRoute(page);
+  if (generated.staticParams.length === 0) throw createEmptyStaticParamsError();
+  const missingParamNames = findMissingStaticParamNames(route.params, generated.staticParams);
+  if (missingParamNames.length > 0) {
+    throw createIncompleteStaticParamsErrorInStaticRoute(page, missingParamNames);
+  }
+}
+
 async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
 ): Promise<Response> {
@@ -1312,6 +1355,15 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // a request without the shell asked for it.
   const isPrerender =
     process.env.VINEXT_PRERENDER === "1" || options.pprFallbackShell !== undefined;
+  // Like Next.js, an `ensureStatic = "navigation"` page is only ever served
+  // from a full static prerender: no fallback shell, no resume, and an RSC
+  // request reads the stored payload too.
+  const isEnsureStaticNavigation =
+    options.pprRuntime !== undefined && isEnsureStaticNavigationRoute(route);
+  if (isEnsureStaticNavigation && !options.isProduction && route.isDynamic) {
+    // The build checks this before it prerenders; dev checks each request.
+    await assertEnsureStaticNavigationStaticParams(options);
+  }
   let traceOperation: "prerender" | "render" = isPrerender ? "prerender" : "render";
   const serveStreamingMetadata = shouldServeStreamingMetadata(
     options.request.headers.get("user-agent") ?? "",
@@ -1583,6 +1635,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       // from the cache, and its regeneration renders the document.
       isDynamicRscRequest:
         options.pprRuntime !== undefined &&
+        !isEnsureStaticNavigation &&
         options.isRscRequest &&
         options.request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) !== "1" &&
         options.renderedConcreteUrlPaths?.has(options.cleanPathname) !== true,
@@ -1595,7 +1648,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               revalidationTarget.interceptOpts,
             )
           : null;
-        if (options.pprRuntime && revalidationTarget.route === route) {
+        if (options.pprRuntime && !isEnsureStaticNavigation && revalidationTarget.route === route) {
           // A regeneration fills the path's missing shells, as a stored miss
           // does, but a failure to find them doesn't fail the page.
           await options.pprRuntime
@@ -1849,15 +1902,18 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     }
   }
 
-  const fallbackShellResult = options.pprRuntime
-    ? await options.pprRuntime.tryServe(
-        filterParamMatchingFallbackShells(options, paramMatchingAdmission),
-        currentRevalidateSeconds,
-        isDraftMode,
-        isForceStatic,
-        isForceDynamic,
-      )
-    : null;
+  // Like Next.js's blocking prerender, a param an `ensureStatic = "navigation"`
+  // page didn't generate renders in full and is stored.
+  const fallbackShellResult =
+    options.pprRuntime && !isEnsureStaticNavigation
+      ? await options.pprRuntime.tryServe(
+          filterParamMatchingFallbackShells(options, paramMatchingAdmission),
+          currentRevalidateSeconds,
+          isDraftMode,
+          isForceStatic,
+          isForceDynamic,
+        )
+      : null;
   if (fallbackShellResult instanceof Response) {
     return fallbackShellResult;
   }
@@ -2103,8 +2159,13 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // Like Next.js, which prerenders a path's shell, a page that rendered
   // dynamically gets one for later requests to resume. A response middleware
   // gave another status isn't the page's.
-  const produceConcreteShell =
-    options.pprRuntime && !pprShellResume && (options.middlewareContext.status ?? 200) === 200
+  // An `ensureStatic = "navigation"` page has no shell to resume: rendering
+  // dynamically breaks its contract, which Next.js's prerender rejects.
+  const produceConcreteShell = isEnsureStaticNavigation
+    ? () => {
+        console.error(createNonPrerenderableBodyErrorInStaticRoute(route.pattern));
+      }
+    : options.pprRuntime && !pprShellResume && (options.middlewareContext.status ?? 200) === 200
       ? () =>
           options.pprRuntime!.produceConcreteShell(
             options,

@@ -501,6 +501,8 @@ Set `partialPrefetching: true` next to `cacheComponents`, or export `const prefe
 - `<Link prefetch={true}>` and `router.prefetch(href, { kind: "full" })` get the page rendered for the request: its cookies, headers and private caches render, `connection()` and uncached data stay at their `<Suspense>` fallbacks, and so does what follows `await navigation()`. It's never a full prefetch with the page's dynamic data, and it's never stored.
 - `<Link prefetch="navigation">` and `{ kind: "navigation" }` render what follows `await navigation()` too.
 
+The App Shell leaves every param but the route's root params (those at or above its root layout) to holes, so one shell serves every path that shares them, and it varies only on the root params it reads: a `/[locale]` app gets one shell per locale, as in Next.js.
+
 A route that doesn't opt in keeps the static shell for automatic prefetches and the full prefetch for `prefetch={true}`. In development, a navigation from a `prefetch={true}` link to such a route logs Next.js's error about dynamic data in the prefetch, since dev doesn't prefetch. `prefetch()` and `navigation()` throw without Cache Components and inside `"use cache"` or `unstable_cache()`; on a request, and in the static shell and the document's partial prerender, both resolve.
 
 ## Partial prerendering
@@ -515,6 +517,10 @@ A request resumes the most specific shell its path has:
 Like Next.js's prerender manifest, a fallback shell records the params generated under it, so a request decides from the stored shell whether its own path was generated, without calling `generateStaticParams`. A shell produced at runtime calls it once, when it renders. A route with parallel route slots records nothing, so its requests that need a fallback shell call it, as the build doesn't run a slot's `generateStaticParams`.
 
 Every query string shares a path's shell, as in Next.js: `/search?q=a` and `/search?q=b` resume the same shell, and only the holes that read the query render with it.
+
+### `ensureStatic = "navigation"`
+
+A page or layout that exports `ensureStatic = "navigation"` (or `unstable_ensureStatic`) must be fully static, as in Next.js. The build fails when its prerender leaves anything for request time, even behind `<Suspense>`, when a dynamic route has no `generateStaticParams`, or when it returns no params or leaves one of them out. Such a page has no fallback shells: a param the build didn't generate is rendered in full on its first request and stored, and its RSC requests read the stored payload too. Client-only IO stays allowed. vinext reports one error for any partial prerender, without pointing at the data that caused it, and dev checks only `generateStaticParams`.
 
 ## Query strings
 

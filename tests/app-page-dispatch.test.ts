@@ -38,7 +38,10 @@ import {
   APP_RSC_RENDER_MODE_PREFETCH_PARTIAL_NAVIGATION,
   APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
 } from "../packages/vinext/src/server/app-rsc-render-mode.js";
-import { createPprFallbackShellSuspensePromise } from "../packages/vinext/src/shims/ppr-fallback-shell.js";
+import {
+  createPprFallbackShellSuspensePromise,
+  getPprFallbackShellState,
+} from "../packages/vinext/src/shims/ppr-fallback-shell.js";
 import { after } from "../packages/vinext/src/shims/server.js";
 import { getRootParam } from "../packages/vinext/src/shims/root-params.js";
 import { makeThenableParams } from "../packages/vinext/src/shims/thenable-params.js";
@@ -178,7 +181,7 @@ type TestRoute = {
   loadings?: readonly ({ default?: unknown } | null | undefined)[];
   loadingTreePositions?: readonly number[];
   notFounds?: readonly ({ default?: unknown } | null | undefined)[];
-  page?: { default?: unknown; dynamic?: unknown } | null;
+  page?: { default?: unknown; dynamic?: unknown; ensureStatic?: unknown } | null;
   params: readonly string[];
   pattern: string;
   routeSegments: readonly string[];
@@ -1886,6 +1889,41 @@ describe("app page dispatch", () => {
         expect(isrSetFallbackShell).toHaveBeenCalledTimes(1);
         expect(isrSetFallbackShell.mock.calls[0]?.[0]).toContain("app-app-shell");
       });
+
+      // Ported from Next.js: test/e2e/app-dir/segment-cache/app-shell-root-params
+      // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/segment-cache/app-shell-root-params/app-shell-root-params.test.ts
+      // The App Shell leaves every param but the root params to holes, so it
+      // answers every path that shares them (vercel/next.js@643e34a). The
+      // static shell renders them all.
+      it.each([
+        [APP_RSC_RENDER_MODE_PREFETCH_APP_SHELL, ["region", "id"]],
+        [APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL, []],
+      ] as const)(
+        "leaves the params of the %s render below its root params",
+        async (renderMode, holes) => {
+          const fallbackParamNames: string[][] = [];
+          const { options } = createStaticShellOptions({
+            async buildPageElement() {
+              fallbackParamNames.push([...(getPprFallbackShellState()?.fallbackParamNames ?? [])]);
+              return React.createElement("main", null, "page");
+            },
+            cleanPathname: "/en/uk/posts/1",
+            params: { id: "1", lang: "en", region: "uk" },
+            renderMode,
+            request: new Request("https://example.test/en/uk/posts/1"),
+            rootParams: { lang: "en" },
+            route: createRoute({
+              isDynamic: true,
+              params: ["lang", "region", "id"],
+              pattern: "/:lang/:region/posts/:id",
+              routeSegments: ["[lang]", "[region]", "posts", "[id]"],
+            }),
+          });
+
+          await runWithRequestContext(createRequestContext(), () => dispatchAppPage(options));
+          expect(fallbackParamNames).toEqual([holes]);
+        },
+      );
 
       it("keeps both in the static shell", async () => {
         const seen: string[] = [];
@@ -5078,6 +5116,76 @@ describe("app page dispatch", () => {
 
     expect(response.status).toBe(200);
     expect(setCurrentForceDynamicFetchDefault).toHaveBeenLastCalledWith(false);
+  });
+
+  // Ported from Next.js: test/e2e/app-dir/ensure-static-navigation and
+  // test/e2e/app-dir/ensure-static-navigation-runtime
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation/ensure-static-navigation.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation-runtime/ensure-static-navigation-runtime.test.ts
+  describe('ensureStatic = "navigation"', () => {
+    const staticRoute = () =>
+      createRoute({
+        isDynamic: true,
+        page: { default: () => null, ensureStatic: "navigation" },
+        params: ["slug"],
+        pattern: "/default/static-params/:slug",
+        routeSegments: ["default", "static-params", "[slug]"],
+      });
+
+    it("renders a param it didn't generate in full, with no fallback shell to resume", async () => {
+      const tryServe = vi.fn<(typeof appPagePprRuntime)["tryServe"]>(async () => null);
+      const produceConcreteShell = vi.fn();
+      const { options } = createDispatchOptions({
+        cleanPathname: "/default/static-params/not-prerendered-1",
+        generateStaticParams: async () => [{ slug: "prerendered-1" }],
+        hasAnyGenerateStaticParams: true,
+        hasGenerateStaticParams: true,
+        isProduction: true,
+        params: { slug: "not-prerendered-1" },
+        pprRuntime: { ...appPagePprRuntime, produceConcreteShell, tryServe },
+        route: staticRoute(),
+      });
+
+      const response = await runWithRequestContext(createRequestContext(), () =>
+        dispatchAppPage(options),
+      );
+      await response.text();
+      expect(tryServe).not.toHaveBeenCalled();
+      expect(produceConcreteShell).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [
+        "no generateStaticParams",
+        undefined,
+        'Page "/default/static-params/[slug]": `ensureStatic = "navigation"` requires an exported `generateStaticParams()` function.',
+      ],
+      [
+        "an empty generateStaticParams",
+        async () => [],
+        "When using Cache Components, all `generateStaticParams` functions must return at least one result.",
+      ],
+      [
+        "an incomplete generateStaticParams",
+        async () => [{}],
+        'Routes using `ensureStatic = "navigation"` must return every dynamic route parameter. Missing: "slug".',
+      ],
+    ])("rejects a dev request to a page with %s", async (_label, generateStaticParams, message) => {
+      const { options } = createDispatchOptions({
+        cleanPathname: "/default/static-params/123",
+        generateStaticParams,
+        hasAnyGenerateStaticParams: generateStaticParams !== undefined,
+        hasGenerateStaticParams: generateStaticParams !== undefined,
+        isProduction: false,
+        params: { slug: "123" },
+        pprRuntime: appPagePprRuntime,
+        route: staticRoute(),
+      });
+
+      await expect(
+        runWithRequestContext(createRequestContext(), () => dispatchAppPage(options)),
+      ).rejects.toThrow(message);
+    });
   });
 
   describe("intercepted RSC of a known-dynamic interception or current route", () => {

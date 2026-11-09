@@ -2871,6 +2871,20 @@ describe("routeStaticParamSets", () => {
     ).toThrow('Missing: "b".');
   });
 
+  // Ported from Next.js: test/e2e/app-dir/ensure-static-navigation
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation/ensure-static-navigation.test.ts
+  it("rejects incomplete sets of an ensureStatic = navigation page", () => {
+    expect(() =>
+      routeStaticParamSets(
+        { pattern: "/default/static-params-incomplete/:slug/:snail" },
+        [{ slug: "123" }],
+        { ensureStaticNavigation: true },
+      ),
+    ).toThrow(
+      'Page "/default/static-params-incomplete/[slug]/[snail]": `generateStaticParams()` returned incomplete params. Routes using `ensureStatic = "navigation"` must return every dynamic route parameter. Missing: "snail".',
+    );
+  });
+
   it("rejects a set whose value does not fit its segment", () => {
     expect(() => routeStaticParamSets({ pattern: "/:id" }, [{ id: 1 }])).toThrow(
       "Parameter id from generateStaticParams for /:id must be a string.",
@@ -3014,6 +3028,81 @@ describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => 
       ]);
     },
   );
+
+  // Ported from Next.js: test/e2e/app-dir/ensure-static-navigation and
+  // test/e2e/app-dir/ensure-static-navigation-runtime
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation/ensure-static-navigation.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation-runtime/ensure-static-navigation-runtime.test.ts
+  describe('ensureStatic = "navigation"', () => {
+    const makeEnsureStatic = (routes: AppRoute[]) => {
+      for (const route of routes) {
+        if (!route.pagePath) continue;
+        fs.writeFileSync(
+          route.pagePath,
+          'export const ensureStatic = "navigation";\nexport default function Page() { return null; }\n',
+        );
+      }
+    };
+
+    it("prerenders its generated params without fallback shells", async () => {
+      const { renderedPaths, routes } = await prerenderDynamicRootParamRoute(
+        true,
+        undefined,
+        undefined,
+        undefined,
+        makeEnsureStatic,
+      );
+      expect(findRoute(routes, "/en/blog/hello")).toMatchObject({ status: "rendered" });
+      expect(renderedPaths).toEqual(["/en/blog/hello"]);
+    });
+
+    it.each([
+      [
+        "no generateStaticParams",
+        null,
+        'Page "/[locale]/blog/[slug]": `ensureStatic = "navigation"` requires an exported `generateStaticParams()` function.',
+      ],
+      [
+        "an empty generateStaticParams",
+        [],
+        "When using Cache Components, all `generateStaticParams` functions must return at least one result.",
+      ],
+    ])("fails the build with %s", async (_label, staticParams, message) => {
+      const { renderedPaths, routes } = await prerenderDynamicRootParamRoute(
+        true,
+        undefined,
+        undefined,
+        () => staticParams,
+        makeEnsureStatic,
+      );
+      expect(routes).toContainEqual(
+        expect.objectContaining({
+          error: expect.stringContaining(message),
+          fatal: true,
+          route: "/:locale/blog/:slug",
+          status: "error",
+        }),
+      );
+      expect(renderedPaths.filter((pathname) => pathname.includes("blog"))).toEqual([]);
+    });
+
+    it("fails the build when its layouts generate only some of its params", async () => {
+      const { routes } = await prerenderDynamicRootParamRoute(
+        true,
+        undefined,
+        undefined,
+        (pattern) => (pattern === "layouts:[locale]" ? [{ locale: "en" }] : null),
+        makeEnsureStatic,
+      );
+      expect(routes).toContainEqual(
+        expect.objectContaining({
+          error: expect.stringContaining('Missing: "slug".'),
+          fatal: true,
+          status: "error",
+        }),
+      );
+    });
+  });
 
   it("writes a fallback shell's state beside it, out of the served HTML, with its generated params", async () => {
     const { formatAppPprShellState, parseAppPprShellState } =
