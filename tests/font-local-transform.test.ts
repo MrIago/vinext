@@ -3,6 +3,7 @@ import path from "node:path";
 import vinext from "../packages/vinext/src/index.js";
 import { toSlash } from "pathslash";
 import localFont, { getSSRFontStyles } from "../packages/vinext/src/shims/font-local.js";
+import { getSSRFontLinks } from "../packages/vinext/src/shims/font-google.js";
 import type { Plugin } from "vite-plus";
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -67,7 +68,9 @@ describe("vinext:local-fonts plugin", () => {
     const result = transform.call(plugin, code, "/proj/node_modules/geist/dist/mono.js");
     expect(result).not.toBeNull();
     expectImported(result.code, "./fonts/geist-mono/GeistMono-Variable.woff2");
-    expect(result.code).toContain(`_vinext: { font: { family: "GeistMono" } }`);
+    expect(result.code).toContain(
+      `_vinext: { font: { family: "GeistMono", stylesheet: __vinext_local_font_css_0 } }`,
+    );
   });
 
   it("skips vinext's own font-local shim (it has example paths in comments)", () => {
@@ -183,7 +186,9 @@ describe("vinext:local-fonts plugin", () => {
 
     expect(result).not.toBeNull();
     expectImported(result.code, "../fonts/font1_roboto.woff2");
-    expect(result.code).toContain(`_vinext: { font: { family: "myFont" } }`);
+    expect(result.code).toContain(
+      `_vinext: { font: { family: "myFont", stylesheet: __vinext_local_font_css_0 } }`,
+    );
   });
 
   it("passes the local binding name through for same-line block declarations", () => {
@@ -198,7 +203,9 @@ describe("vinext:local-fonts plugin", () => {
 
     expect(result).not.toBeNull();
     expectImported(result.code, "./font.woff2");
-    expect(result.code).toContain(`_vinext: { font: { family: "myFont" } }`);
+    expect(result.code).toContain(
+      `_vinext: { font: { family: "myFont", stylesheet: __vinext_local_font_css_0 } }`,
+    );
   });
 
   it("does not produce double-comma when a trailing comma is hidden behind a block comment", () => {
@@ -217,7 +224,9 @@ describe("vinext:local-fonts plugin", () => {
     const result = transform.call(plugin, code, "/app/layout.tsx");
 
     expect(result).not.toBeNull();
-    expect(result.code).toContain(`_vinext: { font: { family: "myFont" } }`);
+    expect(result.code).toContain(
+      `_vinext: { font: { family: "myFont", stylesheet: __vinext_local_font_css_0 } }`,
+    );
     expect(result.code).not.toMatch(/\*\/\s*,/);
   });
 
@@ -235,7 +244,9 @@ describe("vinext:local-fonts plugin", () => {
     const result = transform.call(plugin, code, "/app/layout.tsx");
 
     expect(result).not.toBeNull();
-    expect(result.code).toContain(`_vinext: { font: { family: "myFont" } }`);
+    expect(result.code).toContain(
+      `_vinext: { font: { family: "myFont", stylesheet: __vinext_local_font_css_0 } }`,
+    );
     expect(result.code).not.toMatch(/\/\/ c\n\s*,/);
   });
 
@@ -256,7 +267,9 @@ describe("vinext:local-fonts plugin", () => {
     const result = transform.call(plugin, code, "/app/layout.tsx");
 
     expect(result).not.toBeNull();
-    expect(result.code).toContain(`_vinext: { font: { family: "myFont" } }`);
+    expect(result.code).toContain(
+      `_vinext: { font: { family: "myFont", stylesheet: __vinext_local_font_css_0 } }`,
+    );
     // The real trailing comma must be detected → no double comma injected.
     expect(result.code).not.toMatch(/,\s*,/);
   });
@@ -815,7 +828,9 @@ describe("next/font/local adjustFontFallback", () => {
 
     const result = run();
 
-    expect(result.code).toContain(`_vinext: { font: { family: "roboto" } }`);
+    expect(result.code).toContain(
+      `_vinext: { font: { family: "roboto", stylesheet: __vinext_local_font_css_0 } }`,
+    );
     expect(context.addWatchFile).not.toHaveBeenCalled();
   });
 
@@ -869,7 +884,9 @@ describe("next/font/local adjustFontFallback", () => {
       toSlash(path.join(fontDir, "layout.tsx")),
     );
 
-    expect(run().code).toContain(`_vinext: { font: { family: "broken" } }`);
+    expect(run().code).toContain(
+      `_vinext: { font: { family: "broken", stylesheet: __vinext_local_font_css_0 } }`,
+    );
     expect(context.warn).toHaveBeenCalledTimes(1);
     expect(context.warn.mock.calls[0][0]).toContain(`Failed to load font file: ${fontFile}`);
     // The file stays watched so fixing it regenerates the fallback (see
@@ -923,5 +940,122 @@ describe("next/font/local adjustFontFallback", () => {
     expect(disabled.style.fontFamily).toBe("'myFont2', sans-serif");
     expect(withoutFamily.style.fontFamily).not.toContain("Fallback");
     expect(getSSRFontStyles().slice(beforeCount).join("\n")).not.toContain("Fallback");
+  });
+});
+
+describe("next/font/local build-time @font-face extraction", () => {
+  // Next.js's local font loader generates the `@font-face` rules (and the
+  // adjusted fallback face) at build time and returns them as CSS, which
+  // ships in the build's stylesheets instead of being injected at runtime:
+  // https://github.com/vercel/next.js/blob/canary/packages/font/src/local/loader.ts
+  const FIXTURE_DIR = path.resolve(import.meta.dirname, "fixtures/app-basic");
+  const ROBOTO_DIR = toSlash(path.join(FIXTURE_DIR, "app/script-nonce/with-next-font"));
+  const IMPORTER = `${ROBOTO_DIR}/layout.tsx`;
+
+  function setup() {
+    const plugin = getLocalFontsPlugin();
+    const context = { addWatchFile: vi.fn(), warn: vi.fn() };
+    const transform = (code: string, id = IMPORTER) =>
+      unwrapHook(plugin.transform).call(context, code, id);
+    const resolveId = (source: string) => unwrapHook(plugin.resolveId).call(context, source);
+    const load = (id: string) => unwrapHook(plugin.load).call(context, id);
+    return { transform, resolveId, load };
+  }
+
+  function extractedImport(code: string): string | undefined {
+    return /import __vinext_local_font_css_0 from "([^"]+\/__vinext_local_font_[0-9a-f]+\.css)\?url";/.exec(
+      code,
+    )?.[1];
+  }
+
+  it("imports a stylesheet module with the @font-face and fallback rules", () => {
+    const { transform, resolveId, load } = setup();
+    const result = transform(
+      [
+        `import localFont from "next/font/local";`,
+        `export const roboto = localFont({`,
+        `  src: [{ path: "./font.woff2", weight: "400", style: "normal" }],`,
+        `  display: "optional",`,
+        `  declarations: [{ prop: "ascent-override", value: "90%" }],`,
+        `});`,
+      ].join("\n"),
+    );
+
+    const cssId = extractedImport(result.code);
+    expect(cssId).toBeDefined();
+    // Next to the caller, so Vite resolves `./font.woff2` like the call does.
+    expect(path.posix.dirname(cssId!)).toBe(ROBOTO_DIR);
+    // The shim links it by URL, like the Google font stylesheet.
+    expect(result.code).toContain("stylesheet: __vinext_local_font_css_0");
+
+    expect(resolveId(cssId!)).toBe(cssId);
+    // Dev requests it by its root-relative URL, with Vite's query attached.
+    expect(
+      resolveId(`/app/script-nonce/with-next-font/${path.posix.basename(cssId!)}?direct`),
+    ).toBe(`${cssId}?direct`);
+    // Vite's CSS plugin answers `?url` and loads the stylesheet back.
+    expect(load(`${cssId}?url`)).toBeNull();
+    const css = load(`${cssId}?direct`);
+    expect(css).toBe(`@font-face {
+  font-family: 'roboto';
+  src: url('./font.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: optional;
+}
+@font-face { font-family: 'roboto'; ascent-override: 90%; }
+@font-face {
+  font-family: 'roboto Fallback';
+  src: local("Arial");
+  ascent-override: 92.49%;
+  descent-override: 24.34%;
+  line-gap-override: 0.00%;
+  size-adjust: 100.30%;
+}
+`);
+  });
+
+  it("names the stylesheet by its CSS, so a changed call gets a new module", () => {
+    const { transform } = setup();
+    const call = (display: string) =>
+      extractedImport(
+        transform(
+          `import localFont from "next/font/local";\nconst f = localFont({ src: "./font.woff2", display: "${display}" });`,
+        ).code,
+      );
+    expect(call("swap")).toBe(call("swap"));
+    expect(call("swap")).not.toBe(call("block"));
+  });
+
+  it("keeps runtime injection for calls it cannot analyze", () => {
+    const { transform, resolveId } = setup();
+    for (const options of [
+      `{ src: "./font.woff2", display }`,
+      `{ src: "@/fonts/font.woff2" }`,
+      `{ src: "/fonts/font.woff2" }`,
+      `{ src: [{ path: "./font.woff2", weight: 400 }] }`,
+    ]) {
+      const result = transform(
+        `import localFont from "next/font/local";\nconst f = localFont(${options});`,
+      );
+      expect(extractedImport(result?.code ?? ""), options).toBeUndefined();
+      expect(result?.code ?? "", options).not.toContain("stylesheet:");
+    }
+    expect(resolveId("/app/__vinext_local_font_0123456789abcdef.css")).toBeNull();
+  });
+
+  it("links the extracted stylesheet instead of injecting the @font-face rules", () => {
+    const beforeCount = getSSRFontStyles().length;
+    const result = localFont({
+      src: "/assets/extracted.woff2",
+      variable: "--font-extracted",
+      _vinext: { font: { family: "extracted", stylesheet: "/assets/extracted-font.css" } },
+    });
+
+    expect(getSSRFontLinks()).toContain("/assets/extracted-font.css");
+    const addedStyles = getSSRFontStyles().slice(beforeCount).join("\n");
+    expect(addedStyles).not.toContain("@font-face");
+    expect(addedStyles).toContain(`.${result.className} { font-family: 'extracted', sans-serif; }`);
+    expect(addedStyles).toContain(`--font-extracted: 'extracted', sans-serif;`);
   });
 });

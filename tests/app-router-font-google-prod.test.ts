@@ -178,15 +178,15 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     fs.rmSync(nodeModulesLink, { recursive: true, force: true });
   });
 
-  // Every @font-face rule the page loads: the external Google font
-  // stylesheets the head links to plus the inline `<style data-vinext-fonts>`
-  // block (local fonts and fallback faces).
+  // Every @font-face rule the page loads: the stylesheets the head links to
+  // (Google fonts and extracted local fonts) plus the inline
+  // `<style data-vinext-fonts>` block.
   async function loadFontCss(html: string): Promise<string> {
     const parts = [...html.matchAll(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/g)].map(
       (m) => m[1],
     );
     for (const [, href] of html.matchAll(
-      /<link rel="stylesheet"[^>]*href="(\/_next\/static\/_vinext_fonts\/[^"]+)"/g,
+      /<link rel="stylesheet"[^>]*href="(\/_next\/static\/[^"]+\.css[^"]*)"/g,
     )) {
       parts.push(await (await fetch(`${fontBaseUrl}${href}`)).text());
     }
@@ -237,7 +237,9 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     ].map((m) => m[1]);
     expect(preloadHrefs.length).toBeGreaterThan(0);
     const googleFontHref = preloadHrefs.find((href) => href.includes("/_vinext_fonts/"));
-    const localFontHref = preloadHrefs.find((href) => !href.includes("/_vinext_fonts/"));
+    const localFontHref = preloadHrefs.find(
+      (href) => !href.includes("/_vinext_fonts/") && href.endsWith(".ttf"),
+    );
     expect(googleFontHref).toBeDefined();
     expect(localFontHref).toBeDefined();
     const styleMatch = html.match(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/);
@@ -247,6 +249,9 @@ describe("App Router Production server self-hosted next/font/google headers", ()
       .match(/@font-face\s*\{[^}]*\}/g)
       ?.find((fontFace) => fontFace.includes(localFontHref!));
     expect(localFontFace).toBeDefined();
+    // Byte-identical to the preload, deployment query included, so the
+    // browser reuses the preloaded file.
+    expect(localFontFace).toContain(`url(${localFontHref})`);
     expect(localFontFace).not.toContain("font-weight:");
     // The fixture mirrors #2793's 400/600/700 reproduction. Its omitted
     // local-font weight also matches the equivalent Next.js fixture:
@@ -261,7 +266,7 @@ describe("App Router Production server self-hosted next/font/google headers", ()
       const fontRes = await fetch(`${fontBaseUrl}${href}`);
       expect(fontRes.status, href).toBe(200);
       expect(fontRes.headers.get("content-type")).toBe(
-        href === localFontHref
+        href.endsWith(".ttf")
           ? "font/ttf"
           : href.endsWith(".otf")
             ? "font/otf"
@@ -280,6 +285,25 @@ describe("App Router Production server self-hosted next/font/google headers", ()
       expect(fontCss).toContain(href);
       expect(preloadHrefs).toContain(href);
     }
+  });
+
+  it("serves next/font/local @font-face rules from a stylesheet, not inline", async () => {
+    // Next.js generates next/font/local's @font-face rules at build time and
+    // ships them in the build's CSS, including for a font declared in its own
+    // module (app/fonts.ts here):
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/next-font/with-font-declarations-file.test.ts
+    const html = await (await fetch(`${fontBaseUrl}/`)).text();
+    const inline = [...html.matchAll(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/g)]
+      .map((m) => m[1])
+      .join("\n");
+    for (const fontFace of inline.match(/@font-face\s*\{[^}]*\}/g) ?? []) {
+      expect(fontFace).not.toMatch(/localSans|declaredFont/);
+    }
+    expect(inline).toContain("--font-declared: 'declaredFont', sans-serif;");
+    const fontCss = await loadFontCss(html);
+    expect(fontCss).toMatch(/@font-face\s*\{[^}]*font-family:\s*'?localSans'?[;}]/);
+    expect(fontCss).toMatch(/@font-face\s*\{[^}]*font-family:\s*'?declaredFont'?[;}]/);
+    expect(fontCss).toMatch(/@font-face\s*\{[^}]*font-family:\s*'?localSans Fallback'?[;}]/);
   });
 
   it("self-hosts an extensionless Google font URL as WOFF2 with matching preloads", async () => {

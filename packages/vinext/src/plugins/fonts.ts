@@ -53,6 +53,8 @@ import { findFontFilesInCss } from "../build/google-fonts/find-font-files-in-css
 import { CONTENT_TYPES } from "../server/static-file-cache.js";
 import { ASSET_PREFIX_URL_DIR } from "../utils/asset-prefix.js";
 import { stripViteModuleQuery } from "../utils/path.js";
+import { fnv1a64 } from "../utils/hash.js";
+import { generateLocalFontFaceCSS, type LocalFontSrc } from "vinext/shims/font-utils";
 
 /**
  * Thrown when Google Fonts returns a non-2xx response. Distinct from a raw
@@ -1293,6 +1295,85 @@ function resolveLocalFontFallbackSource(
 }
 
 /**
+ * Basename of the stylesheet a `localFont()` call's `@font-face` rules are
+ * extracted into. The module lives next to the calling module (so Vite
+ * resolves the rules' relative `url()`s against the same directory as the
+ * call's `src` paths) and is named by a hash of its CSS.
+ */
+const EXTRACTED_LOCAL_FONT_CSS_RE = /(?:^|\/)(__vinext_local_font_[0-9a-z]+\.css)(?:\?.*)?$/;
+
+/**
+ * Build the `@font-face` rules for a statically analyzable `localFont()`
+ * call, the way the runtime shim would, but at build time so they ship in a
+ * stylesheet like Next.js's extracted font CSS. The relative `src` paths are
+ * kept as written; Vite's CSS pipeline resolves them to the same asset URLs
+ * the rewritten asset imports produce. Returns undefined for calls whose
+ * options or sources the transform cannot read; those keep the runtime
+ * injection.
+ */
+function buildExtractedLocalFontFaceCSS(
+  optionsStr: string,
+  family: string,
+  adjustedFallbackCSS: string | undefined,
+): string | undefined {
+  const options = parseStaticObjectLiteral(optionsStr);
+  if (!options) return undefined;
+  const isOptionalString = (value: unknown) => value === undefined || typeof value === "string";
+  const { src, display, weight, style, declarations } = options;
+  if (![display, weight, style].every(isOptionalString)) return undefined;
+
+  const entries: unknown[] = Array.isArray(src) ? src : [src];
+  const sources: LocalFontSrc[] = [];
+  for (const entry of entries) {
+    const source =
+      typeof entry === "string" ? { path: entry } : (entry as Record<string, unknown> | null);
+    if (!source || typeof source !== "object") return undefined;
+    if (
+      typeof source.path !== "string" ||
+      !RELATIVE_FONT_PATH_RE.test(source.path) ||
+      !isOptionalString(source.weight) ||
+      !isOptionalString(source.style)
+    ) {
+      return undefined;
+    }
+    sources.push({
+      path: source.path,
+      weight: source.weight as string | undefined,
+      style: source.style as string | undefined,
+    });
+  }
+  if (sources.length === 0) return undefined;
+
+  if (
+    declarations !== undefined &&
+    !(
+      Array.isArray(declarations) &&
+      declarations.every(
+        (declaration) =>
+          declaration &&
+          typeof declaration === "object" &&
+          typeof (declaration as Record<string, unknown>).prop === "string" &&
+          typeof (declaration as Record<string, unknown>).value === "string",
+      )
+    )
+  ) {
+    return undefined;
+  }
+
+  const fontFaceCSS = generateLocalFontFaceCSS(
+    family,
+    {
+      display: display as string | undefined,
+      weight: weight as string | undefined,
+      style: style as string | undefined,
+      declarations: declarations as Array<{ prop: string; value: string }> | undefined,
+    },
+    sources,
+  );
+  return adjustedFallbackCSS ? `${fontFaceCSS}\n${adjustedFallbackCSS}` : fontFaceCSS;
+}
+
+/**
  * Create the `vinext:local-fonts` Vite plugin.
  *
  * Rewrites relative font file paths in `next/font/local` calls into Vite
@@ -1318,6 +1399,9 @@ export function createLocalFontsPlugin(shimsDir: string): Plugin {
   const fontMetricsCache = new Map<string, LocalFontMetrics | null>();
   // Ids of the modules whose fallback CSS was generated from each font file.
   const fontFileImporters = new Map<string, Set<string>>();
+  // Extracted `@font-face` stylesheets, keyed by basename: the module id the
+  // transform imports and the CSS it loads as.
+  const extractedFontCss = new Map<string, { id: string; css: string }>();
 
   function readFontMetrics(
     context: Rollup.TransformPluginContext,
@@ -1355,6 +1439,32 @@ export function createLocalFontsPlugin(shimsDir: string): Plugin {
 
     watchChange(id) {
       fontMetricsCache.delete(toSlash(id));
+    },
+
+    // The extracted stylesheets exist only in memory. Dev serves them under
+    // their root-relative URL, so resolve by basename and keep any query
+    // Vite added (`?direct`, `?inline`, ...).
+    resolveId: {
+      filter: { id: EXTRACTED_LOCAL_FONT_CSS_RE },
+      handler(source) {
+        const match = EXTRACTED_LOCAL_FONT_CSS_RE.exec(source);
+        const entry = match && extractedFontCss.get(match[1]);
+        if (!entry) return null;
+        const queryIndex = source.indexOf("?");
+        return queryIndex === -1 ? entry.id : entry.id + source.slice(queryIndex);
+      },
+    },
+
+    load: {
+      filter: { id: EXTRACTED_LOCAL_FONT_CSS_RE },
+      handler(id) {
+        // `?url` (and `?raw`) are answered by Vite's CSS and asset plugins,
+        // which load the stylesheet itself back through this hook.
+        if (/[?&](?:url|raw)\b/.test(id)) return null;
+        const match = EXTRACTED_LOCAL_FONT_CSS_RE.exec(id);
+        const entry = match && extractedFontCss.get(match[1]);
+        return entry ? entry.css : null;
+      },
     },
 
     hotUpdate({ file, modules }) {
@@ -1413,6 +1523,7 @@ export function createLocalFontsPlugin(shimsDir: string): Plugin {
         const s = new MagicString(code);
         let hasChanges = false;
         let fontImportCounter = 0;
+        let fontCssImportCounter = 0;
         const imports: string[] = [];
 
         // Match font file paths in `path: "..."` or `src: "..."` properties.
@@ -1465,14 +1576,38 @@ export function createLocalFontsPlugin(shimsDir: string): Plugin {
           const internalFontProperties = [`family: ${JSON.stringify(bindingName)}`];
           const fallbackSource = resolveLocalFontFallbackSource(optionsStr, id);
           const fallbackMetrics = fallbackSource && readFontMetrics(this, fallbackSource.file, id);
+          let adjustedFallbackCSS: string | undefined;
           if (fallbackSource && fallbackMetrics) {
-            const adjustedFallbackCSS = buildFallbackFontFace(
+            adjustedFallbackCSS = buildFallbackFontFace(
               bindingName,
               getFallbackMetricsFromFontFile(fallbackMetrics, fallbackSource.category),
             );
             internalFontProperties.push(
               `adjustedFallbackCSS: ${JSON.stringify(adjustedFallbackCSS)}`,
             );
+          }
+          // Next.js emits the `@font-face` rules (and the fallback face) into
+          // the build's CSS, not into the HTML. Extract them into a
+          // stylesheet module the calling module imports, so Vite bundles
+          // them with the rest of the CSS in both dev and build, and tell the
+          // shim not to inject them again.
+          const extractedCSS = buildExtractedLocalFontFaceCSS(
+            optionsStr,
+            bindingName,
+            adjustedFallbackCSS,
+          );
+          if (extractedCSS) {
+            const basename = `__vinext_local_font_${fnv1a64(extractedCSS)}.css`;
+            const cssId = path.join(path.dirname(stripViteModuleQuery(id)), basename);
+            extractedFontCss.set(basename, { id: cssId, css: extractedCSS });
+            // Imported by URL rather than for its side effect: the shim
+            // links it from the document head like the Google font
+            // stylesheet, which works whichever environment evaluates the
+            // call, including a server-only module the RSC CSS collection
+            // never sees (e.g. an `app/fonts.ts` imported by a layout).
+            const cssVar = `__vinext_local_font_css_${fontCssImportCounter++}`;
+            imports.push(`import ${cssVar} from ${JSON.stringify(`${cssId}?url`)};`);
+            internalFontProperties.push(`stylesheet: ${cssVar}`);
           }
           s.appendLeft(
             insertAt,
