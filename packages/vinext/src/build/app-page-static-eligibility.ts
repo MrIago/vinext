@@ -10,6 +10,12 @@ import {
   resolveAppPageStaticGenerationRuntime,
 } from "../server/app-segment-config.js";
 import {
+  createEnsureStaticTree,
+  EnsureStaticLevel,
+  readEnsureStaticFromSource,
+  resolveEnsureStaticLevel,
+} from "../server/app-ensure-static.js";
+import {
   extractExportConstNumber,
   extractExportConstString,
   extractInstantPrefetchConfig,
@@ -203,6 +209,43 @@ export function readAppPageRouteHasPartialPrefetching(
       return false;
     }
   });
+}
+
+/**
+ * Whether the route's segments export `ensureStatic = "navigation"`, read
+ * from their sources as Next.js's build reads the loader tree
+ * (`resolveEnsureStaticConfig`). An unreadable source has no config.
+ */
+export function isAppPageRouteEnsureStaticNavigation(route: AppRoute): boolean {
+  const readSegment = (filePath: string) => {
+    let code = "";
+    try {
+      code = fs.readFileSync(filePath, "utf8");
+    } catch {
+      // An unreadable segment exports nothing.
+    }
+    return { config: readEnsureStaticFromSource(code), filePath };
+  };
+  const tree = createEnsureStaticTree<string>(
+    {
+      layouts: route.layouts,
+      page: route.pagePath,
+      slots: Object.fromEntries(
+        route.parallelSlots.map((slot) => [
+          slot.name,
+          {
+            configLayouts: slot.configLayoutPaths ?? [],
+            default: slot.defaultPath,
+            layout: slot.layoutPath,
+            layoutIndex: slot.layoutIndex,
+            page: slot.pagePath,
+          },
+        ]),
+      ),
+    },
+    readSegment,
+  );
+  return resolveEnsureStaticLevel(tree, false, () => {}) === EnsureStaticLevel.Navigation;
 }
 
 function readInstantConfig(

@@ -3565,6 +3565,42 @@ describe("static-shell prefetch", () => {
     expect(resolveAutoAppRoutePrefetch("/runtime?q=1", "/feed").staticShell).toBeUndefined();
   });
 
+  // Ported from Next.js: test/e2e/app-dir/segment-cache/app-shell-root-params
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/segment-cache/app-shell-root-params/app-shell-root-params.test.ts
+  // Next.js keys a route's App Shell on its root params (vercel/next.js@643e34a),
+  // so a locale-routed Partial Prefetching route gets one too. Without Partial
+  // Prefetching it keeps the root-param route-tree prefetch.
+  it("prefetches a Partial Prefetching root-param route's App Shell", async () => {
+    useCacheComponentsProduction();
+    (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+      {
+        canPrefetchLoadingShell: false,
+        hasRootParams: true,
+        isDynamic: true,
+        partialPrefetching: true,
+        patternParts: [":lang", ":region", "posts", ":id"],
+      },
+      {
+        canPrefetchLoadingShell: false,
+        hasRootParams: true,
+        isDynamic: true,
+        patternParts: [":lang", "legacy", ":id"],
+      },
+    ];
+    const { resolveAutoAppRoutePrefetch } =
+      await import("../packages/vinext/src/shims/internal/app-route-prefetch-policy.js");
+
+    expect(resolveAutoAppRoutePrefetch("/en/uk/posts/1")).toMatchObject({
+      cacheForNavigation: false,
+      prefetchStage: "shell",
+      requiresRouteTreePrefetch: true,
+      staticShell: true,
+    });
+    const legacy = resolveAutoAppRoutePrefetch("/en/legacy/1");
+    expect(legacy.staticShell).toBeUndefined();
+    expect(legacy).toMatchObject({ cacheForNavigation: true, requiresRouteTreePrefetch: true });
+  });
+
   it("prefetches a route with an unstable_instant config automatically, even when asked for a full prefetch", async () => {
     useCacheComponentsProduction();
     (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [

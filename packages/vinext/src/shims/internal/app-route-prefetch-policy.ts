@@ -225,11 +225,15 @@ export function resolveAutoAppRoutePrefetch(
   //
   // A route that prefetches at runtime renders the prefetch with the request's
   // search params and root params, so those hrefs get one too
-  // (`PrefetchHint.HasRuntimePrefetch`).
+  // (`PrefetchHint.HasRuntimePrefetch`). So does a Partial Prefetching route's
+  // App Shell, which keeps the root params concrete and leaves the others to
+  // holes (vercel/next.js@643e34a).
   const staticShell =
     (isReusablePage ||
       (route.instant === "runtime" && !hasCacheComponentsLearningOnlyDynamicPath)) &&
-    (!requiresRouteTreePrefetch || route.instant === "runtime") &&
+    (!requiresRouteTreePrefetch ||
+      route.instant === "runtime" ||
+      route.partialPrefetching === true) &&
     interceptionContext === null &&
     process.env.NODE_ENV === "production" &&
     String(process.env.__NEXT_CACHE_COMPONENTS) === "true";
