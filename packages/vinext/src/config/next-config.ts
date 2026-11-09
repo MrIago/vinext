@@ -507,6 +507,14 @@ export type NextConfig = {
      */
     defineServer?: Record<string, string | number | boolean>;
   };
+  /** Temporary opt-outs Next.js keeps for deprecated behavior. */
+  deprecated?: {
+    /**
+     * Restore loose App Router matching instead of requiring every URL to
+     * build a complete parallel route tree. Only `true` is accepted.
+     */
+    looseRouteMatching?: true;
+  };
   experimental?: {
     /** Enables hard-navigation recovery when App Router navigation rendering fails. */
     appNavFailHandling?: boolean;
@@ -616,6 +624,18 @@ export type ResolvedNextConfig = {
    */
   instrumentationInject: string[];
   cacheComponents: boolean;
+  /**
+   * Strict App Router route matching (Next.js's default since
+   * vercel/next.js#97397): on unless `deprecated.looseRouteMatching` is set or
+   * `experimental.explicitParallelRouteChildren` is `false`.
+   */
+  strictRouteMatching: boolean;
+  /**
+   * Only include `children` in a parallel route layout when an ordinary
+   * branch declares content for it (`experimental.explicitParallelRouteChildren`,
+   * default `true`).
+   */
+  explicitParallelRouteChildren: boolean;
   /** `partialPrefetching`, which only takes effect with `cacheComponents`. */
   partialPrefetching: boolean;
   /**
@@ -2071,6 +2091,31 @@ function readInstalledReactVersion(root: string): string | null {
   }
 }
 
+/**
+ * Next.js resolves strict route matching from two settings
+ * (server/config.ts): it is on unless `deprecated.looseRouteMatching` is
+ * `true`, and the legacy implicit `children` slot
+ * (`experimental.explicitParallelRouteChildren: false`) turns it off, since
+ * pruning assumes `children` exists only when an ordinary branch backs it.
+ * The config schema accepts only `true` for `looseRouteMatching`.
+ */
+export function resolveStrictRouteMatching(
+  config: Pick<NextConfig, "deprecated">,
+  experimental: Record<string, unknown> | undefined,
+): { strictRouteMatching: boolean; explicitParallelRouteChildren: boolean } {
+  const looseRouteMatching = config.deprecated?.looseRouteMatching;
+  if (looseRouteMatching !== undefined && looseRouteMatching !== true) {
+    throw new Error(
+      `Invalid next.config option "deprecated.looseRouteMatching": expected \`true\`, received ${JSON.stringify(looseRouteMatching)}. Remove it to keep strict route matching.`,
+    );
+  }
+  const explicitParallelRouteChildren = experimental?.explicitParallelRouteChildren !== false;
+  return {
+    explicitParallelRouteChildren,
+    strictRouteMatching: looseRouteMatching !== true && explicitParallelRouteChildren,
+  };
+}
+
 export async function resolveNextConfig(
   config: NextConfig | null,
   root: string = toSlash(process.cwd()),
@@ -2094,6 +2139,8 @@ export async function resolveNextConfig(
       resolveExtensions: null,
       serverResolveExtensions: null,
       cacheComponents: false,
+      strictRouteMatching: true,
+      explicitParallelRouteChildren: true,
       partialPrefetching: false,
       cachedNavigations: false,
       appNavFailHandling: false,
@@ -2559,6 +2606,7 @@ export async function resolveNextConfig(
     instrumentationServerValueInjections: webpackProbe.instrumentationServerValueInjections,
     instrumentationInject: readStringArray(config.instrumentationInject),
     cacheComponents,
+    ...resolveStrictRouteMatching(config, experimental),
     partialPrefetching: cacheComponents && config.partialPrefetching === true,
     cachedNavigations: cacheComponents && experimental?.cachedNavigations === true,
     appNavFailHandling: experimental?.appNavFailHandling === true,

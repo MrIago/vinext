@@ -2904,6 +2904,8 @@ describe("detectNextIntlConfig", () => {
       instrumentationClientRouteManifest: undefined,
       instrumentationServerValueInjections: {},
       instrumentationInject: [],
+      strictRouteMatching: true,
+      explicitParallelRouteChildren: true,
       clientTraceMetadata: undefined,
       staleTimes: { dynamic: 0, static: 300 },
       cacheLife: parseCacheLifeProfiles(undefined),
