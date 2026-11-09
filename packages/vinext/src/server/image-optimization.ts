@@ -908,7 +908,7 @@ function setImageResponseHeaders(
 }
 
 /** The `s-maxage` or `max-age` of a Cache-Control value, like Next.js' getMaxAge. */
-function cacheControlMaxAge(cacheControl: string | null): number {
+export function cacheControlMaxAge(cacheControl: string | null): number {
   const directives = new Map<string, string | undefined>();
   for (const directive of cacheControl?.split(",") ?? []) {
     const [key, value] = directive.trim().split("=", 2);
