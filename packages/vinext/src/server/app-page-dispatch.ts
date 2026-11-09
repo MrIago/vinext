@@ -1873,8 +1873,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     // The shell's resume data cache: every cache entry its renders read or wrote.
     const resumeDataCache = createResumeDataCache();
     _setResumeDataCacheCollector(resumeDataCache);
-    // Its entries replay at any age, so while it collects, a stale cache entry
-    // refreshes first, like Next.js (see shouldRevalidateStaleCacheEntryInForeground).
+    // Its entries replay at any age, so while the shell renders, a stale cache
+    // entry refreshes first, like Next.js (see shouldRevalidateStaleCacheEntryInForeground).
     const warmupBuildResult = await buildCurrentPageElement();
     if (warmupBuildResult.response) {
       return warmupBuildResult.response;

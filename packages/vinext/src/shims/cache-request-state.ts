@@ -2,6 +2,7 @@ import { getCdnCacheAdapter } from "./cdn-cache.js";
 import { type CacheLifeConfig, parseCacheLifeProfiles } from "../utils/cache-life-profiles.js";
 import { getHeadersAccessPhase, isInsideAnyCacheScope } from "./internal/headers-state.js";
 import { isRouteCacheabilityProbe } from "./cacheability-classification.js";
+import { getPprFallbackShellState } from "./ppr-fallback-shell.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
 import type { ResumeDataCache } from "./resume-data-cache.js";
 import {
@@ -410,8 +411,11 @@ export function runWithDetachedCacheObservations<T>(fn: () => Promise<T>): Promi
  * consumes the value will persist it in a server cache: static generation (a
  * prerender, a cacheability probe, an ISR or route handler regeneration, which
  * run in the foreground mode) and an enclosing `"use cache"` or
- * `unstable_cache` scope, even inside a dynamic request, and a fallback
- * shell collecting its resume data cache, whose entries replay at any age.
+ * `unstable_cache` scope, even inside a dynamic request, and the production
+ * and warmup of a fallback shell, a prerender even when a request asks for it,
+ * whose resume data cache replays its entries at any age. Collecting a resume
+ * data cache alone doesn't qualify: an ordinary render keeps the stale value
+ * it served there, as Next.js's background revalidation does.
  * Serving the stale
  * value there would store it again and extend its lifetime. Only an ordinary
  * dynamic request, whose output nothing stores, opts into the background mode.
@@ -420,7 +424,7 @@ export function runWithDetachedCacheObservations<T>(fn: () => Promise<T>): Promi
 export function shouldRevalidateStaleCacheEntryInForeground(): boolean {
   return (
     getCacheState().unstableCacheRevalidation !== "background" ||
-    getCacheState().resumeDataCacheCollector !== null ||
+    getPprFallbackShellState() !== null ||
     process.env.VINEXT_PRERENDER === "1" ||
     isRouteCacheabilityProbe() ||
     isInsideAnyCacheScope()
