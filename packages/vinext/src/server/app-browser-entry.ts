@@ -172,6 +172,7 @@ import {
 } from "./app-visited-response-cache.js";
 import {
   createPopstateRestoreHandler,
+  readMissedTraversalState,
   restoreSynchronousPopstateScrollPosition,
   shouldCommitPopstateUrlWithoutNavigation,
 } from "./app-browser-popstate.js";
@@ -363,6 +364,9 @@ function isStaticExportPayloadDeploymentCompatible(elements: AppElements): boole
     AppElementsWire.readMetadata(elements).artifactCompatibility.deploymentVersion;
   return clientDeploymentVersion !== null && deploymentVersion === clientDeploymentVersion;
 }
+
+// Read once at module load, before any history write (#2822).
+const missedTraversalAtLoad = readMissedTraversalState(window);
 
 const MAX_HISTORY_STATE_SNAPSHOTS = 50;
 const historyController = new AppBrowserHistoryController({
@@ -3262,7 +3266,7 @@ function bootstrapHydration(
     shouldSkipScrollRestore: (navId) => synchronousPopstateScrollRestoreNavigationId === navId,
   });
 
-  window.addEventListener("popstate", (event) => {
+  const onPopstate = (event: Pick<PopStateEvent, "state">): void => {
     // The browser has already applied the history entry by the time popstate
     // fires. App Router state does not include hashes, so matching the
     // committed pathname/search proves this traversal does not need a new RSC
@@ -3312,8 +3316,14 @@ function bootstrapHydration(
       return;
     }
     browserNavigationController.finalizeNavigation(snapshotNavigationId, null);
-    handlePopstate(event);
-  });
+    handlePopstate(event as PopStateEvent);
+  };
+  window.addEventListener("popstate", onPopstate);
+  // Replay a traversal the browser made before this listener existed, as
+  // Next.js's Router effect does after it installs its own (#2822).
+  if (missedTraversalAtLoad !== null) {
+    onPopstate({ state: missedTraversalAtLoad.state });
+  }
 
   if (import.meta.env.DEV && import.meta.hot) {
     const applyRscHmrUpdate = async (updateId: number): Promise<void> => {

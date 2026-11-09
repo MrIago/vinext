@@ -117,3 +117,33 @@ export function createPopstateRestoreHandler(
     });
   };
 }
+
+type MissedTraversalWindow = {
+  history: { state: unknown };
+  navigation?: {
+    activation?: { entry?: { key?: string } | null } | null;
+    currentEntry?: { key?: string } | null;
+  };
+};
+
+/**
+ * A Back/Forward pressed before the App Router installs its popstate listener
+ * moves the document to another history entry while nobody listens, and the
+ * traversal is lost. The Navigation API keeps the entry the document was
+ * activated on, and entry keys survive replaceState, so a different current
+ * entry means a traversal went unobserved. Only entries this router wrote can
+ * be restored; the caller replays the traversal with the returned state.
+ *
+ * Mirrors `hasMissedTraversal` in Next.js's app-router.tsx (vercel/next.js#96252).
+ */
+export function readMissedTraversalState(win: MissedTraversalWindow): { state: unknown } | null {
+  const activationKey = win.navigation?.activation?.entry?.key;
+  const currentKey = win.navigation?.currentEntry?.key;
+  if (activationKey === undefined || currentKey === undefined || activationKey === currentKey) {
+    return null;
+  }
+  const state = win.history.state;
+  if (state === null || typeof state !== "object") return null;
+  if (!Object.keys(state).some((key) => key.startsWith("__vinext"))) return null;
+  return { state };
+}
