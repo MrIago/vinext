@@ -385,6 +385,11 @@ import {
 } from "./plugins/import-meta-url.js";
 import { createWorkerImageImportsPlugin } from "./plugins/worker-image-imports.js";
 import {
+  BLUR_QUALITY,
+  getStaticImageBlur,
+  type StaticImageBlur,
+} from "./build/static-image-blur.js";
+import {
   createWorkerServerOnlyImportsPlugin,
   SERVER_ONLY_SPECIFIER_RE,
 } from "./plugins/worker-server-only-imports.js";
@@ -1506,6 +1511,9 @@ const RESOLVED_IMAGE_ADAPTERS = VIRTUAL_PREFIX + VIRTUAL_IMAGE_ADAPTERS;
 /** Virtual module for composed instrumentation-client bootstrap. */
 const VIRTUAL_INSTRUMENTATION_CLIENT = "private-next-instrumentation-client";
 const RESOLVED_INSTRUMENTATION_CLIENT = `${VIRTUAL_PREFIX}${VIRTUAL_INSTRUMENTATION_CLIENT}.mjs`;
+/** What a static image import resolves to, beside its URL (Next.js' StaticImageData). */
+type StaticImageMeta = { width: number; height: number } & StaticImageBlur;
+
 /** Image file extensions handled by the vinext:image-imports plugin.
  *  Shared between the Rolldown hook filter and the transform handler regex. */
 const IMAGE_EXTS = "png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?";
@@ -2351,7 +2359,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     );
   }
 
-  const imageImportDimCache = new Map<string, { width: number; height: number }>();
+  const imageImportDimCache = new Map<string, StaticImageMeta>();
   const staticImageAssets = new Map<string, { fileName: string; source: Buffer }>();
   const staticImageImportsByModule = new Map<string, Set<string>>();
   const writtenStaticImageFiles = new Set<string>();
@@ -8401,23 +8409,52 @@ export const loadServerActionClient = ${
         if (!id.startsWith("\0vinext-image-meta:")) return null;
         const imagePath = id.replace("\0vinext-image-meta:", "");
         this.addWatchFile(imagePath);
+        const isDev = this.environment.config.command === "serve";
 
         // Read from cache first
         const cache = imageImportDimCache;
-        let dims = cache.get(imagePath);
-        if (!dims) {
+        let meta = cache.get(imagePath);
+        if (!meta) {
+          // Like Next.js' next-image-loader: the dimensions, and a blur
+          // placeholder for still JPEG, PNG, WebP and AVIF images.
+          let buffer: Buffer | undefined;
+          let dims = { width: 0, height: 0 };
           try {
             const { imageSize } = await import("image-size");
-            const buffer = fs.readFileSync(imagePath);
+            buffer = fs.readFileSync(imagePath);
             const result = imageSize(buffer);
             dims = { width: result.width ?? 0, height: result.height ?? 0 };
-            cache.set(imagePath, dims);
           } catch {
-            dims = { width: 0, height: 0 };
+            buffer = undefined;
           }
+          let blur: StaticImageBlur = { blurWidth: 0, blurHeight: 0 };
+          if (buffer) {
+            let extension = path.extname(imagePath).slice(1).toLowerCase();
+            if (extension === "jpg") extension = "jpeg";
+            try {
+              blur = await getStaticImageBlur(buffer, extension, dims, {
+                isDev,
+                root: root ?? process.cwd(),
+              });
+            } catch (error) {
+              console.warn(`[vinext] Failed to make the blur placeholder of ${imagePath}:`, error);
+            }
+          }
+          meta = { ...dims, ...blur };
+          if (buffer) cache.set(imagePath, meta);
         }
 
-        return `export default ${JSON.stringify(dims)};`;
+        if (isDev && meta.blurWidth > 0) {
+          // As in `next dev`, the dev server makes the placeholder on request.
+          return [
+            `import url from ${JSON.stringify(imagePath + "?vinext-image-url")};`,
+            `const meta = ${JSON.stringify(meta)};`,
+            `meta.blurDataURL = ${JSON.stringify(`${nextConfig.basePath}/_next/image?`)} + ` +
+              `new URLSearchParams({ url, w: String(meta.blurWidth), q: "${BLUR_QUALITY}" });`,
+            "export default meta;",
+          ].join("\n");
+        }
+        return `export default ${JSON.stringify(meta)};`;
       },
 
       transform: {
@@ -8493,7 +8530,7 @@ export const loadServerActionClient = ${
             // 1. URL module. In dev it delegates to Vite's asset server; in a
             //    production build it returns a stable Next-shaped URL and the
             //    client build writes the registered source under static/media.
-            // 2. Meta import (we provide { width, height })
+            // 2. Meta import (we provide { width, height } and the blur placeholder)
             // Combined into a StaticImageData object.
             //
             // The binding is `var`, not `const`: the `import X` it replaces is a
@@ -8509,7 +8546,8 @@ export const loadServerActionClient = ${
             const replacement =
               `import ${urlVar} from ${JSON.stringify(absImagePath + "?vinext-image-url")};\n` +
               `import ${metaVar} from ${JSON.stringify(absImagePath + "?vinext-meta")};\n` +
-              `var ${varName} = { src: ${urlVar}, width: ${metaVar}.width, height: ${metaVar}.height };`;
+              `var ${varName} = { src: ${urlVar}, height: ${metaVar}.height, width: ${metaVar}.width, ` +
+              `blurDataURL: ${metaVar}.blurDataURL, blurWidth: ${metaVar}.blurWidth, blurHeight: ${metaVar}.blurHeight };`;
 
             s.overwrite(importNode.start, importNode.end, replacement);
             hasChanges = true;
@@ -8556,7 +8594,7 @@ export const loadServerActionClient = ${
           for (const outputPath of nextWrittenFiles) writtenStaticImageFiles.add(outputPath);
         },
       },
-    } as Plugin & { _dimCache: Map<string, { width: number; height: number }> },
+    } as Plugin & { _dimCache: Map<string, StaticImageMeta> },
     // Google Fonts import rewrite + self-hosting — see src/plugins/fonts.ts
     createGoogleFontsPlugin(_fontGoogleShimPath, _shimsDir),
     // Local font path resolution — see src/plugins/fonts.ts
