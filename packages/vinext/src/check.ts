@@ -293,8 +293,8 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
       "ignored, so imports resolve unoptimized; experimental.optimizePackageImports is supported",
   },
   typedRoutes: {
-    status: "partial",
-    detail: "typed Link hrefs are not generated; vinext typegen provides PageProps/LayoutProps",
+    status: "supported",
+    detail: "vinext typegen writes typed links (.next/types/link.d.ts) like Next.js",
   },
   "compiler.define": { status: "supported" },
   "compiler.defineServer": { status: "supported" },
@@ -368,8 +368,8 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     detail: "renamed to cacheComponents in Next.js 16 and ignored; use cacheComponents",
   },
   "experimental.typedRoutes": {
-    status: "partial",
-    detail: "typed Link hrefs are not generated; vinext typegen provides PageProps/LayoutProps",
+    status: "supported",
+    detail: "moved to the top-level typedRoutes in Next.js 16; read as an alias",
   },
   "experimental.serverActions": {
     status: "supported",

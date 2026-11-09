@@ -287,6 +287,9 @@ async function typegen() {
     root,
     pageExtensions: resolvedNextConfig.pageExtensions,
     cacheLife: resolvedNextConfig.cacheLife,
+    typedRoutes: resolvedNextConfig.typedRoutes,
+    redirects: resolvedNextConfig.redirects,
+    rewrites: resolvedNextConfig.rewrites,
   });
   const nextEnvMessage =
     result.nextEnvStatus === "unchanged"

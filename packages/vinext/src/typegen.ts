@@ -1,3 +1,9 @@
+import { apiRouter, pagesRouter } from "./routing/pages-router.js";
+import {
+  convertCustomRouteSource,
+  generateLinkTypesFile,
+  type LinkTypesManifest,
+} from "./typegen/link-types.js";
 import { generateCacheLifeTypes } from "./typegen/cache-life-types.js";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -14,6 +20,15 @@ type GenerateRouteTypesOptions = {
   root: string;
   appDir?: string | null;
   pageExtensions?: readonly string[];
+  /** `typedRoutes`: also write the typed-links `link.d.ts` (#3075). */
+  typedRoutes?: boolean;
+  /** Resolved redirects and rewrites, whose sources typed links accept. */
+  redirects?: readonly { source: string }[];
+  rewrites?: {
+    beforeFiles: readonly { source: string }[];
+    afterFiles: readonly { source: string }[];
+    fallback: readonly { source: string }[];
+  };
   /** Resolved `cacheLife` profiles, typed as `cacheLife()` overloads (#3244). */
   cacheLife?: Readonly<Record<string, { stale?: number; revalidate?: number; expire?: number }>>;
 };
@@ -73,9 +88,26 @@ export async function generateRouteTypes(
   if (hasCacheLifeTypes) {
     await fs.writeFile(cacheLifePath, generateCacheLifeTypes({ ...options.cacheLife }), "utf-8");
   }
+  // Like Next.js (route-types-utils.ts), `typedRoutes: true` adds link.d.ts
+  // next to the route types, so Route<T>, next/link, next/navigation and
+  // next/form only accept the app's routes.
+  const linkTypesPath = path.join(path.dirname(outPath), "link.d.ts");
+  if (options.typedRoutes === true) {
+    await fs.writeFile(
+      linkTypesPath,
+      generateLinkTypesFile(await collectLinkTypesManifest(root, appDir, pagesDir, options)),
+      "utf-8",
+    );
+  } else {
+    await fs.rm(linkTypesPath, { force: true });
+  }
+  const typeImports = [
+    ...(hasCacheLifeTypes ? ['import "./cache-life.d.ts";'] : []),
+    ...(options.typedRoutes === true ? ['import "./link.d.ts";'] : []),
+  ];
   await fs.writeFile(
     outPath,
-    hasCacheLifeTypes ? `import "./cache-life.d.ts";\n${content}` : content,
+    typeImports.length > 0 ? `${typeImports.join("\n")}\n${content}` : content,
     "utf-8",
   );
   const nextEnv = await ensureNextEnvFile(root, appDir !== null);
@@ -84,6 +116,68 @@ export async function generateRouteTypes(
     nextEnvPath: nextEnv.path,
     nextEnvStatus: nextEnv.status,
   };
+}
+
+/**
+ * The routes typed links accept, collected as Next.js's route types manifest
+ * is (route-types-utils.ts): App Router pages and route handlers, Pages
+ * Router pages, and every route a redirect or rewrite source can match.
+ * Pages Router API routes are keyed by their file path relative to the
+ * project, as Next.js keys them.
+ */
+async function collectLinkTypesManifest(
+  root: string,
+  appDir: string | null,
+  pagesDir: string | null,
+  options: GenerateRouteTypesOptions,
+): Promise<LinkTypesManifest> {
+  const manifest: LinkTypesManifest = {
+    appRoutes: {},
+    pageRoutes: {},
+    redirectRoutes: {},
+    rewriteRoutes: {},
+    appRouteHandlerRoutes: {},
+    pageApiRoutes: [],
+  };
+  if (appDir) {
+    const graph = await appRouteGraph(appDir, options.pageExtensions);
+    for (const route of graph.routes) {
+      const nextRoute = patternToNextFormat(route.pattern);
+      if (route.pagePath) {
+        manifest.appRoutes[nextRoute] ??= { path: path.relative(root, route.pagePath) };
+      } else if (route.routePath) {
+        manifest.appRouteHandlerRoutes[nextRoute] ??= {
+          path: path.relative(root, route.routePath),
+        };
+      }
+    }
+  }
+  if (pagesDir) {
+    const [pageRoutes, apiRoutes] = await Promise.all([
+      pagesRouter(pagesDir, options.pageExtensions),
+      apiRouter(pagesDir, options.pageExtensions),
+    ]);
+    for (const route of pageRoutes) {
+      manifest.pageRoutes[patternToNextFormat(route.pattern)] ??= {
+        path: path.relative(root, route.filePath),
+      };
+    }
+    manifest.pageApiRoutes = apiRoutes.map((route) => path.relative(root, route.filePath));
+  }
+  for (const redirect of options.redirects ?? []) {
+    for (const route of convertCustomRouteSource(redirect.source)) {
+      manifest.redirectRoutes[route] = { path: route };
+    }
+  }
+  const rewrites = options.rewrites;
+  for (const rewrite of rewrites
+    ? [...rewrites.beforeFiles, ...rewrites.afterFiles, ...rewrites.fallback]
+    : []) {
+    for (const route of convertCustomRouteSource(rewrite.source)) {
+      manifest.rewriteRoutes[route] = { path: route };
+    }
+  }
+  return manifest;
 }
 
 async function ensureNextEnvFile(

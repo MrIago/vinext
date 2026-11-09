@@ -2285,6 +2285,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       appDir: hasAppDir ? appDir : null,
       pageExtensions: nextConfig.pageExtensions,
       cacheLife: nextConfig.cacheLife,
+      typedRoutes: nextConfig.typedRoutes,
+      redirects: nextConfig.redirects,
+      rewrites: nextConfig.rewrites,
     });
   }
 

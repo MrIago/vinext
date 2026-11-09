@@ -631,6 +631,11 @@ export type ResolvedNextConfig = {
    */
   strictRouteMatching: boolean;
   /**
+   * `typedRoutes` (or its moved `experimental.typedRoutes` alias): typegen also
+   * writes typed links (`link.d.ts`).
+   */
+  typedRoutes: boolean;
+  /**
    * Only include `children` in a parallel route layout when an ordinary
    * branch declares content for it (`experimental.explicitParallelRouteChildren`,
    * default `true`).
@@ -1197,7 +1202,12 @@ function warnDeprecatedConfigOptions(config: NextConfig, root: string): void {
   }
   // Next.js drops nullish nested values before warning about a moved key.
   const experimental = readOptionalRecord(config.experimental);
-  for (const key of ["skipTrailingSlashRedirect", "cacheComponents", "cacheLife"] as const) {
+  for (const key of [
+    "skipTrailingSlashRedirect",
+    "cacheComponents",
+    "cacheLife",
+    "typedRoutes",
+  ] as const) {
     if (experimental?.[key] != null) {
       warnConfigOnce(
         `\`experimental.${key}\` has been moved to \`${key}\`. Please update your ${configFileName} file accordingly.`,
@@ -2141,6 +2151,7 @@ export async function resolveNextConfig(
       cacheComponents: false,
       strictRouteMatching: true,
       explicitParallelRouteChildren: true,
+      typedRoutes: false,
       partialPrefetching: false,
       cachedNavigations: false,
       appNavFailHandling: false,
@@ -2607,6 +2618,10 @@ export async function resolveNextConfig(
     instrumentationInject: readStringArray(config.instrumentationInject),
     cacheComponents,
     ...resolveStrictRouteMatching(config, experimental),
+    // Next.js copies a moved `experimental.typedRoutes` over the top-level key
+    // (warnOptionHasBeenMovedOutOfExperimental).
+    typedRoutes:
+      (experimental?.typedRoutes ?? (config as { typedRoutes?: unknown }).typedRoutes) === true,
     partialPrefetching: cacheComponents && config.partialPrefetching === true,
     cachedNavigations: cacheComponents && experimental?.cachedNavigations === true,
     appNavFailHandling: experimental?.appNavFailHandling === true,

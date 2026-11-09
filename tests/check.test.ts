@@ -942,7 +942,7 @@ describe("analyzeConfig", () => {
     expect(status("reactCompiler")).toBe("partial");
     expect(status("experimental.reactCompiler")).toBe("partial");
     expect(status("modularizeImports")).toBe("partial");
-    expect(status("typedRoutes")).toBe("partial");
+    expect(status("typedRoutes")).toBe("supported");
     expect(status("compiler.styledComponents")).toBe("partial");
     expect(status("compiler.emotion")).toBe("partial");
     // A parent object without its own entry is not reported.
