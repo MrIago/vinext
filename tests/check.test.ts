@@ -1681,8 +1681,8 @@ describe("checkConventions", () => {
     const items = checkConventions(tmpDir);
     const vt = items.find((i) => i.name.includes("ViewTransition"));
     expect(vt).toBeDefined();
-    expect(vt?.status).toBe("partial");
-    expect(vt?.detail).toContain("passthrough fallback");
+    expect(vt?.status).toBe("supported");
+    expect(vt?.detail).toContain("React 19.3");
     expect(vt?.files).toHaveLength(1);
   });
 

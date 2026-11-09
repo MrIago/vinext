@@ -13,6 +13,7 @@
  * App Router navigations.
  */
 
+import { addNavigationTransitionTypes } from "./internal/navigation-transition-types.js";
 import * as React from "react";
 import {
   __basePath,
@@ -2683,7 +2684,7 @@ function pingVisibleLinksOnceNavigationsSettle(): void {
  */
 const _appRouter: AppRouterInstance = {
   bfcacheId: INITIAL_BFCACHE_ID,
-  push(href: string, options?: { scroll?: boolean }): void {
+  push(href: string, options?: { scroll?: boolean; transitionTypes?: string[] }): void {
     assertSafeNavigationUrl(href);
     if (isServer) return;
     // An imperative navigation supersedes any <Link>-owned pending state.
@@ -2693,6 +2694,7 @@ const _appRouter: AppRouterInstance = {
     const releaseNavigation = trackScheduledAppRouterNavigation();
     try {
       React.startTransition(() => {
+        addNavigationTransitionTypes(options?.transitionTypes);
         void navigateClientSide(href, "push", options?.scroll !== false, true);
       });
     } catch (error) {
@@ -2701,13 +2703,14 @@ const _appRouter: AppRouterInstance = {
     }
     releaseScheduledAppRouterNavigationAfterCurrentTask(releaseNavigation);
   },
-  replace(href: string, options?: { scroll?: boolean }): void {
+  replace(href: string, options?: { scroll?: boolean; transitionTypes?: string[] }): void {
     assertSafeNavigationUrl(href);
     if (isServer) return;
     notifyAppNavigationStart(href);
     const releaseNavigation = trackScheduledAppRouterNavigation();
     try {
       React.startTransition(() => {
+        addNavigationTransitionTypes(options?.transitionTypes);
         void navigateClientSide(href, "replace", options?.scroll !== false, true);
       });
     } catch (error) {

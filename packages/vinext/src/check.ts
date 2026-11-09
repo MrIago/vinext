@@ -1586,9 +1586,10 @@ export function checkConventions(root: string): CheckItem[] {
   // Emit items for the combined scan results
   if (viewTransitionFiles.length > 0) {
     items.push({
-      name: "ViewTransition (React canary API)",
-      status: "partial",
-      detail: "vinext auto-shims with a passthrough fallback, view transitions won't animate",
+      name: "ViewTransition",
+      status: "supported",
+      detail:
+        "stable in React 19.3, which vinext requires; <Link transitionTypes> and router.push/replace transitionTypes are supported",
       files: viewTransitionFiles,
     });
   }

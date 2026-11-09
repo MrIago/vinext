@@ -7,6 +7,7 @@
  * On click, prevents full page reload and triggers client-side
  * page swap via the router's navigation system.
  */
+import { addNavigationTransitionTypes } from "./internal/navigation-transition-types.js";
 import React, {
   forwardRef,
   useCallback,
@@ -1397,7 +1398,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     unstable_dynamicOnHover = false,
     legacyBehavior = false,
     passHref = false,
-    transitionTypes: _transitionTypes,
+    transitionTypes,
     locale,
     ...anchorProps
   },
@@ -1824,6 +1825,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       if (setter) setLinkForCurrentNavigation(setter);
       setPending(true);
       React.startTransition(() => {
+        addNavigationTransitionTypes(transitionTypes);
         void navigateClientSide(navigateHref, replace ? "replace" : "push", scroll, false).finally(
           () => {
             setPending(false);
