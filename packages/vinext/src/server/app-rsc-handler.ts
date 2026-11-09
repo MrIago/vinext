@@ -39,6 +39,7 @@ import {
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SECRET_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
+  VINEXT_PRERENDER_PARAM_MATCHING_PATH,
   VINEXT_PRERENDER_STATIC_PARAMS_PATH,
   VINEXT_PARAMS_HEADER,
   VINEXT_RENDERED_PATH_AND_SEARCH_HEADER,
@@ -776,6 +777,8 @@ export type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
   renderNotFound: (options: RenderNotFoundOptions<TRoute>) => Promise<Response | null>;
   renderPagesFallback?: (options: RenderPagesFallbackOptions) => Promise<Response | null>;
   rootParamNamesByPattern?: RootParamNamesMap;
+  /** Every page route's parameter matching policy, for the prerender endpoint. */
+  resolvePrerenderParamMatchingPolicies?: () => Promise<unknown>;
   setNavigationContext: (context: NavigationContextValue) => void;
   /** next.config `skipProxyUrlNormalize`. */
   skipProxyUrlNormalize?: boolean;
@@ -1187,6 +1190,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
 
   if (
     pathname === VINEXT_PRERENDER_STATIC_PARAMS_PATH ||
+    pathname === VINEXT_PRERENDER_PARAM_MATCHING_PATH ||
     pathname === VINEXT_PRERENDER_PAGES_STATIC_PATHS_PATH ||
     pathname === VINEXT_PRERENDER_METADATA_ROUTES_PATH
   ) {
@@ -1201,6 +1205,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       getMetadataRoutePaths: options.getPrerenderMetadataRoutePaths,
       loadPagesRoutes: options.loadPrerenderPagesRoutes,
       pathname,
+      resolveParamMatchingPolicies: options.resolvePrerenderParamMatchingPolicies,
       rootParamNamesByPattern: options.rootParamNamesByPattern,
       staticParamsMap: options.staticParamsMap,
     });

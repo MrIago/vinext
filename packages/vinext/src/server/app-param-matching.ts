@@ -715,3 +715,32 @@ export function isParamMatchingFallbackShellAllowed(
   );
   return mode === "prerender";
 }
+
+/**
+ * Every page route's effective policy, keyed by pattern, after checking that
+ * route handlers configure none and that closed parameters agree across
+ * routes. Pages without exports are included: an omitted policy cannot
+ * silently inherit another route's closure.
+ */
+export async function resolveAppParamMatchingPolicies(
+  routes: readonly (ParamMatchingRoute & { routeHandler?: ParamMatchingModule })[],
+  options: {
+    cacheComponents: boolean;
+    ensureRouteLoaded?: (route: never) => Promise<void> | void;
+  },
+): Promise<Record<string, ParamMatching | null>> {
+  const paramMatchingByRoute = new Map<string, ParamMatching | undefined>();
+  for (const route of routes) {
+    await options.ensureRouteLoaded?.(route as never);
+    if (route.routeHandler) assertRouteHandlerHasNoParamMatching(route.pattern, route.routeHandler);
+    if (!route.page) continue;
+    paramMatchingByRoute.set(
+      route.pattern,
+      await resolveRouteParamMatching(route, { cacheComponents: options.cacheComponents }),
+    );
+  }
+  if (options.cacheComponents) validateParamMatchingCoherence(paramMatchingByRoute);
+  const policies: Record<string, ParamMatching | null> = {};
+  for (const [pattern, policy] of paramMatchingByRoute) policies[pattern] = policy ?? null;
+  return policies;
+}

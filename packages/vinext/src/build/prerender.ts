@@ -46,6 +46,7 @@ import {
   VINEXT_METADATA_ROUTE_CACHE_HEADER,
   VINEXT_PRERENDER_REWRITTEN_HEADER,
   VINEXT_PRERENDER_METADATA_ROUTES_PATH,
+  VINEXT_PRERENDER_PARAM_MATCHING_PATH,
   VINEXT_PRERENDER_RENDER_ERROR_HEADER,
   VINEXT_PRERENDER_SPECIAL_ERROR_HEADER,
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
@@ -83,6 +84,12 @@ import {
   splitAppPprFallbackShellState,
 } from "../server/app-ppr-fallback-shell.js";
 import { enterPrerenderPhase } from "./prerender-phase.js";
+import {
+  collectGeneratedParamNames,
+  isParamMatchingFallbackShellAllowed,
+  validateParamMatchingParams,
+  type ParamMatching,
+} from "../server/app-param-matching.js";
 import { buildAppRouteCacheValue } from "../server/app-route-handler-response.js";
 import {
   readPrerenderCacheLifeHeader,
@@ -1549,6 +1556,24 @@ export async function prerenderApp({
       },
     });
 
+    // Each page route's parameter matching policy, resolved by the server
+    // where its generators run. Like Next.js's build, an invalid or
+    // incoherent policy fails the build before any route renders.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/index.ts
+    let paramMatchingByPattern: Record<string, ParamMatching | null> = {};
+    if (config.cacheComponents === true) {
+      const res = await fetch(`${baseUrl}${VINEXT_PRERENDER_PARAM_MATCHING_PATH}`, {
+        headers: secretHeaders,
+      });
+      const text = await res.text();
+      if (res.status === 500) throw new Error(parsePrerenderEndpointError(text));
+      if (res.ok && text) {
+        paramMatchingByPattern = JSON.parse(text) as Record<string, ParamMatching | null>;
+      }
+    }
+    const paramMatchingOf = (pattern: string): ParamMatching | undefined =>
+      paramMatchingByPattern[pattern] ?? undefined;
+
     // ── Collect URLs to render ────────────────────────────────────────────────
     type UrlToRender = {
       kind?: "page" | "metadata";
@@ -1611,6 +1636,17 @@ export async function prerenderApp({
       if (config.cacheComponents !== true || mode === "export") return;
       for (const fallbackShell of createAppPprFallbackShells(route, params)) {
         if (queuedRouteUrls.has(fallbackShell.pathname)) continue;
+        // A not-found or blocking boundary has no fallback shell: Next.js
+        // emits only a matcher for it, and a request renders its own path.
+        if (
+          !isParamMatchingFallbackShellAllowed(
+            paramMatchingOf(route.pattern),
+            fallbackShell.fallbackParamNames,
+            route.rootParamNames ?? [],
+          )
+        ) {
+          continue;
+        }
         queuedRouteUrls.add(fallbackShell.pathname);
         const keptParamNames = route.params.filter(
           (name) => !fallbackShell.fallbackParamNames.includes(name),
@@ -1784,6 +1820,22 @@ export async function prerenderApp({
                 : routeStaticParamSets(route, Array.isArray(results) ? results : [], {
                     staticExport: mode === "export",
                   });
+          }
+
+          const paramMatching = paramMatchingOf(route.pattern);
+          if (paramMatching) {
+            const { generatedParamNames, missingParamNames } = collectGeneratedParamNames(
+              route.params,
+              paramSets ?? [],
+            );
+            validateParamMatchingParams(
+              route.pattern,
+              paramMatching,
+              generatedParamNames,
+              missingParamNames,
+              route.params,
+              mode === "export" ? "export" : undefined,
+            );
           }
 
           // null: route has no generateStaticParams (CF Workers Proxy returned null)

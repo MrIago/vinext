@@ -70,6 +70,9 @@ export {
 /** Internal endpoint used to evaluate App Router generateStaticParams exports. */
 export const VINEXT_PRERENDER_STATIC_PARAMS_PATH = "/__vinext/prerender/static-params";
 
+/** Internal endpoint used to resolve App Router parameter matching policies. */
+export const VINEXT_PRERENDER_PARAM_MATCHING_PATH = "/__vinext/prerender/param-matching";
+
 /** Internal endpoint used to evaluate Pages Router getStaticPaths exports. */
 export const VINEXT_PRERENDER_PAGES_STATIC_PATHS_PATH = "/__vinext/prerender/pages-static-paths";
 
