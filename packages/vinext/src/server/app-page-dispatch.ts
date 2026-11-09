@@ -1883,7 +1883,11 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   if (
     paramMatchingAdmission === null &&
     options.skipStaticParamsValidation !== true &&
-    !(options.isProduction && isForceDynamic)
+    !(options.isProduction && isForceDynamic) &&
+    // Draft Mode renders a path the build didn't generate even under
+    // `dynamicParams = false`, as the Pages fallback gate already does
+    // (vercel/next.js#99370). Its render never reaches the public cache.
+    !isDraftMode
   ) {
     const dynamicParamsResponse = await validateAppPageDynamicParams({
       enforceStaticParamsOnly: options.dynamicParamsConfig === false,

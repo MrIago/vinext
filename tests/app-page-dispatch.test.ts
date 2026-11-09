@@ -2171,6 +2171,31 @@ describe("app page dispatch", () => {
     expect(ensureRouteLoaded).not.toHaveBeenCalled();
   });
 
+  // Ported from Next.js (vercel/next.js#99370): Draft Mode renders a path
+  // `dynamicParams = false` would reject for an ordinary request.
+  it("renders an ungenerated closed param in Draft Mode (#3547)", async () => {
+    const { options } = createDispatchOptions({
+      async buildPageElement() {
+        return React.createElement("p", null, "draft");
+      },
+      async generateStaticParams() {
+        return [{ slug: "known" }];
+      },
+      isProduction: true,
+      isRscRequest: true,
+      isrGet: vi.fn(async () => null),
+      request: new Request("http://localhost/posts/unknown", {
+        headers: { cookie: "__prerender_bypass=draft-secret" },
+      }),
+      revalidateSeconds: 60,
+      route: createRoute({ isDynamic: true, params: ["slug"] }),
+    });
+
+    const response = await dispatchAppPage({ ...options, dynamicParamsConfig: false });
+
+    expect(response.status).toBe(200);
+  });
+
   it("bounds a redirect from a generated-param miss by the route's dynamic stale time (#3745)", async () => {
     // A not-found boundary that calls redirect() answers an RSC request with
     // a streamed redirect, which a prefetch may replay.
