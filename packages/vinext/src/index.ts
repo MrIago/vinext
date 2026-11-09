@@ -3781,10 +3781,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // other server external, but `transpilePackages` opts a package back
         // into the bundle (#3485): a server compiled to a single file must not
         // need `react` / `react-dom` from node_modules at runtime.
+        // Only `transpilePackages` opts a package into the bundle;
+        // `optimizePackageImports` rewrites imports and must not move React.
+        const userTranspilePackages = nextConfig?.transpilePackages ?? [];
         const ssrReactExternals = ["react", "react-dom", "react-dom/server"].filter(
           (entry) =>
-            !serverTranspilePackages.includes(entry) &&
-            !serverTranspilePackages.includes(entry.split("/")[0]!),
+            !userTranspilePackages.includes(entry) &&
+            !userTranspilePackages.includes(entry.split("/")[0]!),
         );
         // Detect if this is a multi-environment build (App Router or Cloudflare).
         // In multi-env builds, manualChunks must only be set per-environment
