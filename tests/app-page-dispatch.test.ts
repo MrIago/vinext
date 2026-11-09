@@ -6973,6 +6973,27 @@ describe("app page dispatch", () => {
     expect(buildPageElement).not.toHaveBeenCalled();
   });
 
+  // Ported from Next.js (build/templates/app-page-runtime.ts,
+  // `shouldForceDynamicPPRRender`; issue cloudflare/vinext#3320): a shell's
+  // head is already closed, so an HTML-limited bot renders the page with
+  // blocking metadata instead of resuming the shell.
+  it("renders an HTML-limited bot's request instead of serving a fallback shell", async () => {
+    const buildPageElement = createParamTextPageElement();
+    const isrGet = createPprBlogFallbackShellGetter(false);
+    const { options } = createPprBlogDispatchOptions({
+      buildPageElement,
+      isrGet,
+      request: new Request("http://localhost/en/blog/new-post", {
+        headers: { "user-agent": "Twitterbot/1.0" },
+      }),
+    });
+
+    await dispatchAppPage(options);
+
+    expect(isrGet).not.toHaveBeenCalledWith("shell:/en/blog/[slug]");
+    expect(buildPageElement).toHaveBeenCalled();
+  });
+
   it("decides from a stored fallback shell's generated params without asking generateStaticParams", async () => {
     const generateStaticParams = vi.fn(async () => [{ locale: "en", slug: "hello" }]);
     const buildPageElement = createParamTextPageElement();

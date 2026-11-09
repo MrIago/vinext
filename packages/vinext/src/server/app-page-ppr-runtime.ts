@@ -11,6 +11,7 @@ import {
   _setResumeDataCacheSeed,
 } from "vinext/shims/cache-request-state";
 import { markDynamicUsage } from "vinext/shims/internal/headers-state";
+import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
 import { createResumeDataCache, parseResumeDataCache } from "vinext/shims/resume-data-cache";
 import {
   isQueryFreeManifestDispatch,
@@ -43,6 +44,7 @@ type PprFallbackShellEligibility =
         | "skip-fallback-shell-render"
         | "seed-rsc-request"
         | "skip-non-get"
+        | "skip-blocking-metadata"
         | "skip-cache-disabled"
         | "skip-on-demand-revalidate";
     };
@@ -63,6 +65,20 @@ function classifyPprFallbackShellEligibility<TRoute extends AppPageDispatchRoute
   // stores it instead of resuming a shell with the values it was built with.
   if (_isOnDemandRevalidate()) return { kind: "skip-on-demand-revalidate" };
   if (options.request.method !== "GET") return { kind: "skip-non-get" };
+  // A shell has already closed its head, so metadata resolved while it
+  // resumes lands after the head, where an HTML-limited bot can't see it.
+  // Like Next.js (build/templates/app-page-runtime.ts,
+  // `shouldForceDynamicPPRRender`), such a request skips the shell and renders
+  // the page with blocking metadata in the initial head.
+  if (
+    !options.isRscRequest &&
+    !shouldServeStreamingMetadata(
+      options.request.headers.get("user-agent") ?? "",
+      options.htmlLimitedBots,
+    )
+  ) {
+    return { kind: "skip-blocking-metadata" };
+  }
   if (
     !shouldReadAppPageCache({
       isDraftMode,
