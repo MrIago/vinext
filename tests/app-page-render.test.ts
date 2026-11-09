@@ -3049,7 +3049,9 @@ describe("ISR storage of a page's special error", () => {
     await expect(response.text()).resolves.toBe("page:404");
   });
 
-  it("doesn't mark a special error from a speculative prerender", async () => {
+  // As Next.js's build does, a route without segment config writes its
+  // special error too.
+  it("marks a special error from a speculative prerender", async () => {
     const common = createCommonOptions();
 
     const { markers, response } = await recordPrerenderSpecialErrors(() =>
@@ -3064,7 +3066,7 @@ describe("ISR storage of a page's special error", () => {
     );
 
     expect(response.status).toBe(404);
-    expect(markers).toEqual([]);
+    expect(markers).toEqual([{ headers: {}, status: 404 }]);
     await response.text();
   });
 
