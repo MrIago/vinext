@@ -970,6 +970,45 @@ function createPassthroughImageResponse(
   return new Response(body, { status: 200, headers });
 }
 
+const DEFAULT_IMAGE_MAXIMUM_REDIRECTS = 3;
+
+/**
+ * Fetch a source, following the redirects an internal source answers with,
+ * as Next.js' `fetchInternalImage` does since vercel/next.js#100005: a
+ * relative Location is fetched again through the same internal path, and an
+ * absolute one only where remote sources are allowed (the Node.js server),
+ * through the same SSRF-guarded remote fetch. Past `maximumRedirects`, or for
+ * an absolute target without remote fetching, the redirect response itself is
+ * returned and answers 500 as before (#4564).
+ */
+export async function fetchImageSourceFollowingRedirects(
+  handlers: Pick<ImageHandlers, "allowRemote" | "fetchAsset">,
+  imageUrl: string,
+  request: Request,
+  maximumRedirects: number,
+): Promise<Response> {
+  let target = imageUrl;
+  let response = await handlers.fetchAsset(target, request);
+  for (let hop = 0; hop < maximumRedirects; hop++) {
+    if (response.status < 300 || response.status >= 400) return response;
+    const location = response.headers.get("Location");
+    if (!location) return response;
+    const base = new URL(target, request.url);
+    let next: URL;
+    try {
+      next = new URL(location, base);
+    } catch {
+      return response;
+    }
+    const sameOrigin = next.origin === new URL(request.url).origin;
+    if (!sameOrigin && !handlers.allowRemote) return response;
+    response.body?.cancel().catch(() => {});
+    target = sameOrigin ? `${next.pathname}${next.search}` : next.href;
+    response = await handlers.fetchAsset(target, request);
+  }
+  return response;
+}
+
 /** Whether a source's Content-Length is more than `limit` bytes. */
 function declaresMoreThan(source: Response, limit: number): boolean {
   return Number(source.headers.get("Content-Length") ?? Number.NaN) > limit;
@@ -1029,7 +1068,12 @@ export async function handleImageOptimization(
   const { imageUrl, width, quality } = params;
 
   // Fetch source image
-  const fetchedSource = await handlers.fetchAsset(imageUrl, request);
+  const fetchedSource = await fetchImageSourceFollowingRedirects(
+    handlers,
+    imageUrl,
+    request,
+    imageConfig?.maximumRedirects ?? DEFAULT_IMAGE_MAXIMUM_REDIRECTS,
+  );
   const isBuildAsset = isImageBuildAsset(fetchedSource);
   const limit = imageConfig?.maximumResponseBody ?? DEFAULT_MAXIMUM_RESPONSE_BODY;
   const source = await withDetectedImageContentType(fetchedSource, limit);
