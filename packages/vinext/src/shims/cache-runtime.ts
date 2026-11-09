@@ -371,7 +371,11 @@ async function serializeCacheResult<TResult>(
     // errored Flight row rejects the callable-cache invocation instead of
     // returning the original, unserializable object.
     const [deserializedResult, bytes] = await Promise.all([
-      rsc.createFromReadableStream<TResult>(returnStream, {}, { preserveServerReferences: true }),
+      // Load the real module of each Server Action in the result, as Next.js's
+      // `__next_require__` does, so the caller can invoke it. A preserved
+      // reference only re-serializes, and throws when called, which broke a
+      // cached action that generateStaticParams() or a render calls.
+      rsc.createFromReadableStream<TResult>(returnStream, {}),
       // Draining the saved branch is part of cache entry generation: lazy
       // Server Components may execute here and contribute tags, cache life,
       // or root param dependencies to the active cache scope.
@@ -923,7 +927,6 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
             return rsc.createFromReadableStream<TResult>(
               uint8ToStream(base64ToUint8(privateHit.serialized.body)),
               {},
-              { preserveServerReferences: true },
             );
           }
           return privateHit.result;
@@ -1214,7 +1217,6 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
           const result = await rsc.createFromReadableStream<TResult>(
             uint8ToStream(base64ToUint8(existing.value.data.body)),
             {},
-            { preserveServerReferences: true },
           );
           recordRequestScopedCacheControl(existing.cacheControl);
           // vinext always stores a lifetime. Without one, a custom handler's
