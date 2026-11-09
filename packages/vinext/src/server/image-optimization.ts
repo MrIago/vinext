@@ -972,14 +972,26 @@ function createPassthroughImageResponse(
 
 const DEFAULT_IMAGE_MAXIMUM_REDIRECTS = 3;
 
+const IMAGE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const TOO_MANY_INTERNAL_REDIRECTS_MESSAGE =
+  '"url" parameter is valid but internal response is invalid';
+
 /**
  * Fetch a source, following the redirects an internal source answers with,
- * as Next.js' `fetchInternalImage` does since vercel/next.js#100005: a
- * relative Location is fetched again through the same internal path, and an
- * absolute one only where remote sources are allowed (the Node.js server),
- * through the same SSRF-guarded remote fetch. Past `maximumRedirects`, or for
- * an absolute target without remote fetching, the redirect response itself is
- * returned and answers 500 as before (#4564).
+ * as Next.js' `fetchInternalImage` does (packages/next/src/server/image-optimizer.ts,
+ * vercel/next.js#100005), for #4564:
+ *
+ * - Only 301, 302, 303, 307 and 308 with a parseable Location are followed;
+ *   any other response is the source's answer, as before.
+ * - With no redirects left, the endpoint answers 508.
+ * - The Location is validated like a `url` parameter, without matching
+ *   localPatterns/remotePatterns again (Next.js' `isRedirect`); an invalid
+ *   one answers 400.
+ * - A relative Location is fetched again through the internal path; an
+ *   absolute one goes through the remote fetch, which the Node.js server
+ *   guards against SSRF and DNS rebinding. Workers can't pin a fetch to the
+ *   address they checked, so they serve local sources only and answer 400
+ *   for an absolute redirect target instead of fetching it unguarded.
  */
 export async function fetchImageSourceFollowingRedirects(
   handlers: Pick<ImageHandlers, "allowRemote" | "fetchAsset">,
@@ -987,26 +999,44 @@ export async function fetchImageSourceFollowingRedirects(
   request: Request,
   maximumRedirects: number,
 ): Promise<Response> {
-  let target = imageUrl;
-  let response = await handlers.fetchAsset(target, request);
-  for (let hop = 0; hop < maximumRedirects; hop++) {
-    if (response.status < 300 || response.status >= 400) return response;
+  let response = await handlers.fetchAsset(imageUrl, request);
+  let remaining = maximumRedirects;
+  while (IMAGE_REDIRECT_STATUSES.has(response.status)) {
     const location = response.headers.get("Location");
-    if (!location) return response;
-    const base = new URL(target, request.url);
-    let next: URL;
-    try {
-      next = new URL(location, base);
-    } catch {
-      return response;
-    }
-    const sameOrigin = next.origin === new URL(request.url).origin;
-    if (!sameOrigin && !handlers.allowRemote) return response;
+    if (!location || !URL.canParse(location, "http://n")) return response;
     response.body?.cancel().catch(() => {});
-    target = sameOrigin ? `${next.pathname}${next.search}` : next.href;
-    response = await handlers.fetchAsset(target, request);
+    if (remaining === 0) {
+      return imageSourceErrorResponse(508, TOO_MANY_INTERNAL_REDIRECTS_MESSAGE);
+    }
+    remaining--;
+    const target = validateImageRedirectLocation(location);
+    if (target === null) return imageSourceErrorResponse(400, '"url" parameter is invalid');
+    if (target.isAbsolute && !handlers.allowRemote) {
+      return imageSourceErrorResponse(400, '"url" parameter is not allowed');
+    }
+    response = await handlers.fetchAsset(target.href, request);
   }
   return response;
+}
+
+/**
+ * Next.js' `validateUrlParam` for a redirect Location: a path starting with
+ * a single `/`, or an http(s) URL. Pattern lists are not consulted again.
+ */
+function validateImageRedirectLocation(
+  location: string,
+): { href: string; isAbsolute: boolean } | null {
+  if (location.startsWith("/")) {
+    if (location.startsWith("//") || location.startsWith("/\\")) return null;
+    return { href: location, isAbsolute: false };
+  }
+  try {
+    const url = new URL(location);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return { href: url.href, isAbsolute: true };
+  } catch {
+    return null;
+  }
 }
 
 /** Whether a source's Content-Length is more than `limit` bytes. */

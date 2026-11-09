@@ -27,7 +27,7 @@ describe("fetchImageSourceFollowingRedirects", () => {
     expect(await response.text()).toBe("png");
   });
 
-  it("stops at maximumRedirects", async () => {
+  it("answers 508 past maximumRedirects", async () => {
     let calls = 0;
     const response = await fetchImageSourceFollowingRedirects(
       {
@@ -41,7 +41,7 @@ describe("fetchImageSourceFollowingRedirects", () => {
       2,
     );
     expect(calls).toBe(3);
-    expect(response.status).toBe(307);
+    expect(response.status).toBe(508);
   });
 
   it("does not follow an absolute redirect without remote fetching", async () => {
@@ -58,7 +58,27 @@ describe("fetchImageSourceFollowingRedirects", () => {
       3,
     );
     expect(seen).toEqual(["/a.png"]);
-    expect(response.status).toBe(307);
+    expect(response.status).toBe(400);
+  });
+
+  it("answers 400 for a Location that isn't a valid image url", async () => {
+    const response = await fetchImageSourceFollowingRedirects(
+      { fetchAsset: async () => redirect("//evil.example/a.png") },
+      "/a.png",
+      request,
+      3,
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it("returns a non-redirect 3xx as the source's own answer", async () => {
+    const response = await fetchImageSourceFollowingRedirects(
+      { fetchAsset: async () => new Response(null, { status: 304 }) },
+      "/a.png",
+      request,
+      3,
+    );
+    expect(response.status).toBe(304);
   });
 
   it("follows an absolute redirect where remote sources are allowed", async () => {
