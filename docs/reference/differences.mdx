@@ -84,6 +84,7 @@ With `cacheComponents`, vinext resumes stored shells as Next.js does (see [Parti
 - Next.js prerenders a route's shells at build. vinext renders a path in full on its first request and, when that render is dynamic, produces the path's own shell after it, and renders a fallback shell on the first request that needs it.
 - A client page that reads its `searchParams` prop is a hole of its shell, which a request fills with the browser's query. Next.js renders that page in the browser instead, and serves the route as a static page when nothing else in it is dynamic.
 - On a Workers Cache deployment, a path the deploy manifest certifies as static is dispatched without its query, unless a `next.config` header sets its cache policy, so a resumed shell's `useSearchParams()` holes render in the browser, as the path's static render does.
+- Under Partial Prefetching (see [Partial Prefetching](/docs/caching#partial-prefetching)), Next.js prefetches each segment on its own and uses a static request when the shell holds every cache it needs. vinext prefetches the whole page in one request, and a `prefetch={true}` prefetch always renders for the request.
 
 ## Routing config
 
