@@ -12,7 +12,7 @@
 import fs from "node:fs";
 import path from "pathslash";
 
-export const WEAKREF_COMPAT_DATE = "2025-05-05";
+const WEAKREF_COMPAT_DATE = "2025-05-05";
 
 export type WranglerCompatibility = {
   compatibilityDate?: string;
