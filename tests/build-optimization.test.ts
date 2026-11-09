@@ -777,6 +777,49 @@ describe("optimizeDeps.exclude for vinext", () => {
     }
   }, 15000);
 
+  // https://github.com/cloudflare/vinext/issues/3485: `transpilePackages`
+  // bundles React into the SSR build instead of leaving it external.
+  it("lets transpilePackages bundle react and react-dom into the ssr build", async () => {
+    const vinext = (await import("../packages/vinext/src/index.js")).default;
+    const mainPlugin = vinext().find(
+      (p: any) => p.name === "vinext:config" && typeof p.config === "function",
+    );
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+    const path = await import("node:path");
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-ssr-transpile-react-"));
+    await fsp.symlink(
+      path.resolve(import.meta.dirname, "../node_modules"),
+      path.join(tmpDir, "node_modules"),
+      "junction",
+    );
+    await fsp.mkdir(path.join(tmpDir, "app"), { recursive: true });
+    await fsp.writeFile(
+      path.join(tmpDir, "app", "layout.tsx"),
+      `export default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }`,
+    );
+    await fsp.writeFile(
+      path.join(tmpDir, "app", "page.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+    await fsp.writeFile(
+      path.join(tmpDir, "next.config.mjs"),
+      `export default { transpilePackages: ["react", "react-dom"] };`,
+    );
+    try {
+      const result = await (mainPlugin as any).config(
+        { root: tmpDir, build: {}, plugins: [] },
+        { command: "build" },
+      );
+      const external = result.environments.ssr.resolve.external;
+      expect(external).not.toContain("react");
+      expect(external).not.toContain("react-dom");
+      expect(external).not.toContain("react-dom/server");
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 15000);
+
   it("excludes vinext in all environments for App Router builds", async () => {
     const vinext = (await import("../packages/vinext/src/index.js")).default;
     const plugins = vinext();

@@ -3704,6 +3704,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           openTelemetryPackages,
         );
         resolvedServerExternalPackages = nextServerExternal;
+        // React is externalized from the SSR build by default, like every
+        // other server external, but `transpilePackages` opts a package back
+        // into the bundle (#3485): a server compiled to a single file must not
+        // need `react` / `react-dom` from node_modules at runtime.
+        const ssrReactExternals = ["react", "react-dom", "react-dom/server"].filter(
+          (entry) =>
+            !serverTranspilePackages.includes(entry) &&
+            !serverTranspilePackages.includes(entry.split("/")[0]!),
+        );
         // Detect if this is a multi-environment build (App Router or Cloudflare).
         // In multi-env builds, manualChunks must only be set per-environment
         // (on the client env), not globally — otherwise it leaks into RSC/SSR
@@ -4004,9 +4013,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               : {
                   ssr: {
                     external: [
-                      "react",
-                      "react-dom",
-                      "react-dom/server",
+                      ...ssrReactExternals,
                       ...ipaddrSsrExternal,
                       ...(Array.isArray(config.ssr?.external) ? config.ssr.external : []),
                       ...nextServerExternal,
@@ -4706,13 +4713,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             },
             ssr: {
               resolve: {
-                external: [
-                  "react",
-                  "react-dom",
-                  "react-dom/server",
-                  ...ipaddrSsrExternal,
-                  ...nextServerExternal,
-                ],
+                external: [...ssrReactExternals, ...ipaddrSsrExternal, ...nextServerExternal],
                 noExternal: true as const,
               },
               optimizeDeps: {
