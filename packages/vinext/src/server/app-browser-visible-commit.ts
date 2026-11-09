@@ -557,3 +557,24 @@ export async function resolveAndClassifyNavigationCommit(options: {
     trace: approval.decision.trace,
   };
 }
+
+/**
+ * True when `next` is a navigation started from a visible tree that a history
+ * restore (Back/Forward) has since replaced. Its state was computed when its
+ * commit was approved, but a queued transition can apply it after the restore
+ * committed; applying it would put the departed route back on screen under
+ * the restored URL (#3013). Next.js's traverse action supersedes it the same way.
+ */
+export function isSupersededByHistoryRestore(
+  current: AppRouterState,
+  next: AppRouterState,
+): boolean {
+  const restore = current.activeOperation;
+  const operation = next.activeOperation;
+  return (
+    restore?.lane === "traverse" &&
+    operation !== null &&
+    operation.lane !== "traverse" &&
+    operation.startedVisibleCommitVersion < current.visibleCommitVersion
+  );
+}

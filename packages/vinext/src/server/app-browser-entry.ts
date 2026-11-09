@@ -170,6 +170,7 @@ import {
   isVisitedResponseCacheEntryFresh,
   type VisitedResponseCacheEntry,
 } from "./app-visited-response-cache.js";
+import { isSupersededByHistoryRestore } from "./app-browser-visible-commit.js";
 import {
   createPopstateRestoreHandler,
   readMissedTraversalState,
@@ -1432,7 +1433,21 @@ function BrowserRoot({
   // the hydration commit, so getBrowserRouterState() never observes a null ref.
   useLayoutEffect(() => {
     const setAppRouterStateValue = (value: AppRouterState | Promise<AppRouterState>) => {
-      setTreeStateValue(value);
+      if (isRouterStatePromise(value)) {
+        setTreeStateValue(value);
+        return;
+      }
+      // A navigation's state is computed when its commit is approved, but a
+      // transition may apply it later. If a history restore committed in the
+      // meantime, that navigation was superseded: applying its state would put
+      // the departed route back on screen under the restored URL (#3013).
+      setTreeStateValue((current) =>
+        !isMpaNavigationState(current) &&
+        !isRouterStatePromise(current) &&
+        isSupersededByHistoryRestore(current, value)
+          ? current
+          : value,
+      );
     };
     const detach = browserNavigationController.attachBrowserRouterState(
       setAppRouterStateValue,
