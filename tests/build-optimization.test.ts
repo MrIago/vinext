@@ -731,6 +731,52 @@ describe("optimizeDeps.exclude for vinext", () => {
     }
   }, 15000);
 
+  // https://github.com/cloudflare/vinext/issues/3236: a dual CJS/ESM server
+  // external such as `file-type` breaks the dependency optimizer's interop, so
+  // no environment may pre-bundle `serverExternalPackages`.
+  it("excludes serverExternalPackages from the rsc and ssr optimizers too", async () => {
+    const vinext = (await import("../packages/vinext/src/index.js")).default;
+    const mainPlugin = vinext().find(
+      (p: any) => p.name === "vinext:config" && typeof p.config === "function",
+    );
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+    const path = await import("node:path");
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-optdeps-server-external-"));
+    await fsp.symlink(
+      path.resolve(import.meta.dirname, "../node_modules"),
+      path.join(tmpDir, "node_modules"),
+      "junction",
+    );
+    await fsp.mkdir(path.join(tmpDir, "app"), { recursive: true });
+    await fsp.writeFile(
+      path.join(tmpDir, "app", "layout.tsx"),
+      `export default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }`,
+    );
+    await fsp.writeFile(
+      path.join(tmpDir, "app", "page.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+    await fsp.writeFile(
+      path.join(tmpDir, "next.config.mjs"),
+      `export default { serverExternalPackages: ["file-type"] };`,
+    );
+    try {
+      const result = await (mainPlugin as any).config(
+        { root: tmpDir, build: {}, plugins: [] },
+        { command: "serve" },
+      );
+      for (const envName of ["rsc", "ssr", "client"]) {
+        expect(
+          result.environments[envName].optimizeDeps?.exclude,
+          `${envName} should not pre-bundle file-type`,
+        ).toContain("file-type");
+      }
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 15000);
+
   it("excludes vinext in all environments for App Router builds", async () => {
     const vinext = (await import("../packages/vinext/src/index.js")).default;
     const plugins = vinext();

@@ -4475,7 +4475,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     },
                   }),
               optimizeDeps: {
-                exclude: mergeOptimizeDepsExclude(incomingExclude, shimOptimizeDepsExclude),
+                // `serverExternalPackages` are loaded by the runtime resolver,
+                // never pre-bundled: a dual CJS/ESM package such as `file-type`
+                // breaks Rolldown's pre-bundle interop (MISSING_EXPORT) while
+                // the runtime loads it fine (#3236). The client optimizer
+                // already excludes them.
+                exclude: mergeOptimizeDepsExclude(
+                  incomingExclude,
+                  shimOptimizeDepsExclude,
+                  nextServerExternal,
+                ),
                 entries: optimizeEntries,
                 // plugin-rsc pre-includes server.edge and static.edge for the
                 // Flight runtime it selects: its vendored copy, or an app-installed
@@ -4550,6 +4559,8 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 exclude: mergeOptimizeDepsExclude(
                   incomingExclude,
                   shimOptimizeDepsExclude,
+                  // As in the RSC environment: never pre-bundle server externals.
+                  nextServerExternal,
                   ["ipaddr.js"],
                   userSsrExternal === true || externalizeSsrReactInDev
                     ? SSR_EXTERNAL_REACT_ENTRIES
