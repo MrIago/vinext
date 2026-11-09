@@ -1406,6 +1406,88 @@ export function GET(request) {
     }
   }, 120000);
 
+  // Ported from Next.js:
+  // test/production/app-dir/use-cache-generate-static-params-server-action/use-cache-generate-static-params-server-action.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/production/app-dir/use-cache-generate-static-params-server-action/use-cache-generate-static-params-server-action.test.ts
+  // A Server Action returned from "use cache" must stay callable on the
+  // server, in generateStaticParams() during the prerender and in a render.
+  it('can call a server action returned from "use cache" during generateStaticParams', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-use-cache-gsp-action-"));
+
+    try {
+      fs.writeFileSync(path.join(tmpDir, "package.json"), `{"type":"module"}`);
+      fs.symlinkSync(
+        path.resolve(import.meta.dirname, "../node_modules"),
+        path.join(tmpDir, "node_modules"),
+        "junction",
+      );
+      const pageDir = path.join(tmpDir, "app", "(group)", "static-params", "[slug]");
+      fs.mkdirSync(pageDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "layout.tsx"),
+        `export default function Root({ children }: { children: React.ReactNode }) {
+  return <html><body>{children}</body></html>;
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(pageDir, "actions.ts"),
+        `"use server";
+
+export async function getSlug() {
+  return "known";
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(pageDir, "page.tsx"),
+        `import { getSlug } from "./actions";
+
+async function getCachedAction() {
+  "use cache";
+  return getSlug;
+}
+
+export async function generateStaticParams() {
+  const action = await getCachedAction();
+  return [{ slug: await action() }];
+}
+
+export default async function Page({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  return <p>{slug}</p>;
+}
+`,
+      );
+
+      const builder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+
+      const result = await runPrerender({ root: tmpDir, concurrency: 1 });
+      expect(result?.routes).toContainEqual(
+        expect.objectContaining({ path: "/static-params/known", status: "rendered" }),
+      );
+
+      const built: { default?: unknown } = await import(
+        `${pathToFileURL(path.join(tmpDir, "dist", "server", "index.js")).href}?t=${Date.now()}`
+      );
+      expect(isBuiltAppHandler(built.default)).toBe(true);
+      if (!isBuiltAppHandler(built.default)) return;
+      const response = await built.default(new Request("http://localhost/static-params/known"));
+      expect(response).toBeInstanceOf(Response);
+      if (!(response instanceof Response)) return;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("<p>known</p>");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 120000);
+
   // Next.js returns the value decoded from one branch of the callable-cache
   // Flight stream and saves the other branch, so a serializer error rejects
   // the call instead of persisting an error row.
