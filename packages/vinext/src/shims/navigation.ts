@@ -3335,7 +3335,13 @@ const _appRouter: AppRouterInstance = {
       const rewrittenPrefetchHref = HAS_CLIENT_REWRITES
         ? resolveLoadedHybridClientRewriteHref(fullHref, __basePath)
         : null;
-      const kind = options?.kind === "full" ? "full" : "auto";
+      // "prefetch" is an alias for "full", and "navigation" (prefetch through
+      // `navigation()` boundaries) is the same as "full" without Partial
+      // Prefetching. "shell" is an alias for "auto".
+      const kind =
+        options?.kind === "full" || options?.kind === "prefetch" || options?.kind === "navigation"
+          ? "full"
+          : "auto";
       // Dynamic import keeps the policy module and its route-trie
       // dependencies off the startup path of every next/navigation consumer.
       const [

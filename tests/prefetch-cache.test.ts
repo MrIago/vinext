@@ -236,6 +236,40 @@ describe("prefetch cache eviction", () => {
     expect(headers.get("next-router-prefetch")).toBeNull();
   });
 
+  // Ported from Next.js prefetchRoute: "prefetch" and "navigation" are full
+  // stages; without Partial Prefetching "navigation" is the same as "full".
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/prefetch.ts
+  it.each(["prefetch", "navigation"] as const)(
+    "router.prefetch kind %s issues a full prefetch",
+    async (kind) => {
+      vi.stubEnv("__VINEXT_TRAILING_SLASH", "true");
+      vi.resetModules();
+      const navigation = await import("../packages/vinext/src/shims/navigation.js");
+      const fetch = vi.fn(
+        async (_input: RequestInfo | URL, _init?: RequestInit) =>
+          new Response("flight", { headers: { "content-type": "text/x-component" } }),
+      );
+      const navigate = vi.fn(async (_href: string) => {});
+      (globalThis as any).fetch = fetch;
+      (globalThis as any).window[Symbol.for("vinext.navigationRuntime")] = {
+        bootstrap: { routeManifest: null, rsc: undefined },
+        functions: { navigate },
+      };
+
+      navigation.appRouterInstance.prefetch("/dashboard", { kind });
+      await waitForPrefetchSetup(() => fetch.mock.calls.length === 1);
+      navigation.appRouterInstance.push("/dashboard");
+      await waitForPrefetchSetup(() => navigate.mock.calls.length === 1);
+
+      expect(toRscUrlString(fetch.mock.calls[0]![0])).toMatch(/^\/dashboard\/\?_rsc=.+$/);
+      expect(navigate.mock.calls[0]?.[0]).toBe("/dashboard/");
+      const headers = new Headers(fetch.mock.calls[0]![1]?.headers);
+      expect(headers.get("rsc")).toBe("1");
+      expect(headers.get("next-router-state-tree")).toBeNull();
+      expect(headers.get("next-router-prefetch")).toBeNull();
+    },
+  );
+
   it("uses the same contextual basePath root for router.prefetch and router.push", async () => {
     vi.stubEnv("__NEXT_ROUTER_BASEPATH", "/docs");
     vi.stubEnv("__VINEXT_TRAILING_SLASH", "false");

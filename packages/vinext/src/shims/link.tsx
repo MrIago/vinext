@@ -152,8 +152,14 @@ export type LinkProps<_RouteInferType = unknown> = {
   as?: string | UrlObject;
   /** Replace the current history entry instead of pushing */
   replace?: boolean;
-  /** Prefetch the page in the background (App Router default: auto, Pages Router default: true) */
-  prefetch?: boolean | "auto" | null;
+  /**
+   * Prefetch the page in the background (App Router default: auto, Pages
+   * Router default: true). In the App Router, "shell" is an alias for "auto"
+   * and "prefetch" for `true`. "navigation" prefetches up to where
+   * `navigation()` resolves; without Partial Prefetching that is the same as
+   * `true`, matching Next.js.
+   */
+  prefetch?: boolean | "auto" | "shell" | "prefetch" | "navigation" | null;
   /**
    * Unstable App Router option matching Next.js canary: an automatic prefetch
    * is upgraded to a full prefetch when the user shows navigation intent.
@@ -306,7 +312,12 @@ export function resolveLinkPrefetchMode(
   isDangerous: boolean,
 ): LinkPrefetchMode {
   if (isDangerous || prefetchProp === false) return "disabled";
-  if (prefetchProp === true) return "full";
+  // Next.js maps true/"prefetch" to the Prefetch stage and "navigation" to the
+  // Navigation stage. vinext has no Partial Prefetching, so both are a full
+  // prefetch; "auto"/"shell"/null stay on the automatic (shell) stage.
+  if (prefetchProp === true || prefetchProp === "prefetch" || prefetchProp === "navigation") {
+    return "full";
+  }
   return "auto";
 }
 
