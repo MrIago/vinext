@@ -869,6 +869,17 @@ function doesStaticShellRankCover(
   return entry.stage >= other.stage && entry.completeness >= other.completeness;
 }
 
+/** What a prefetch to `stage` needs from an entry to be served by it. */
+function getWantedStaticShellRank(stage: StaticShellPrefetchStage | undefined): {
+  completeness: number;
+  stage: number;
+} {
+  return {
+    completeness: stage === undefined ? COMPLETENESS_NEEDS_RUNTIME : COMPLETENESS_CACHE_COMPLETE,
+    stage: STATIC_SHELL_STAGE_ORDER[stage ?? "shell"],
+  };
+}
+
 function forEachStaticShellEntryForUrl(
   rscUrls: readonly string[],
   interceptionContext: string | null,
@@ -905,10 +916,7 @@ export function hasCoveringStaticShellPrefetch(
   stage: StaticShellPrefetchStage | undefined,
   additionalRscUrls: readonly string[] = [],
 ): boolean {
-  const wanted = {
-    completeness: stage === undefined ? COMPLETENESS_NEEDS_RUNTIME : COMPLETENESS_CACHE_COMPLETE,
-    stage: STATIC_SHELL_STAGE_ORDER[stage ?? "shell"],
-  };
+  const wanted = getWantedStaticShellRank(stage);
   const now = Date.now();
   let covered = false;
   forEachStaticShellEntryForUrl(
@@ -996,8 +1004,10 @@ export function seedStaticShellPrefetchFromVaryingShell(
   mountedSlotsHeader: string | null,
   resolveSnapshot: (source: CachedRscResponse, sourceHref: string) => CachedRscResponse | null,
   onInvalidate?: () => void,
+  stage?: StaticShellPrefetchStage,
 ): boolean {
   if (interceptionContext !== null) return false;
+  const wanted = getWantedStaticShellRank(stage);
   const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
   const cache = getPrefetchCache();
   const now = Date.now();
@@ -1012,6 +1022,9 @@ export function seedStaticShellPrefetchFromVaryingShell(
     }
     const expiresAt = resolvePrefetchCacheEntryExpiresAt(source);
     if (expiresAt <= now) continue;
+    // Only a shell from a stage at least as deep stands in for this one.
+    const sourceRank = getStaticShellEntryRank(source);
+    if (sourceRank === null || !doesStaticShellRankCover(sourceRank, wanted)) continue;
     const sourceKey = parsePrefetchCacheKey(sourceCacheKey);
     if (sourceKey.interceptionContext !== null || sourceCacheKey === cacheKey) continue;
     if (!isPrefetchCacheEntryCompatibleWithMountedSlots(source, mountedSlotsHeader)) continue;
@@ -1037,6 +1050,7 @@ export function seedStaticShellPrefetchFromVaryingShell(
       prefetchKind: "static-shell",
       size,
       snapshot: { ...snapshot, url: rscUrl },
+      ...(source.stage === undefined ? {} : { stage: source.stage }),
       timestamp: source.timestamp,
     };
     for (const callback of supersededCallbacks ?? []) {
@@ -3782,6 +3796,7 @@ const _appRouter: AppRouterInstance = {
           mountedSlotsHeader,
           createVaryingStaticShellResolver(fullHref),
           options?.onInvalidate,
+          policy.prefetchStage,
         )
       ) {
         return;

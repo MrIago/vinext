@@ -820,6 +820,8 @@ function prefetchUrl(
             interceptionContext,
             mountedSlotsHeader,
             createVaryingStaticShellResolver(fullHref),
+            undefined,
+            autoPrefetch.prefetchStage,
           )
         ) {
           return;

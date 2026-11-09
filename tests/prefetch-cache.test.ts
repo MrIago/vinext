@@ -3923,6 +3923,28 @@ describe("static-shell prefetch", () => {
       expect(fetch).toHaveBeenCalledTimes(2);
     });
 
+    // With Partial Prefetching, each stage is its own shell: one from a
+    // shallower stage can't stand in for a deeper prefetch of another URL
+    // (vercel/next.js#99706).
+    it("reuses another URL's shell only for a stage it covers", async () => {
+      setUpShopRoute();
+      (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__[0].partialPrefetching = true;
+      const fetch = mockShellFetch({ varyParams: [] });
+      const prefetchStage = async (href: string, kind: string, calls: number) => {
+        appRouterInstance.prefetch(href, { kind } as never);
+        await waitForPrefetchSetup(
+          () => fetch.mock.calls.length === calls && findEntry(href)?.outcome === "cache-seeded",
+        );
+      };
+
+      await prefetchStage("/shop/electronics/phone", "prefetch", 1);
+      await prefetchStage("/shop/electronics/tablet", "navigation", 2);
+      expect(findEntry("/shop/electronics/tablet")?.stage).toBe("navigation");
+      // Either shell covers a prefetch-stage one.
+      await prefetchStage("/shop/clothing/shirt", "prefetch", 2);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
     it("reuses a complete shell as the page of a URL with another query string", async () => {
       setUpShopRoute();
       const fetch = mockShellFetch({ staticShell: "complete", varyParams: ["category"] });
