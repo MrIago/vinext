@@ -60,6 +60,7 @@ import {
   createNavigationRuntimeRscMetadataScript,
   createRscEmbedTransform,
   createTickBufferedTransform,
+  getInlineCss,
   rewriteInlineCssStylesheetLinks,
   waitAtLeastOneReactRenderTask,
   type InitialNavigationCacheMetadata,
@@ -306,8 +307,34 @@ function renderFontHtml(
   return fontHTML;
 }
 
-function hasInlineCssManifest(manifest: Record<string, string> | undefined): boolean {
+function hasInlineCssManifest(
+  manifest: Record<string, string> | undefined,
+): manifest is Record<string, string> {
   return manifest !== undefined && Object.keys(manifest).length > 0;
+}
+
+/**
+ * With `experimental.inlineCss`, Next.js inlines every stylesheet, the
+ * next/font CSS included. The font stylesheets (the extracted
+ * next/font/local rules and the self-hosted Google CSS) are linked from the
+ * head by the font collector, not rendered as React stylesheet resources, so
+ * the Fizz link rewrite never sees them. Swap each one the inline manifest
+ * knows for its CSS, which then joins the font styles merged into the first
+ * inline `<style>`. Links the manifest doesn't know stay links.
+ */
+function inlineFontStylesheets(
+  fontData: FontData | undefined,
+  manifest: Record<string, string> | undefined,
+): FontData | undefined {
+  if (!fontData?.links?.length || !hasInlineCssManifest(manifest)) return fontData;
+  const links: string[] = [];
+  const styles: string[] = [];
+  for (const url of fontData.links) {
+    const css = getInlineCss(manifest, url);
+    if (css === null) links.push(url);
+    else styles.push(css);
+  }
+  return { ...fontData, links, styles: [...styles, ...(fontData.styles ?? [])] };
 }
 
 /**
@@ -916,14 +943,15 @@ export async function handleSsr(
         // (prod-server.ts) or via build-time bundle injection (index.ts). Left
         // undefined in dev, which naturally disables inline CSS there.
         const inlineCssManifest = globalThis.__VINEXT_INLINE_CSS__;
-        const fontStyles = fontData?.styles ?? [];
+        const pageFontData = inlineFontStylesheets(fontData, inlineCssManifest);
+        const fontStyles = pageFontData?.styles ?? [];
         const mergeFontStylesIntoInlineCss =
           fontStyles.length > 0 && hasInlineCssManifest(inlineCssManifest);
         const inlineCssFontStyles = mergeFontStylesIntoInlineCss ? fontStyles.join("\n") : "";
         const inlineCssFontStyleFallbackHTML = mergeFontStylesIntoInlineCss
           ? renderFontHtml({ styles: fontStyles }, options?.scriptNonce)
           : "";
-        const fontHTML = renderFontHtml(fontData, options?.scriptNonce, {
+        const fontHTML = renderFontHtml(pageFontData, options?.scriptNonce, {
           includeStyles: !mergeFontStylesIntoInlineCss,
         });
         // Trace meta tags only need to land in the document head once.

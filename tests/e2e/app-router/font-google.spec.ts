@@ -21,6 +21,10 @@ test("dev mode self-hosts Google fonts", async ({ page, request }) => {
   expect(cssLink).not.toBeNull();
   const cssRes = await request.get(cssLink![1]);
   expect(cssRes.status()).toBe(200);
-  expect(cssRes.headers()["content-type"]).toBe("text/css");
+  // Next.js serves static CSS through `send`, which appends the mime
+  // charset to text types ("text/css; charset=UTF-8"), so match the type
+  // and allow a charset parameter.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/serve-static.ts
+  expect(cssRes.headers()["content-type"]).toMatch(/^text\/css(?:;\s*charset=utf-8)?$/i);
   expect(await cssRes.text()).toContain("@font-face");
 });
