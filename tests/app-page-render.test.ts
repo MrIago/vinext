@@ -4045,7 +4045,10 @@ describe("outgoing RSC payload metadata", () => {
       return response.headers.get("cache-control");
     };
 
-    expect(await render({ "page:/test": "test-page" })).toContain("s-maxage=60");
+    // These renders run as development, where every whole payload is
+    // `no-store` (#2995, vercel/next.js#97505). The partial payload still
+    // takes the uncacheable path, which sends its own header.
+    expect(await render({ "page:/test": "test-page" })).toBe("no-store");
     expect(
       await render({
         [APP_SKIPPED_LAYOUT_IDS_KEY]: ["layout:/"],
