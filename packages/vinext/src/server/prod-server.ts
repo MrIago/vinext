@@ -53,6 +53,7 @@ import {
   type ImageOptimizationSignal,
 } from "./image-optimization.js";
 import { normalizePath } from "./normalize-path.js";
+import { closeServerOnTerminationSignals, trackBackgroundWork } from "./prod-server-shutdown.js";
 import { registerPrerenderCloudflareLoader } from "../build/prerender-cloudflare-loader.js";
 import {
   canonicalizeRequestPathname,
@@ -108,7 +109,6 @@ import {
   readTrustedPrerenderRouteParamsFromHeaders,
   serializePrerenderRouteParamsHeader,
 } from "./prerender-route-params.js";
-import { installGracefulShutdown } from "./graceful-shutdown.js";
 import { installSocketErrorBackstop } from "./socket-error-backstop.js";
 import {
   trustProxy,
@@ -328,12 +328,6 @@ export type ProdServerOptions = {
   purpose?: "prerender";
   /** Suppress the startup log for internal child-process servers. */
   silent?: boolean;
-  /**
-   * Close the server on SIGINT/SIGTERM and exit once in-flight requests
-   * finish, like `next start` (default: false). Set by `vinext start` and
-   * the standalone entry; left off for in-process callers (prerender, tests).
-   */
-  gracefulShutdown?: boolean;
 };
 
 /**
@@ -1565,7 +1559,6 @@ export async function startProdServer(options: ProdServerOptions = {}) {
     noCompression = false,
     purpose,
     silent = false,
-    gracefulShutdown = false,
   } = options;
 
   if (purpose === "prerender") {
@@ -1605,7 +1598,6 @@ export async function startProdServer(options: ProdServerOptions = {}) {
         rscEntryPath,
         compress,
         purpose,
-        silent,
       })
     : await startPagesRouterServer({
         port,
@@ -1615,10 +1607,12 @@ export async function startProdServer(options: ProdServerOptions = {}) {
         serverEntryPath,
         compress,
         purpose,
-        silent,
       });
-
-  if (gracefulShutdown) installGracefulShutdown(started.server);
+  // Build-time servers run inside the build process, which owns its signals.
+  // Register before announcing readiness, so a supervisor that signals as
+  // soon as it sees the server up still gets a graceful shutdown.
+  if (purpose !== "prerender") closeServerOnTerminationSignals(started.server);
+  if (!silent) logProdServerStarted(host, started.port, purpose);
   return started;
 }
 
@@ -1632,7 +1626,6 @@ type AppRouterServerOptions = {
   rscEntryPath: string;
   compress: boolean;
   purpose?: ProdServerOptions["purpose"];
-  silent?: boolean;
 };
 
 type WorkerAppRouterEntry = {
@@ -1649,12 +1642,12 @@ function createNodeExecutionContext(
 ): ExecutionContextLike {
   return {
     hostRuntime: "node",
+    skipsPagesApiHandlerWaitUntil: true,
     requestSignal,
     waitUntil(promise: Promise<unknown>) {
-      // Node doesn't provide a Workers lifecycle, but we still attach a
-      // rejection handler so background waitUntil work doesn't surface as an
-      // unhandled rejection when a Worker-style entry is used with vinext start.
-      void Promise.resolve(promise).catch(() => {});
+      // Node has no Workers lifecycle. The work runs on its own; tracking it
+      // lets a graceful shutdown wait for it, as `next start` does.
+      trackBackgroundWork(promise);
     },
     passThroughOnException() {},
     trustedRevalidateOrigin,
@@ -1943,7 +1936,6 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     rscEntryPath,
     compress: compressOption,
     purpose,
-    silent,
   } = options;
 
   // Load prerender secret written at build time by vinext:server-manifest plugin.
@@ -2408,7 +2400,6 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   disablePrerenderKeepAliveTimeout(server, purpose);
 
   const actualPort = await listen(server, port, host);
-  if (!silent) logProdServerStarted(host, actualPort, purpose);
   return { server, port: actualPort };
 }
 
@@ -2422,7 +2413,6 @@ type PagesRouterServerOptions = {
   serverEntryPath: string;
   compress: boolean;
   purpose?: ProdServerOptions["purpose"];
-  silent?: boolean;
 };
 
 type PagesServerEntryPageRoute = {
@@ -2460,13 +2450,12 @@ function readPagesServerEntryPageRoutes(value: unknown): PagesServerEntryPageRou
  * - vinextConfig — embedded next.config.js settings
  */
 async function startPagesRouterServer(options: PagesRouterServerOptions) {
-  const { port, host, purpose, silent } = options;
+  const { port, host, purpose } = options;
   const handler = await createPagesRouterRequestHandler(options);
   const server = createServer(handler);
   disablePrerenderKeepAliveTimeout(server, purpose);
 
   const actualPort = await listen(server, port, host);
-  if (!silent) logProdServerStarted(host, actualPort, purpose);
   return { server, port: actualPort };
 }
 
@@ -2962,7 +2951,7 @@ async function createPagesRouterRequestHandler(
         hasMiddleware,
         middlewareRequest,
         dataNotFoundResponse,
-        ctx: undefined, // Node has no platform ExecutionContext; middleware gets middlewareCtx
+        ctx: undefined, // Node has no platform ExecutionContext; each handler below creates its own
         // Raw query from req.url so redirect Locations aren't re-encoded by URL parsing.
         rawSearch: rawQs,
         authorizeOnDemandRevalidate:
@@ -2991,7 +2980,9 @@ async function createPagesRouterRequestHandler(
                   request,
                   resolvedUrl,
                   ssrManifest,
-                  undefined,
+                  // Background ISR work goes to its waitUntil, which a
+                  // graceful shutdown waits for.
+                  createNodeExecutionContext(),
                   stagedHeaders,
                   {
                     ...options,

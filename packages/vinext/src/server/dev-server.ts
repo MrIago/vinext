@@ -853,11 +853,12 @@ export function createSSRHandler(
     }
 
     const { route, params } = match;
-    // A direct request for the custom 404 page still answers 404, like
-    // Next.js and the production handler (pages-page-handler.ts defaults the
-    // `/404` route's status the same way). A middleware rewrite status wins.
-    if (statusCode === undefined && route.pattern === "/404") {
-      statusCode = 404;
+    // Like Next.js base-server.ts, a direct /404 or /500 page request answers
+    // with that status. Data requests keep 200 (Next exempts them only for
+    // /404). As in the prod handler, a middleware rewrite status wins.
+    if (statusCode === undefined && !isDataReq) {
+      if (route.pattern === "/404") res.statusCode = 404;
+      else if (route.pattern === "/500") res.statusCode = 500;
     }
     // Implements the Next.js `req.url` contract: data-fetching methods observe
     // the original request URL. For ordinary page requests this defaults to

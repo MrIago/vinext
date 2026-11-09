@@ -1,6 +1,6 @@
 {
   "next/link": { "shim": "link", "types": "upstream" },
-  "next/head": { "shim": "head", "types": "upstream", "reactServer": true },
+  "next/head": { "shim": "head", "types": "upstream" },
   "next/router": { "shim": "router", "types": "upstream" },
   "next/compat/router": { "shim": "compat-router", "types": "upstream" },
   "next/image": { "shim": "image", "types": "upstream" },

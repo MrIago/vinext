@@ -224,8 +224,8 @@ function isReferencedAsset(server: ViteDevServer, url: string | undefined): bool
   let pathname: string;
   let decodedPathname: string;
   try {
-    // A target that starts with `//` parses as a protocol-relative URL, so an
-    // invalid host after the slashes (`//`, `//:80`, `//%`) makes this throw.
+    // A request target starting with `//` (or `/\`) parses as a host, which
+    // throws when it's not a valid one
     ({ pathname } = new URL(url, "http://localhost"));
     decodedPathname = decodeURI(pathname);
   } catch {

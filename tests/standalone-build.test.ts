@@ -134,10 +134,6 @@ describe("emitStandaloneOutput", () => {
     expect(fs.readFileSync(path.join(appRoot, "dist/standalone/server.js"), "utf-8")).toContain(
       "startProdServer",
     );
-    // Like Next's standalone server.js, close gracefully on SIGINT/SIGTERM.
-    expect(fs.readFileSync(path.join(appRoot, "dist/standalone/server.js"), "utf-8")).toContain(
-      "gracefulShutdown: true",
-    );
     const standalonePkg = JSON.parse(
       fs.readFileSync(path.join(appRoot, "dist/standalone/package.json"), "utf-8"),
     ) as { type: string };

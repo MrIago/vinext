@@ -1,6 +1,6 @@
 /**
  * Cancellation registry for App Router prefetch setup, shared by `<Link>`
- * (link.tsx) and `router.prefetch()` (navigation.ts).
+ * (link.tsx) and `router.prefetch()` (app-router-navigation.ts).
  *
  * Both start asynchronous setup (lazy module loads, the route manifest) before
  * they register a cache entry or issue a request. Each one registers a token
@@ -21,7 +21,7 @@
  * destination" value would not.
  *
  * This module has no React or route-trie dependencies so link.tsx can import
- * it statically while keeping navigation.ts off its synchronous path.
+ * it statically while keeping app-router-navigation.ts off its synchronous path.
  */
 import { isExternalUrl } from "../../utils/external-url.js";
 import { toCanonicalBrowserNavigationHref, toSameOriginAppPath } from "../url-utils.js";

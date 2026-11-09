@@ -167,10 +167,7 @@ import {
   serializePrerenderRouteParamsHeader,
   type TrustedPrerenderState,
 } from "./prerender-route-params.js";
-import {
-  createServerActionNotFoundResponse,
-  getServerActionNotFoundMessage,
-} from "./server-action-not-found.js";
+import { respondServerActionNotFound } from "./server-action-not-found.js";
 import {
   createRouteTreePrefetchResponse,
   isRouteTreePrefetchRequest,
@@ -812,15 +809,6 @@ function isForwardedActionContext(
     hasProperty(value, "actionForwarded") &&
     value.actionForwarded === true
   );
-}
-
-function createMissingServerActionResponse(
-  options: Pick<CreateAppRscHandlerOptions<AppRscHandlerRoute>, "clearRequestContext">,
-  actionId: string | null,
-): Response {
-  console.warn(getServerActionNotFoundMessage(actionId));
-  options.clearRequestContext();
-  return createServerActionNotFoundResponse();
 }
 
 async function applyRewrite(
@@ -2307,7 +2295,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     if (!filesystemRouteEligible || !isPostRequest || !actionId) return null;
     if (routeMatch && isAppRouteHandlerRoute(routeMatch.route)) return null;
     if (!options.handleServerActionRequest) {
-      return markServerActionResponse(createMissingServerActionResponse(options, actionId));
+      return markServerActionResponse(
+        respondServerActionNotFound(actionId, options.clearRequestContext),
+      );
     }
     const sourceConfigHeaders = new Headers();
     await applyAppRscConfigHeaders(sourceConfigHeaders, request, {
@@ -2348,7 +2338,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     if (!options.handleProgressiveActionRequest) {
       return unrenderedRouteMatch?.route.__loadPage &&
         !unrenderedRouteMatch.route.__loadRouteHandler
-        ? markServerActionResponse(createMissingServerActionResponse(options, null))
+        ? markServerActionResponse(respondServerActionNotFound(null, options.clearRequestContext))
         : null;
     }
     const progressiveActionResult = await options.handleProgressiveActionRequest({

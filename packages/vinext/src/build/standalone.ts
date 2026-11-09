@@ -211,7 +211,6 @@ startProdServer({
   port,
   host,
   outDir: join(import.meta.dirname, "dist"),
-  gracefulShutdown: true,
 }).catch((error) => {
   console.error("[vinext] Failed to start standalone server");
   console.error(error);

@@ -1,14 +1,12 @@
-import { LegacyHead } from "./legacy-head";
+import Link from "next/link";
 
-export const metadata = {
-  title: "From metadata",
-};
-
-export default function Page() {
+export default function NextHeadIgnoredPage() {
   return (
     <main>
-      <LegacyHead />
-      <h1 id="next-head-ignored">next/head is ignored in the App Router</h1>
+      <h1>next/head in the App Router</h1>
+      <Link href="/next-head-ignored/server-component" id="next-head-server-link">
+        Server component
+      </Link>
     </main>
   );
 }

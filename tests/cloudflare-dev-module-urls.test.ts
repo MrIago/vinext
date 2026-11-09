@@ -209,25 +209,6 @@ describe("cloudflare dev module URLs plugin", () => {
     ]);
   });
 
-  // A request target that starts with `//` parses as a protocol-relative URL,
-  // so an invalid host after the slashes made `new URL()` throw and Vite
-  // answered 500. Such a request is not a referenced asset (#4600).
-  it.each(["//", "//:80", "//%", "/\\"])(
-    "falls through to the Worker for %s instead of throwing",
-    async (url) => {
-      const calls: string[] = [];
-      const { run } = setup({
-        enabled: true,
-        viteMiddlewares: [
-          passThrough("viteTransformMiddleware", calls),
-          passThrough("viteServeStaticMiddleware", calls),
-        ],
-      });
-
-      expect(await run(url)).toEqual({ args: [], url });
-    },
-  );
-
   it("restores the request URL when a Vite middleware rewrites it and falls through", async () => {
     const { run } = setup({
       enabled: true,
@@ -434,6 +415,19 @@ describe("cloudflare dev module URLs plugin", () => {
     });
 
     expect(await run("/app/%E0%A4%A.png")).toEqual({ args: [], url: "/app/%E0%A4%A.png" });
+    expect(calls).toEqual([]);
+  });
+
+  it("sends a URL that parses as an invalid host to the Worker", async () => {
+    const calls: string[] = [];
+    const { run } = setup({
+      enabled: true,
+      viteMiddlewares: [passThrough("viteServeStaticMiddleware", calls)],
+    });
+
+    for (const url of ["//", "//:80", "//%", "/\\:80"]) {
+      expect(await run(url)).toEqual({ args: [], url });
+    }
     expect(calls).toEqual([]);
   });
 

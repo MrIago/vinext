@@ -1485,12 +1485,20 @@ describe("Pages Router integration", () => {
     expect(JSON.parse(nextDataMatch![1]).buildId).toBe("test-build-id");
   });
 
-  // Ported from Next.js: test/e2e/404-page/404-page.test.ts ("should respond to 404 correctly")
-  // https://github.com/vercel/next.js/blob/canary/test/e2e/404-page/404-page.test.ts
-  it("answers a direct request for /404 with a 404 status", async () => {
+  // Ported from Next.js: test/integration/404-page/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/404-page/test/index.test.ts
+  it("answers a direct /404 request with 404 in dev", async () => {
     const res = await fetch(`${baseUrl}/404`);
     expect(res.status).toBe(404);
     expect(await res.text()).toContain("404 - Page Not Found");
+  });
+
+  // Ported from Next.js: test/integration/500-page/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/500-page/test/index.test.ts
+  it("answers a direct /500 request with 500 in dev", async () => {
+    const res = await fetch(`${baseUrl}/500`);
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain("custom pages/500");
   });
 
   // Ported from Next.js: test/e2e/not-found-revalidate/not-found-revalidate.test.ts
@@ -1830,6 +1838,25 @@ export default function Page({ value }: { value: string }) {
     expect(headContents.indexOf('name="description"')).toBeGreaterThan(
       headContents.indexOf('name="viewport"'),
     );
+  });
+
+  // Ported from Next.js: test/development/pages-dir/client-navigation/rendering-head.test.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/development/pages-dir/client-navigation/rendering-head.test.ts
+  it("replaces the default charset and viewport with unkeyed next/head tags", async () => {
+    const html = await (await fetch(`${baseUrl}/head-priority`)).text();
+    const headContents = html.match(/<head[^>]*>([\s\S]*?)<\/head>/i)?.[1] ?? "";
+
+    // "header helper dedupes tags": only the page's charset and viewport remain.
+    expect(headContents.match(/<meta charset=/g)).toHaveLength(1);
+    expect(headContents.match(/<meta name="viewport" /g)).toHaveLength(1);
+    // "should place charset element at the top of <head>": the next/head tags
+    // lead <head>, ahead of the children of _document's <Head>.
+    const nextHeadTags =
+      '<meta charset="iso-8859-5" data-next-head="" />' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1" data-next-head="" />' +
+      '<meta name="title" content="head title" data-next-head="" />';
+    expect(headContents.trimStart().slice(0, nextHeadTags.length)).toBe(nextHeadTags);
+    expect(headContents.indexOf('<meta name="description"')).toBeGreaterThan(nextHeadTags.length);
   });
 
   it("rerenders GSP pages without carrying prior render state", async () => {
@@ -8258,6 +8285,14 @@ describe("Production server middleware (Pages Router)", () => {
   // the collapsed path (base-server.ts / resolve-routes.ts).
   it("redirects repeated slashes and backslashes like Next.js", async () => {
     await expectRepeatedSlashRedirects(prodUrl);
+  });
+
+  // Ported from Next.js: test/integration/500-page/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/500-page/test/index.test.ts
+  it("answers a direct /500 request with 500", async () => {
+    const res = await fetch(`${prodUrl}/500`);
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain("custom pages/500");
   });
 
   it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {
