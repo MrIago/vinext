@@ -1926,6 +1926,17 @@ function createServerEnvironmentFileNameResolver(
   };
 }
 
+function readPackageJsonType(root: string): unknown {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf-8")) as {
+      type?: unknown;
+    };
+    return pkg.type;
+  } catch {
+    return undefined;
+  }
+}
+
 export default function vinext(options: VinextOptions = {}): PluginOption[] {
   const internalOptions = options as InternalVinextOptions;
   const { supportsNativeTypeofWindowFolding: useNativeTypeofWindowFolding } =
@@ -6136,6 +6147,25 @@ export const loadServerActionClient = ${
             optimizerConditions.filter((condition) => condition !== "browser");
         }
         return null;
+      },
+    },
+    {
+      // A project that declares `"type": "commonjs"` makes Node read every
+      // `.js` the server build writes as CommonJS, so the generated ESM
+      // (Server Actions entry included) fails to load (#4565). Next.js gives
+      // its generated actions entry an `.mjs` extension (vercel/next.js#101164);
+      // vinext scopes its whole server output as ESM instead.
+      name: "vinext:server-output-module-scope",
+      apply: "build",
+      generateBundle() {
+        if (hasCloudflarePlugin || hasNitroPlugin) return;
+        if (!this.environment || !isServerEnvironment(this.environment)) return;
+        if (readPackageJsonType(root) !== "commonjs") return;
+        this.emitFile({
+          type: "asset",
+          fileName: "package.json",
+          source: `${JSON.stringify({ type: "module" })}\n`,
+        });
       },
     },
     {
