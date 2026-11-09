@@ -55,6 +55,11 @@ type ResolveAppPageResponsePolicyBaseOptions = {
   isDynamicError: boolean;
   isForceDynamic: boolean;
   isForceStatic: boolean;
+  /**
+   * A build-time prerender renders with `isProduction: false` but produces
+   * the production response, so it keeps the route's caching policy.
+   */
+  isPrerender?: boolean;
   isProduction: boolean;
   /**
    * `false` for routes Next.js classifies as dynamic (ƒ). Their responses are
@@ -179,15 +184,18 @@ export function resolveUncacheableCacheControl(isProduction: boolean): string {
  *
  * Mirrors app-page-runtime.ts from vercel/next.js#97505.
  */
-function applyDevNoStore<T extends AppPageResponsePolicy>(isProduction: boolean, policy: T): T {
-  if (isProduction) return policy;
+function applyDevNoStore<T extends AppPageResponsePolicy>(
+  options: { isPrerender?: boolean; isProduction: boolean },
+  policy: T,
+): T {
+  if (options.isProduction || options.isPrerender === true) return policy;
   return { ...policy, cacheControl: DEV_DOCUMENT_CACHE_CONTROL };
 }
 
 export function resolveAppPageRscResponsePolicy(
   options: ResolveAppPageRscResponsePolicyOptions,
 ): AppPageResponsePolicy {
-  return applyDevNoStore(options.isProduction, resolveAppPageRscCachePolicy(options));
+  return applyDevNoStore(options, resolveAppPageRscCachePolicy(options));
 }
 
 function resolveAppPageRscCachePolicy(
@@ -251,7 +259,7 @@ function resolveAppPageRscCachePolicy(
 export function resolveAppPageHtmlResponsePolicy(
   options: ResolveAppPageHtmlResponsePolicyOptions,
 ): AppPageHtmlResponsePolicy {
-  return applyDevNoStore(options.isProduction, resolveAppPageHtmlCachePolicy(options));
+  return applyDevNoStore(options, resolveAppPageHtmlCachePolicy(options));
 }
 
 function resolveAppPageHtmlCachePolicy(
