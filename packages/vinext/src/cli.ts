@@ -286,6 +286,7 @@ async function typegen() {
   const result = await generateRouteTypes({
     root,
     pageExtensions: resolvedNextConfig.pageExtensions,
+    cacheLife: resolvedNextConfig.cacheLife,
   });
   const nextEnvMessage =
     result.nextEnvStatus === "unchanged"

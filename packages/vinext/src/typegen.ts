@@ -1,3 +1,4 @@
+import { generateCacheLifeTypes } from "./typegen/cache-life-types.js";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -13,6 +14,8 @@ type GenerateRouteTypesOptions = {
   root: string;
   appDir?: string | null;
   pageExtensions?: readonly string[];
+  /** Resolved `cacheLife` profiles, typed as `cacheLife()` overloads (#3244). */
+  cacheLife?: Readonly<Record<string, { stale?: number; revalidate?: number; expire?: number }>>;
 };
 
 export type GenerateRouteTypesResult = {
@@ -62,7 +65,19 @@ export async function generateRouteTypes(
     : renderRouteTypes(emptyRouteTypeModel(), false, declareParamMatching);
 
   await fs.mkdir(path.dirname(outPath), { recursive: true });
-  await fs.writeFile(outPath, content, "utf-8");
+  // Like Next.js's type generation, the resolved cacheLife profiles become
+  // `CacheLifeProfiles` keys and `cacheLife()` overloads in next/cache.
+  const cacheLifePath = path.join(path.dirname(outPath), "cache-life.d.ts");
+  const hasCacheLifeTypes =
+    options.cacheLife !== undefined && Object.keys(options.cacheLife).length > 0;
+  if (hasCacheLifeTypes) {
+    await fs.writeFile(cacheLifePath, generateCacheLifeTypes({ ...options.cacheLife }), "utf-8");
+  }
+  await fs.writeFile(
+    outPath,
+    hasCacheLifeTypes ? `import "./cache-life.d.ts";\n${content}` : content,
+    "utf-8",
+  );
   const nextEnv = await ensureNextEnvFile(root, appDir !== null);
   return {
     routeTypesPath: outPath,
