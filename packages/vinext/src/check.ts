@@ -350,6 +350,11 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     status: "partial",
     detail: "experimental support; behavior is incomplete",
   },
+  partialPrefetching: {
+    status: "partial",
+    detail:
+      "App Shell and partial prefetches for <Link> and router.prefetch() in production builds; per-segment prefetch requests are one request per page",
+  },
   "experimental.cacheComponents": {
     status: "partial",
     detail: "legacy alias of cacheComponents; experimental support, behavior is incomplete",

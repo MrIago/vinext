@@ -74,6 +74,7 @@ import {
   isAppPageRouteRenderedDynamically,
   readAppInterceptInstantConfig,
   readAppPageRouteInstantConfig,
+  readAppPageRouteHasPartialPrefetching,
 } from "./build/app-page-static-eligibility.js";
 import { rewriteOutputRootExternals } from "./build/output-root-externals.js";
 
@@ -5650,6 +5651,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               pageExtensionsIncludeMdx(nextConfig?.pageExtensions ?? [])
                 ? await loadMdxEsmReader(root)
                 : null;
+            const partialPrefetchMdxEsm =
+              readMdxEsm ??
+              (nextConfig?.cacheComponents === true &&
+              !nextConfig.partialPrefetching &&
+              pageExtensionsIncludeMdx(nextConfig.pageExtensions ?? [])
+                ? await loadMdxEsmReader(root)
+                : null);
             return generateBrowserEntry(
               graph.routes,
               pagesPrefetchRoutes,
@@ -5668,6 +5676,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     intercept: (intercept, layoutPaths) =>
                       readAppInterceptInstantConfig(intercept, layoutPaths, readMdxEsm),
                   }
+                : undefined,
+              // Partial Prefetching needs Cache Components. Dev reads it too:
+              // its navigations warn about full prefetches without it.
+              nextConfig?.cacheComponents === true
+                ? (route) =>
+                    nextConfig.partialPrefetching ||
+                    readAppPageRouteHasPartialPrefetching(route, partialPrefetchMdxEsm)
                 : undefined,
             );
           }
