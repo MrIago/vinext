@@ -13,6 +13,7 @@ import {
   extractExportConstNumber,
   extractExportConstString,
   extractInstantPrefetchConfig,
+  hasPartialPrefetchingConfig,
   hasRuntimeExportedName,
 } from "./report.js";
 
@@ -172,6 +173,36 @@ export function readAppInterceptInstantConfig(
     return !relative.startsWith("..") && !path.isAbsolute(relative);
   });
   return readInstantConfig([...ancestorLayoutPaths, intercept.pagePath], readMdxEsm);
+}
+
+/**
+ * Whether a segment of the route, a parallel slot's included, opts into
+ * Partial Prefetching, as Next.js's `anySegmentHasPartialPrefetchingEnabled`
+ * reads the route's loader tree. An unreadable source doesn't opt in.
+ */
+export function readAppPageRouteHasPartialPrefetching(
+  route: AppRoute,
+  readMdxEsm: ((source: string) => string) | null,
+): boolean {
+  const filePaths = [
+    ...route.layouts,
+    route.pagePath,
+    ...route.parallelSlots.flatMap((slot) => [
+      ...(slot.configLayoutPaths ?? []),
+      slot.layoutPath,
+      slot.pagePath ?? slot.defaultPath,
+    ]),
+  ];
+  return filePaths.some((filePath) => {
+    if (!filePath) return false;
+    try {
+      let code = fs.readFileSync(filePath, "utf8");
+      if (filePath.toLowerCase().endsWith(".mdx")) code = readMdxEsm?.(code) ?? "";
+      return hasPartialPrefetchingConfig(code);
+    } catch {
+      return false;
+    }
+  });
 }
 
 function readInstantConfig(

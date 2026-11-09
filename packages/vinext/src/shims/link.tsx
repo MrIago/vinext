@@ -68,6 +68,9 @@ import {
   hasAppRouteInstantConfig,
   resolveAutoAppRoutePrefetch,
   resolveFullAppRoutePrefetch,
+  createLinkPrefetchPartialError,
+  readAppRoutePartialPrefetching,
+  resolvePartialAppRoutePrefetch,
 } from "./internal/app-route-prefetch-policy.js";
 import { RouterContext } from "./internal/router-context.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
@@ -200,7 +203,12 @@ export type LinkProps<_RouteInferType = unknown> = {
   children?: React.ReactNode;
 } & Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "href">;
 
-type LinkPrefetchMode = "disabled" | "auto" | "full" | "full-after-shell";
+/**
+ * "navigation" is a full prefetch to the Navigation stage
+ * (`prefetch="navigation"`), which only differs from "full" for a route that
+ * opts into Partial Prefetching.
+ */
+type LinkPrefetchMode = "disabled" | "auto" | "full" | "navigation" | "full-after-shell";
 
 declare global {
   // Window is an ambient interface from lib.dom; interface merging is required
@@ -314,11 +322,10 @@ export function resolveLinkPrefetchMode(
 ): LinkPrefetchMode {
   if (isDangerous || prefetchProp === false) return "disabled";
   // Next.js maps true/"prefetch" to the Prefetch stage and "navigation" to the
-  // Navigation stage. vinext has no Partial Prefetching, so both are a full
-  // prefetch; "auto"/"shell"/null stay on the automatic (shell) stage.
-  if (prefetchProp === true || prefetchProp === "prefetch" || prefetchProp === "navigation") {
-    return "full";
-  }
+  // Navigation stage. Without Partial Prefetching both are a full prefetch;
+  // "auto"/"shell"/null stay on the automatic (shell) stage.
+  if (prefetchProp === true || prefetchProp === "prefetch") return "full";
+  if (prefetchProp === "navigation") return "navigation";
   return "auto";
 }
 
@@ -464,7 +471,7 @@ function prefetchUrl(
             {
               APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
               APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
-              APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
+              getStaticShellPrefetchRenderMode,
             },
             headersModule,
             { createVaryingStaticShellResolver },
@@ -530,15 +537,32 @@ function prefetchUrl(
         const prefetchPolicyHref = rewrittenPrefetchHref ?? prefetchHref;
         const interceptionContext = getPrefetchInterceptionContext(fullHref);
         const mountedSlotsHeader = getMountedSlotsHeader();
+        // Like Next.js's segment cache scheduler, a route that opts into
+        // Partial Prefetching never gets a legacy full prefetch: a link asking
+        // for more than the shell is prefetched like the shell, up to the
+        // stage it asks for.
+        const partialPrefetch =
+          mode === "auto"
+            ? null
+            : resolvePartialAppRoutePrefetch(
+                prefetchPolicyHref,
+                interceptionContext,
+                mode === "navigation" ? "navigation" : "prefetch",
+              );
+        if (mode === "navigation") mode = "full";
         // Like Next.js, a route with an `unstable_instant` config ignores a
         // full prefetch: it's prefetched as an automatic one.
-        if (mode !== "auto" && hasAppRouteInstantConfig(prefetchPolicyHref, interceptionContext)) {
+        if (
+          partialPrefetch !== null ||
+          (mode !== "auto" && hasAppRouteInstantConfig(prefetchPolicyHref, interceptionContext))
+        ) {
           mode = "auto";
         }
         const autoPrefetch =
-          mode === "auto"
+          partialPrefetch ??
+          (mode === "auto"
             ? resolveAutoAppRoutePrefetch(prefetchPolicyHref, interceptionContext)
-            : resolveFullAppRoutePrefetch();
+            : resolveFullAppRoutePrefetch());
         if (!autoPrefetch.shouldPrefetch) return;
 
         const isOptimisticRouteShellPrefetch = !autoPrefetch.cacheForNavigation;
@@ -568,7 +592,7 @@ function prefetchUrl(
           prefetchKind: mode === "full" || mode === "full-after-shell" ? "full" : "auto",
           renderMode: isOptimisticRouteShellPrefetch
             ? autoPrefetch.staticShell === true
-              ? APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL
+              ? getStaticShellPrefetchRenderMode(autoPrefetch.prefetchStage)
               : hasSearchAgnosticShell
                 ? APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
                 : isAutomaticSearchParamShell
@@ -1749,6 +1773,22 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     // hash-only changes, RSC fetch, and two-phase URL commit.
     if (hasAppNavigationRuntime) {
       const { navigateClientSide } = loadedNavigationModule ?? (await loadNavigationModule());
+      // Like Next.js in development with Cache Components, warn when a link
+      // that asks for more than the shell navigates to a route without
+      // Partial Prefetching: its prefetch is a legacy full one, with the
+      // route's dynamic data. It fires at navigation rather than prefetch
+      // time, so a page full of such links isn't one warning per link, and
+      // dev doesn't prefetch anyway (vercel/next.js#94672).
+      if (
+        process.env.NODE_ENV !== "production" &&
+        String(process.env.__NEXT_CACHE_COMPONENTS) === "true" &&
+        (prefetchMode === "full" || prefetchMode === "navigation") &&
+        readAppRoutePartialPrefetching(navigateHref) === false
+      ) {
+        console.error(
+          createLinkPrefetchPartialError(new URL(navigateHref, window.location.href).pathname),
+        );
+      }
       const setter = setPendingRef.current;
       // Register this link as the one driving the current navigation. This
       // resets any previously-pending link (e.g. a different link clicked

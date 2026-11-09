@@ -23,12 +23,18 @@ import {
   isDraftModeEnabled,
   markDynamicUsage as _markDynamic,
 } from "./headers.js";
+import { getCacheScopeKind } from "./internal/headers-state.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
 import { sha256Hex } from "../utils/hash.js";
 import { isInsideUnifiedScope, getRequestContext } from "./unified-request-context.js";
 import { workUnitAsyncStorage } from "./internal/work-unit-async-storage.js";
 import { makeHangingPromise } from "./internal/make-hanging-promise.js";
-import { createPprFallbackShellSuspensePromise } from "./ppr-fallback-shell.js";
+import {
+  createPprFallbackShellSuspensePromise,
+  createPprFallbackShellSuspensePromiseForState,
+  getPprFallbackShellState,
+  reachesPprFallbackShellPrefetchStage,
+} from "./ppr-fallback-shell.js";
 import { isInsideWorkStoreScope } from "./internal/work-store-scope.js";
 import { encodeCacheTag, encodeCacheTags } from "../utils/encode-cache-tag.js";
 import {
@@ -352,6 +358,86 @@ export function unstable_io(): Promise<void> {
 }
 
 let _unstableIoWarned = false;
+
+// ---------------------------------------------------------------------------
+// prefetch / navigation — Cache Components render stage boundaries
+// ---------------------------------------------------------------------------
+
+/**
+ * What follows `await prefetch()` or `await navigation()` renders only in a
+ * render that reaches that stage, as Next.js's `cache-stages.ts` decides:
+ *
+ * - a request, and a static shell (the whole static prerender, which a static
+ *   prefetch and the document's prelude share), render both: static output is
+ *   shared across clients, so there's no per-request cost to save;
+ * - an App Shell renders neither;
+ * - a runtime prefetch renders what follows `prefetch()`, and what follows
+ *   `navigation()` only when it was asked for the navigation stage.
+ *
+ * A boundary left unrendered is a hole in the shell, with its Suspense
+ * fallback, but unlike `connection()` it doesn't make the route dynamic:
+ * what follows stays cacheable.
+ *
+ * Ported from Next.js: packages/next/src/server/request/cache-stages.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/cache-stages.ts
+ */
+function cacheStageBoundary(api: "prefetch" | "navigation"): Promise<void> {
+  if (typeof window !== "undefined") {
+    throw new Error(`\`${api}\` is only available in a Server Component.`);
+  }
+  const state = getPprFallbackShellState();
+  const route = state?.routePattern;
+  const usedBy = route === undefined ? "A route" : `Route ${route}`;
+  if (String(process.env.__NEXT_CACHE_COMPONENTS) !== "true") {
+    throw new Error(
+      `${usedBy} used \`${api}()\`, which requires Cache Components to be enabled. Learn more: https://nextjs.org/docs/app/api-reference/config/next-config-js/cacheComponents`,
+    );
+  }
+  const purpose =
+    api === "prefetch"
+      ? "must not run in the app shell"
+      : "must only run during an actual navigation";
+  const scope = getCacheScopeKind();
+  if (scope === "use cache" || scope === "use cache: private") {
+    throw new Error(
+      `${usedBy} used \`${api}()\` inside "${scope}". This is not currently supported. Instead, move the "use cache" directive to a function that's called below \`await ${api}()\`, so that the cached content is deferred to the ${api} without caching the stage boundary itself. See more info here: https://nextjs.org/docs/messages/next-request-in-use-cache`,
+    );
+  }
+  if (scope === "unstable_cache") {
+    throw new Error(
+      `${usedBy} used \`${api}()\` inside a function cached with \`unstable_cache()\`. The \`${api}()\` function is used to indicate the subsequent code ${purpose}, but \`unstable_cache()\` caches must be able to be produced before a ${api}, so this function is not allowed in this scope. See more info here: https://nextjs.org/docs/app/api-reference/functions/unstable_cache`,
+    );
+  }
+  if (workUnitAsyncStorage.getStore()?.type === "generate-static-params") {
+    throw new Error(
+      `${usedBy} used \`${api}()\` inside \`generateStaticParams\`. This is not supported because \`generateStaticParams\` runs at build time without a ${api}. Read more: https://nextjs.org/docs/messages/next-dynamic-api-wrong-context`,
+    );
+  }
+  if (state === null || reachesPprFallbackShellPrefetchStage(state.prefetchStage, api)) {
+    return _resolvedIOPromise;
+  }
+  return createPprFallbackShellSuspensePromiseForState<void>(state, `\`${api}()\``);
+}
+
+/**
+ * Leaves what follows out of an App Shell: it renders in a static prefetch, a
+ * prefetch (`<Link prefetch={true}>`) and a navigation. Unlike `navigation()`,
+ * request data read after it still makes the route request-dependent.
+ * Requires Cache Components.
+ */
+export function prefetch(): Promise<void> {
+  return cacheStageBoundary("prefetch");
+}
+
+/**
+ * Defers what follows to an actual navigation: it's left out of App Shells
+ * and runtime prefetches, which are rendered per user and per link, but it
+ * renders in the static prerender, which is shared. Requires Cache
+ * Components.
+ */
+export function navigation(): Promise<void> {
+  return cacheStageBoundary("navigation");
+}
 
 // ---------------------------------------------------------------------------
 // cacheLife / cacheTag — Next.js 15+ "use cache" APIs

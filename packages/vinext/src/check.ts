@@ -108,7 +108,7 @@ const IMPORT_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   "next/cache": {
     status: "supported",
     detail:
-      "revalidateTag, revalidatePath, updateTag, refresh, unstable_cache, unstable_noStore, io, cacheLife, cacheTag",
+      "revalidateTag, revalidatePath, updateTag, refresh, unstable_cache, unstable_noStore, io, cacheLife, cacheTag, prefetch, navigation",
   },
   "next/dynamic": { status: "supported" },
   "next/head": { status: "supported" },
@@ -349,6 +349,11 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   cacheComponents: {
     status: "partial",
     detail: "experimental support; behavior is incomplete",
+  },
+  partialPrefetching: {
+    status: "partial",
+    detail:
+      "App Shell and partial prefetches for <Link> and router.prefetch() in production builds; per-segment prefetch requests are one request per page",
   },
   "experimental.cacheComponents": {
     status: "partial",

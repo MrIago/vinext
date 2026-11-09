@@ -3596,6 +3596,55 @@ describe("static-shell prefetch", () => {
     expect(headers?.get("Next-Router-Prefetch")).toBe("1");
   });
 
+  // Ported from Next.js's Partial Prefetching (vercel/next.js#94510): an
+  // automatic prefetch of a route that opts in gets the App Shell, and a full
+  // one is prefetched like the shell, up to its stage, never with the page's
+  // dynamic data.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/segment-cache/scheduler.ts
+  it.each([
+    [undefined, "prefetch-app-shell"],
+    ["full", "prefetch-partial"],
+    ["prefetch", "prefetch-partial"],
+    ["navigation", "prefetch-partial-navigation"],
+  ] as const)(
+    "prefetches a Partial Prefetching route with kind %s as %s",
+    async (kind, renderMode) => {
+      useCacheComponentsProduction();
+      (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+        {
+          canPrefetchLoadingShell: false,
+          isDynamic: false,
+          partialPrefetching: true,
+          patternParts: ["test"],
+        },
+      ];
+      const fetch = vi.fn(
+        async (_input: RequestInfo | URL, _init?: RequestInit) =>
+          new Response("0:shell", { headers: { "content-type": "text/x-component" } }),
+      );
+      (globalThis as any).fetch = fetch;
+      (globalThis as any).window[Symbol.for("vinext.navigationRuntime")] = {
+        bootstrap: { routeManifest: null, rsc: undefined },
+        functions: {
+          getPrefetchRouterState: () => ({ pathAndSearch: "/current", routeId: "route:/current" }),
+          navigate: vi.fn(),
+        },
+      };
+      appRouterInstance.prefetch("/test", kind === undefined ? undefined : ({ kind } as never));
+      await waitForPrefetchSetup(() => fetch.mock.calls.length === 1);
+      const headers = fetch.mock.calls[0]?.[1]?.headers as Headers | undefined;
+      expect(headers?.get("X-Vinext-Rsc-Render-Mode")).toBe(renderMode);
+      expect(headers?.get("Next-Router-State-Tree")).toBeNull();
+    },
+  );
+
+  it("keeps the full prefetch of a route that doesn't opt into Partial Prefetching", async () => {
+    useCacheComponentsProduction();
+    const { resolvePartialAppRoutePrefetch } =
+      await import("../packages/vinext/src/shims/internal/app-route-prefetch-policy.js");
+    expect(resolvePartialAppRoutePrefetch("/test", null, "prefetch")).toBeNull();
+  });
+
   it("reads an intercepting page's unstable_instant config under its interception context", async () => {
     useCacheComponentsProduction();
     (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [

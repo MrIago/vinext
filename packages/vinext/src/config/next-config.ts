@@ -450,6 +450,13 @@ export type NextConfig = {
    */
   cacheComponents?: boolean;
   /**
+   * Partial Prefetching (Next.js 16): with Cache Components, a `<Link>`
+   * prefetches only the App Shell of its target, and `<Link prefetch={true}>`
+   * prefetches the page's cached content without its dynamic data. A segment
+   * opts in alone with `export const prefetch = "partial"`.
+   */
+  partialPrefetching?: boolean;
+  /**
    * Enables source maps while generating static pages.
    * Helps with errors during the prerender phase in `vite build`.
    * Defaults to `true`. Set to `false` to disable.
@@ -588,6 +595,8 @@ export type ResolvedNextConfig = {
   /** Server globals injected into instrumentation.ts by wrapped webpack configs. */
   instrumentationServerValueInjections: Record<string, unknown>;
   cacheComponents: boolean;
+  /** `partialPrefetching`, which only takes effect with `cacheComponents`. */
+  partialPrefetching: boolean;
   /**
    * `experimental.cachedNavigations`: lets the client cache the static stage of
    * navigation responses. Requires `cacheComponents`.
@@ -2032,6 +2041,7 @@ export async function resolveNextConfig(
       resolveExtensions: null,
       serverResolveExtensions: null,
       cacheComponents: false,
+      partialPrefetching: false,
       cachedNavigations: false,
       appNavFailHandling: false,
       gestureTransition: false,
@@ -2478,6 +2488,7 @@ export async function resolveNextConfig(
     instrumentationClientRouteManifest: webpackProbe.instrumentationClientRouteManifest,
     instrumentationServerValueInjections: webpackProbe.instrumentationServerValueInjections,
     cacheComponents,
+    partialPrefetching: cacheComponents && config.partialPrefetching === true,
     cachedNavigations: cacheComponents && experimental?.cachedNavigations === true,
     appNavFailHandling: experimental?.appNavFailHandling === true,
     gestureTransition: experimental?.gestureTransition === true,

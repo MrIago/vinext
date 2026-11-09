@@ -1,4 +1,5 @@
 import type { CachedAppPageValue } from "vinext/shims/cache-handler";
+import type { PprFallbackShellPrefetchStage } from "vinext/shims/ppr-fallback-shell";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { resolveClientStaleTimeSeconds } from "../utils/cache-control-metadata.js";
 import { buildAppPageCacheTags, resolveStaticStaleTimeSeconds } from "./app-page-cache.js";
@@ -18,6 +19,7 @@ import {
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
 import { isUnknownRecord } from "../utils/record.js";
 import {
+  appIsrAppShellRscKey,
   appIsrStaticShellRscKey,
   coalesceFallbackShellProduction,
   isrCacheControl,
@@ -155,8 +157,13 @@ async function produceStaticShell<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
   key: string | null,
   isRuntimePrefetch = false,
+  prefetchStage?: PprFallbackShellPrefetchStage,
 ): Promise<CachedAppPageValue | null> {
-  const { isPartial, response } = await renderAppPageStaticShell(options, isRuntimePrefetch);
+  const { isPartial, response } = await renderAppPageStaticShell(
+    options,
+    isRuntimePrefetch,
+    prefetchStage,
+  );
   const cacheControlHeader = response.headers.get("cache-control") ?? "";
   const rscData = await response.arrayBuffer();
   if (response.status !== 200 || rscData.byteLength === 0) {
@@ -222,10 +229,14 @@ async function produceStaticShell<TRoute extends AppPageDispatchRoute>(
  * prefetch the page's prerendered payload. A page without a stored shell
  * renders it first, blocking, as a build without the page would; a stale one is
  * served while it regenerates. Returns null when the prefetch can't have one.
+ *
+ * With the `shell` stage, it's the page's App Shell instead, which a Partial
+ * Prefetching route's automatic prefetch gets, stored under its own key.
  */
 export async function serveAppPageStaticShellPrefetch<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
   isDraftMode: boolean,
+  prefetchStage?: "shell",
 ): Promise<Response | null> {
   if (!canServeStaticShell(options, isDraftMode)) return null;
   if (options.mountedSlotsHeader) {
@@ -234,15 +245,17 @@ export async function serveAppPageStaticShellPrefetch<TRoute extends AppPageDisp
     // variant is rendered for the request, not stored.
     let value: CachedAppPageValue | null;
     try {
-      value = await produceStaticShell(options, null);
+      value = await produceStaticShell(options, null, false, prefetchStage);
     } catch (renderError) {
       console.error("[vinext] ISR static shell render error:", renderError);
       return null;
     }
     return value ? buildStaticShellResponse(value, options.middlewareContext) : null;
   }
-  const key = appIsrStaticShellRscKey(options.cachePathname ?? options.cleanPathname);
-  const produce = () => produceStaticShell(options, key);
+  const pathname = options.cachePathname ?? options.cleanPathname;
+  const key =
+    prefetchStage === "shell" ? appIsrAppShellRscKey(pathname) : appIsrStaticShellRscKey(pathname);
+  const produce = () => produceStaticShell(options, key, false, prefetchStage);
 
   let cached: ISRCacheEntry | null;
   try {
@@ -286,15 +299,20 @@ export async function serveAppPageStaticShellPrefetch<TRoute extends AppPageDisp
  * private caches rendered, and only `connection()` and caches about to go stale left at their
  * Suspense fallbacks. It's never stored, as it holds the
  * request's data. Returns null when the prefetch can't be prerendered.
+ *
+ * `prefetchStage` is how far it renders: a Partial Prefetching route's
+ * `<Link prefetch="navigation">` renders what follows `navigation()` too, and
+ * its automatic prefetch of a runtime-prefetched route stops at the shell.
  */
 export async function serveAppPageRuntimePrefetch<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
   isDraftMode: boolean,
+  prefetchStage?: PprFallbackShellPrefetchStage,
 ): Promise<Response | null> {
   if (!canServeRuntimePrefetch(options, isDraftMode)) return null;
   let value: CachedAppPageValue | null;
   try {
-    value = await produceStaticShell(options, null, true);
+    value = await produceStaticShell(options, null, true, prefetchStage);
   } catch (renderError) {
     console.error("[vinext] Runtime prefetch render error:", renderError);
     return null;

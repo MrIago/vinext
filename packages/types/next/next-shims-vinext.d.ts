@@ -34,3 +34,10 @@ declare module "next/navigation" {
     bfcacheId: string;
   };
 }
+
+// Cache Components render stage boundaries, newer than the vendored Next.js
+// declarations: https://github.com/vercel/next.js/blob/canary/packages/next/cache.d.ts
+declare module "next/cache" {
+  export function prefetch(): Promise<void>;
+  export function navigation(): Promise<void>;
+}

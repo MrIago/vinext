@@ -469,7 +469,7 @@ describe("Link App Router prefetch mode", () => {
   it("maps the stage aliases onto the automatic and full prefetch modes", () => {
     expect(resolveLinkPrefetchMode("shell", false)).toBe("auto");
     expect(resolveLinkPrefetchMode("prefetch", false)).toBe("full");
-    expect(resolveLinkPrefetchMode("navigation", false)).toBe("full");
+    expect(resolveLinkPrefetchMode("navigation", false)).toBe("navigation");
     expect(resolveLinkPrefetchMode("navigation", true)).toBe("disabled");
   });
 

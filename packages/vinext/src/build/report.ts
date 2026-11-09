@@ -257,6 +257,18 @@ export function extractInstantPrefetchConfig(code: string): "runtime" | "static"
 }
 
 /**
+ * Whether a segment opts into Partial Prefetching with
+ * `export const prefetch = "partial"`, or Next.js's earlier
+ * `export const unstable_prefetch = "partial"`.
+ */
+export function hasPartialPrefetchingConfig(code: string): boolean {
+  return (
+    extractExportConstString(code, "prefetch") === "partial" ||
+    extractExportConstString(code, "unstable_prefetch") === "partial"
+  );
+}
+
+/**
  * Extracts the string value of `export const <name> = "value"`.
  * Handles TypeScript annotations/assertions and no-substitution template literals.
  * Returns null if the export is absent or not a string literal.

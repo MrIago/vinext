@@ -2710,6 +2710,60 @@ describe("Link prefetch scheduling", () => {
     }
   });
 
+  // Ported from Next.js's Partial Prefetching (vercel/next.js#94510): a Link
+  // to a route that opts in prefetches its App Shell by default, and
+  // `prefetch={true}` / `prefetch="navigation"` prefetch it up to their stage,
+  // never as a legacy full prefetch.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/segment-cache/scheduler.ts
+  it.each([
+    [undefined, "prefetch-app-shell"],
+    [true, "prefetch-partial"],
+    ["navigation", "prefetch-partial-navigation"],
+  ] as const)(
+    "prefetches a Link with prefetch=%s to a Partial Prefetching route as %s",
+    async (prefetch, renderMode) => {
+      vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
+      const observer = stubIntersectionObserver();
+
+      const result = await renderIsolatedLink({
+        href: "/partial-target",
+        nodeEnv: "production",
+        props: prefetch === undefined ? {} : { prefetch },
+        windowOverrides: {
+          __VINEXT_LINK_PREFETCH_ROUTES__: [
+            {
+              canPrefetchLoadingShell: false,
+              isDynamic: false,
+              partialPrefetching: true,
+              patternParts: ["partial-target"],
+            },
+          ],
+        },
+      });
+
+      try {
+        result.fetch.mockImplementation(() => {
+          const response = createFlightResponse("partial prefetch");
+          response.headers.set("X-Vinext-Static-Shell", "partial");
+          return Promise.resolve(response);
+        });
+        observer.dispatchIntersectingEntry(result.anchor);
+        await waitForFetchCalls(result.fetch, 1);
+        await flushPrefetchTasks();
+
+        expect(result.fetch).toHaveBeenCalledTimes(1);
+        const fetchInit = result.fetch.mock.calls[0]?.[1] as RequestInit | undefined;
+        expect(
+          (fetchInit?.headers as Headers | undefined)?.get(VINEXT_RSC_RENDER_MODE_HEADER),
+        ).toBe(renderMode);
+        const { getPrefetchCache } = await import("../packages/vinext/src/shims/navigation.js");
+        expect(Array.from(getPrefetchCache().values())[0]?.prefetchKind).toBe("static-shell");
+      } finally {
+        result.restoreNodeEnv();
+      }
+    },
+  );
+
   it("prefetches a runtime prefetch route's search-param href as its own static shell", async () => {
     vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
     const observer = stubIntersectionObserver();
@@ -4171,6 +4225,66 @@ describe("Link prefetch scheduling", () => {
       result.restoreNodeEnv();
     }
   });
+
+  // Ported from Next.js (vercel/next.js#94672): in development with Cache
+  // Components, a navigation from a link that asks for more than the shell to
+  // a route without Partial Prefetching reports that its prefetch included
+  // the route's dynamic data.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/app-router-state.ts
+  it.each([
+    ["prefetch={true} to a route without Partial Prefetching", true, false, true],
+    ['prefetch="navigation" to a route without Partial Prefetching', "navigation", false, true],
+    ["prefetch={true} to a Partial Prefetching route", true, true, false],
+    ["the default prefetch", undefined, false, false],
+  ] as const)(
+    "warns about a navigation from %s: %s",
+    async (_name, prefetch, partialPrefetching, warns) => {
+      vi.stubEnv("__NEXT_CACHE_COMPONENTS", "true");
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      const result = await renderIsolatedLink({
+        href: "/dashboard",
+        nodeEnv: "development",
+        props: prefetch === undefined ? {} : { prefetch },
+        windowOverrides: {
+          __VINEXT_LINK_PREFETCH_ROUTES__: [
+            {
+              canPrefetchLoadingShell: false,
+              isDynamic: false,
+              ...(partialPrefetching ? { partialPrefetching: true } : {}),
+              patternParts: ["dashboard"],
+            },
+          ],
+        },
+      });
+
+      try {
+        const clickEvent = {
+          button: 0,
+          currentTarget: { hasAttribute: () => false, target: "" },
+          defaultPrevented: false,
+          preventDefault() {
+            this.defaultPrevented = true;
+          },
+        } satisfies CapturedClickEvent;
+        await result.capturedAnchorProps.onClick?.(clickEvent);
+        await flushPrefetchTasks();
+
+        const messages = error.mock.calls.map(([value]) =>
+          value instanceof Error ? value.message : String(value),
+        );
+        expect(
+          messages.some((message) =>
+            message.startsWith(
+              'Next.js encountered dynamic data during prefetching for "/dashboard".',
+            ),
+          ),
+        ).toBe(warns);
+      } finally {
+        error.mockRestore();
+        result.restoreNodeEnv();
+      }
+    },
+  );
 
   it("does not prefetch shallow Pages Router links on intent", async () => {
     const result = await renderIsolatedLink({

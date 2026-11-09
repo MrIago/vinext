@@ -26,6 +26,15 @@ export type PprFallbackShellState = {
   pendingCacheReadyCleanup: (() => void) | null;
   pendingCacheTasks: number;
   phase: "warmup" | "final";
+  /**
+   * How far the render goes, as Next.js's render stages: `shell` is an App
+   * Shell, which leaves out what follows `prefetch()` and `navigation()` and
+   * caches that go stale within five minutes; `prefetch` renders what follows
+   * `prefetch()`; `navigation` renders what follows both. A static shell (the
+   * whole static prerender) goes to `navigation`, a runtime prefetch to
+   * `prefetch`.
+   */
+  prefetchStage: PprFallbackShellPrefetchStage;
   routePattern: string;
   /**
    * The params the render reads, `?` for search params, when it records them
@@ -35,9 +44,26 @@ export type PprFallbackShellState = {
   varyParams: Set<string> | null;
 };
 
+export type PprFallbackShellPrefetchStage = "shell" | "prefetch" | "navigation";
+
+const PREFETCH_STAGE_ORDER: Record<PprFallbackShellPrefetchStage, number> = {
+  shell: 0,
+  prefetch: 1,
+  navigation: 2,
+};
+
+/** Whether a render that goes to `stage` renders what follows a `reached` boundary. */
+export function reachesPprFallbackShellPrefetchStage(
+  stage: PprFallbackShellPrefetchStage,
+  reached: PprFallbackShellPrefetchStage,
+): boolean {
+  return PREFETCH_STAGE_ORDER[stage] >= PREFETCH_STAGE_ORDER[reached];
+}
+
 type CreatePprFallbackShellStateOptions = {
   fallbackParamNames: readonly string[];
   isRuntimePrefetch?: boolean;
+  prefetchStage?: PprFallbackShellPrefetchStage;
   routePattern: string;
   varyParams?: Set<string>;
 };
@@ -178,6 +204,8 @@ export function createPprFallbackShellState(
     pendingCacheReadyCleanup: null,
     pendingCacheTasks: 0,
     phase: "warmup",
+    prefetchStage:
+      options.prefetchStage ?? (options.isRuntimePrefetch === true ? "prefetch" : "navigation"),
     routePattern: options.routePattern,
     varyParams: options.varyParams ?? null,
   };

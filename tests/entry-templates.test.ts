@@ -21,6 +21,7 @@ import {
   isAppInterceptRenderedDynamically,
   isAppPageRouteRenderedDynamically,
   readAppInterceptInstantConfig,
+  readAppPageRouteHasPartialPrefetching,
   readAppPageRouteInstantConfig,
 } from "../packages/vinext/src/build/app-page-static-eligibility.js";
 import {
@@ -652,6 +653,63 @@ describe("App Router generated manifest construction", () => {
     ).toEqual([
       { instant: "static", sourcePatternParts: ["feed"], targetPatternParts: ["photos", ":id"] },
     ]);
+  });
+
+  // Next.js's `SubtreeHasPartialPrefetching` route tree hint
+  // (vercel/next.js#94448, #94655): any segment's `prefetch = "partial"` opts
+  // the route in, and the document's own route tree carries it.
+  it("records which routes opt into Partial Prefetching", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-partial-prefetching-"));
+    const appDir = path.join(tmpDir, "app");
+    const page = "export default function Page() { return null; }\n";
+    const layout = "export default function Layout({ children }) { return children; }\n";
+    const write = (relativePath: string, source: string) => {
+      fs.mkdirSync(path.dirname(path.join(appDir, relativePath)), { recursive: true });
+      fs.writeFileSync(path.join(appDir, relativePath), source);
+    };
+    try {
+      write("layout.tsx", layout);
+      write("page.tsx", page);
+      write("partial/page.tsx", `export const prefetch = "partial";\n${page}`);
+      write("legacy/layout.tsx", `export const unstable_prefetch = "partial";\n${layout}`);
+      write("legacy/page.tsx", page);
+      write("slot/layout.tsx", layout);
+      write("slot/page.tsx", page);
+      write("slot/@panel/page.tsx", `export const prefetch = "partial";\n${page}`);
+      write("auto/page.tsx", `export const prefetch = "auto";\n${page}`);
+      const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+      const hasPartialPrefetching = (route: AppRoute) =>
+        readAppPageRouteHasPartialPrefetching(route, null);
+      const prefetchRoutes = toLinkPrefetchRoutes(
+        graph.routes,
+        undefined,
+        undefined,
+        hasPartialPrefetching,
+      );
+      expect(
+        Object.fromEntries(
+          prefetchRoutes.map((route) => [route.patternParts.join("/"), route.partialPrefetching]),
+        ),
+      ).toEqual({
+        "": undefined,
+        auto: undefined,
+        legacy: true,
+        partial: true,
+        slot: true,
+      });
+      const entryCode = generateBrowserEntry(
+        graph.routes,
+        [],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hasPartialPrefetching,
+      );
+      expect(entryCode).toContain('"partialPrefetching":true');
+    } finally {
+      fs.rmSync(tmpDir, { force: true, recursive: true });
+    }
   });
 
   it("reads an intercepting page's unstable_instant config from its own layouts only", () => {

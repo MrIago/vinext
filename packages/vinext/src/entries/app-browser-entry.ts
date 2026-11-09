@@ -29,10 +29,16 @@ export function generateBrowserEntry(
   locales: readonly string[] = [],
   classifier?: AppRouteDynamicRenderClassifier,
   instantConfigReader?: AppRouteInstantConfigReader,
+  hasPartialPrefetching?: (route: AppRoute) => boolean,
 ): string {
   const entryPath = resolveRuntimeEntryModule("app-browser-entry");
   const reactInstanceBootstrapPath = resolveClientRuntimeModule("react-instance-bootstrap");
-  const prefetchRoutes = toLinkPrefetchRoutes(routes, classifier, instantConfigReader);
+  const prefetchRoutes = toLinkPrefetchRoutes(
+    routes,
+    classifier,
+    instantConfigReader,
+    hasPartialPrefetching,
+  );
   // Route handlers only feed hybrid App/Pages ownership. An App-only client
   // learns a handler URL from its non-Flight response (a prefetch miss, then a
   // document navigation), like Next.js, so it gets none (issue #3624).
@@ -171,6 +177,7 @@ export function toLinkPrefetchRoutes(
   routes: readonly AppRoute[],
   classifier?: AppRouteDynamicRenderClassifier,
   instantConfigReader?: AppRouteInstantConfigReader,
+  hasPartialPrefetching?: (route: AppRoute) => boolean,
 ): VinextLinkPrefetchRoute[] {
   const siblingInterceptLoadingTargets: string[][] = [];
   for (const route of routes) {
@@ -194,7 +201,11 @@ export function toLinkPrefetchRoutes(
       classifier?.route(route) ?? false,
     );
     const instant = instantConfigReader?.route(route) ?? null;
-    const classifiedRoute = instant !== null ? { ...prefetchRoute, instant } : prefetchRoute;
+    const instantRoute = instant !== null ? { ...prefetchRoute, instant } : prefetchRoute;
+    const classifiedRoute =
+      hasPartialPrefetching?.(route) === true
+        ? { ...instantRoute, partialPrefetching: true as const }
+        : instantRoute;
     const routeIntercepts = intercepts
       .filter(({ targetPatternParts }) =>
         interceptTargetMayMatchRoute(targetPatternParts, route.patternParts),

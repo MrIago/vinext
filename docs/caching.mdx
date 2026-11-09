@@ -491,6 +491,18 @@ As with Next.js's `varyParams`, a shell records which params its render read, `?
 
 A page under a `loading.tsx` boundary, an href with a query string, an intercepted route and the dev server keep the loading-shell prefetch.
 
+A static shell, like a runtime prefetch, leaves out a `"use cache"` function whose `stale` time is under 30 seconds: data that goes stale that fast isn't worth prefetching.
+
+### Partial Prefetching
+
+Set `partialPrefetching: true` next to `cacheComponents`, or export `const prefetch = "partial"` from a page or layout, and a route prefetches in stages, as in Next.js:
+
+- A `<Link>` with no `prefetch` prop gets the page's **App Shell**: the static shell without what follows `await prefetch()` or `await navigation()` from `next/cache`, and without `"use cache"` functions whose `stale` time is under five minutes. It's stored beside the static shell, with the same lifetime and tags. A fully static page is no longer prefetched whole by default; set `prefetch={true}` on links that should keep that.
+- `<Link prefetch={true}>` and `router.prefetch(href, { kind: "full" })` get the page rendered for the request: its cookies, headers and private caches render, `connection()` and uncached data stay at their `<Suspense>` fallbacks, and so does what follows `await navigation()`. It's never a full prefetch with the page's dynamic data, and it's never stored.
+- `<Link prefetch="navigation">` and `{ kind: "navigation" }` render what follows `await navigation()` too.
+
+A route that doesn't opt in keeps the static shell for automatic prefetches and the full prefetch for `prefetch={true}`. In development, a navigation from a `prefetch={true}` link to such a route logs Next.js's error about dynamic data in the prefetch, since dev doesn't prefetch. `prefetch()` and `navigation()` throw without Cache Components and inside `"use cache"` or `unstable_cache()`; on a request, and in the static shell and the document's partial prerender, both resolve.
+
 ## Partial prerendering
 
 With `cacheComponents`, vinext serves a production App Router page's document from a stored shell, as Next.js serves its partial prerender. The shell is the page rendered with `cookies()`, `headers()`, `connection()`, `searchParams`, `useSearchParams()`, uncached `fetch` calls, `"use cache: private"` functions and short-lived `"use cache"` functions left at their `<Suspense>` fallbacks. A request sends the stored shell at once, then renders only those holes and streams them into it. The rest of the page doesn't render again, and the browser hydrates the shell as it arrives.

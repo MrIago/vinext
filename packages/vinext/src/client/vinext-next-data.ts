@@ -37,6 +37,12 @@ export type VinextLinkPrefetchRoute = {
    * Components: "runtime" when the route's prefetches render at runtime.
    */
   instant?: "runtime" | "static";
+  /**
+   * The route opts into Partial Prefetching, through `partialPrefetching` or a
+   * segment's `export const prefetch = "partial"`, as Next.js's
+   * `SubtreeHasPartialPrefetching` route tree hint. Set with Cache Components.
+   */
+  partialPrefetching?: true;
 };
 
 export type VinextLinkPrefetchIntercept = {

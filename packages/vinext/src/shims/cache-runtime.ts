@@ -118,14 +118,27 @@ export function replayCachedFunction(fn: object, args: CacheFlightArguments): Pr
 // Constants for nested-dynamic cache life detection
 // ---------------------------------------------------------------------------
 
-/** Threshold below which expire is considered "dynamic" (5 minutes in seconds). */
+/**
+ * Threshold below which expire is considered "dynamic" (5 minutes in seconds),
+ * as Next.js's `MIN_PRERENDERABLE_EXPIRE`: a static shell leaves such a cache
+ * out, a runtime prefetch keeps it.
+ */
 const DYNAMIC_EXPIRE = 300;
 
 /**
- * Stale time under which a runtime prefetch leaves a cache out (30 seconds), as
- * Next.js's `RUNTIME_PREFETCH_DYNAMIC_STALE`: it's not worth prefetching.
+ * Stale time under which every shell leaves a cache out (30 seconds), as
+ * Next.js's `MIN_PREFETCHABLE_STALE`: it's not worth prefetching. Like
+ * Next.js (vercel/next.js#94678), static shells and runtime prefetches apply
+ * it alike.
  */
-const RUNTIME_PREFETCH_DYNAMIC_STALE = 30;
+const MIN_PREFETCHABLE_STALE = 30;
+
+/**
+ * Stale time under which an App Shell leaves a cache out (5 minutes), as
+ * Next.js's `MIN_SHELL_STALE`: a client may keep the shell longer than the
+ * cache's stale time. A static shell and a prefetch still render it.
+ */
+const MIN_SHELL_STALE = 300;
 
 /** A cache result a shell render leaves out, as a dynamic hole. */
 const OMITTED_FROM_SHELL: unique symbol = Symbol("vinext.omittedFromShell");
@@ -138,7 +151,11 @@ function isShortLivedCacheLife(life: ShellCacheLife): boolean {
 }
 
 function isSoonStaleCacheLife(life: ShellCacheLife): boolean {
-  return life.stale !== undefined && life.stale < RUNTIME_PREFETCH_DYNAMIC_STALE;
+  return life.stale !== undefined && life.stale < MIN_PREFETCHABLE_STALE;
+}
+
+function isShellStaleCacheLife(life: ShellCacheLife): boolean {
+  return life.stale !== undefined && life.stale < MIN_SHELL_STALE;
 }
 
 /**
@@ -759,13 +776,15 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
     // Like Next.js's final prerender, a shell leaves a short-lived outermost
     // cache out: it's not worth a static shell, so its lifetime and tags don't
     // count toward the shell's either. The value is still stored for requests.
-    // A runtime prefetch keeps short-lived caches and leaves out those about to
-    // go stale instead.
+    // A runtime prefetch keeps short-lived caches. Both leave out those about
+    // to go stale, and an App Shell those that go stale within its own life.
     const shellState = cacheContextStorage.getStore() ? null : getPprFallbackShellState();
     const omitFromShell = (life: ShellCacheLife | undefined) =>
       shellState?.phase === "final" &&
       life !== undefined &&
-      (shellState.isRuntimePrefetch ? isSoonStaleCacheLife(life) : isShortLivedCacheLife(life));
+      (isSoonStaleCacheLife(life) ||
+        (!shellState.isRuntimePrefetch && isShortLivedCacheLife(life)) ||
+        (shellState.prefetchStage === "shell" && isShellStaleCacheLife(life)));
 
     const task = trackPprFallbackShellCacheTask(async (): Promise<ShellResult<TResult>> => {
       const codec = await getRscModule();

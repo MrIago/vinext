@@ -270,6 +270,13 @@ function _isInsideUnstableCache(): boolean {
   return _getGlobalCacheScopeStore(_UNSTABLE_CACHE_ALS_KEY) === true;
 }
 
+/** The innermost cache scope the work runs in, or null outside one. */
+export function getCacheScopeKind(): "use cache" | "use cache: private" | "unstable_cache" | null {
+  const ctx = _getUseCacheGuardContext();
+  if (ctx !== null) return ctx.variant === "private" ? "use cache: private" : "use cache";
+  return _isInsideUnstableCache() ? "unstable_cache" : null;
+}
+
 /** Whether work is executing inside a cache boundary that owns its reuse. */
 export function isInsideAnyCacheScope(): boolean {
   return _getUseCacheGuardContext() !== null || _isInsideUnstableCache();

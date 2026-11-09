@@ -2463,6 +2463,23 @@ describe("resolveNextConfig cachedNavigations", () => {
   });
 });
 
+describe("resolveNextConfig partialPrefetching", () => {
+  it("defaults partialPrefetching to false", async () => {
+    const resolved = await resolveNextConfig({ cacheComponents: true });
+    expect(resolved.partialPrefetching).toBe(false);
+  });
+
+  it("reads partialPrefetching alongside cacheComponents", async () => {
+    const resolved = await resolveNextConfig({ cacheComponents: true, partialPrefetching: true });
+    expect(resolved.partialPrefetching).toBe(true);
+  });
+
+  it("keeps partialPrefetching off without cacheComponents", async () => {
+    const resolved = await resolveNextConfig({ partialPrefetching: true });
+    expect(resolved.partialPrefetching).toBe(false);
+  });
+});
+
 describe("resolveNextConfig appNavFailHandling", () => {
   it("defaults experimental.appNavFailHandling to false", async () => {
     const resolved = await resolveNextConfig({});
@@ -2841,6 +2858,7 @@ describe("detectNextIntlConfig", () => {
       resolveExtensions: null,
       serverResolveExtensions: null,
       cacheComponents: false,
+      partialPrefetching: false,
       cachedNavigations: false,
       appNavFailHandling: false,
       gestureTransition: false,
