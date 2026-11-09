@@ -2859,6 +2859,24 @@ describe("App Router Production server (startProdServer)", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-app-public-basepath-"));
     const fixtureRoot = path.join(tmpDir, "fixture");
     let basePathServer: import("node:http").Server | undefined;
+    const previousPagesClientAssets = getPagesClientAssets();
+    const prodGlobalKeys = [
+      "__vite_rsc_client_require__",
+      "__vite_rsc_require__",
+      "__vite_rsc_server_require__",
+      "__webpack_chunk_load__",
+      "__webpack_require__",
+    ];
+    // startProdServer installs build/runtime globals process-wide, and this
+    // second server's bundle would keep answering the shared server's
+    // server-reference loads (a cached result decodes its Server Actions
+    // through `__vite_rsc_server_require__`). Restore them before later tests.
+    const previousGlobals = new Map(
+      prodGlobalKeys.map((key) => [
+        key,
+        { exists: Reflect.has(globalThis, key), value: Reflect.get(globalThis, key) },
+      ]),
+    );
 
     try {
       fs.cpSync(APP_FIXTURE_DIR, fixtureRoot, { recursive: true });
@@ -2933,6 +2951,14 @@ describe("App Router Production server (startProdServer)", () => {
       );
     } finally {
       basePathServer?.close();
+      setPagesClientAssets(previousPagesClientAssets);
+      for (const [key, previous] of previousGlobals) {
+        if (previous.exists) {
+          Reflect.set(globalThis, key, previous.value);
+        } else {
+          Reflect.deleteProperty(globalThis, key);
+        }
+      }
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
