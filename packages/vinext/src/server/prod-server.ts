@@ -39,6 +39,8 @@ import {
   IMAGE_CONTENT_SECURITY_POLICY,
   IMAGE_RESPONSE_CACHE_STATE,
   INVALID_IMAGE_SOURCE_MESSAGE,
+  INVALID_INTERNAL_IMAGE_RESPONSE_MESSAGE,
+  internalImageSourceErrorStatus,
   parseImageParams,
   isImageSourceBodyStatus,
   IMAGE_TYPE_NOT_ALLOWED_MESSAGE,
@@ -62,6 +64,7 @@ import {
 import { notFoundResponse } from "./http-error-responses.js";
 import {
   isServableFilesystemRoute,
+  pagesImageSourceStatus,
   runPagesRequest,
   wrapMiddlewareWithBasePath,
   type PagesPipelineDeps,
@@ -562,6 +565,22 @@ function installClientBuildManifestGlobals(
 }
 function isNoBodyResponseStatus(status: number): boolean {
   return NO_BODY_RESPONSE_STATUSES.has(status);
+}
+
+/**
+ * Answer a local image source the application served no file for, as
+ * Next.js' fetchInternalImage does: the source's error status, a success with
+ * a body being no image. A null status is a source that was never routed.
+ */
+function sendImageSourceError(
+  status: number | null,
+  send: (status: number, body: string) => void,
+): void {
+  if (status === null || isImageSourceBodyStatus(status)) {
+    send(400, INVALID_IMAGE_SOURCE_MESSAGE);
+    return;
+  }
+  send(internalImageSourceErrorStatus(status), INVALID_INTERNAL_IMAGE_RESPONSE_MESSAGE);
 }
 
 /**
@@ -2052,14 +2071,15 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     }
     // Next.js sets config and middleware headers before the image handler, so
     // only an image replaces their Content-Type and Content-Encoding.
-    const sendBadRequest = (body: string) => {
+    const sendImageError = (status: number, body: string) => {
       for (const name of IMAGE_ERROR_SIGNAL_HEADERS) {
         const value = signalHeaders[name];
         if (value !== undefined) res.setHeader(name, value);
       }
-      res.writeHead(400);
+      res.writeHead(status);
       res.end(body);
     };
+    const sendBadRequest = (body: string) => sendImageError(400, body);
     // The query middleware and rewrites selected, which the handler validated.
     const parsedUrl = new URL(`/${signal.search}`, "http://localhost");
     const params = parseImageParams(parsedUrl, appImageAllowedWidths, imageConfig?.qualities, {
@@ -2126,6 +2146,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     // Any other source goes through the application pipeline as a GET without
     // the caller's headers, like Next.js' fetchInternalImage, so middleware
     // admits it. Only a public file that pipeline selects is served.
+    let sourceStatus: number | null = null;
     if (sourcePathname !== null) {
       const sourceResponse = await rscHandler(
         new Request(sourceUrl, { signal: request.signal }),
@@ -2138,6 +2159,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         : null;
       cancelResponseBody(sourceResponse, request.signal.reason);
       if (request.signal.aborted) return;
+      sourceStatus = sourceResponse.status;
       if (sourceSignal !== null) {
         let sourcePath = sourceSignal;
         try {
@@ -2153,7 +2175,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         if (await serveSource(sourcePath, sourceResponse.headers.get("Cache-Control"))) return;
       }
     }
-    sendBadRequest(INVALID_IMAGE_SOURCE_MESSAGE);
+    sendImageSourceError(sourceStatus, sendImageError);
   };
 
   // Files the client build emits outside `_next/static`, for example a
@@ -2837,7 +2859,9 @@ async function createPagesRouterRequestHandler(
       /** The public file a source resolves to, with the Cache-Control staged for it. */
       const resolvePublicImageSource = async (
         sourceUrl: URL,
-      ): Promise<{ path: string; cacheControl: string | null } | null> => {
+      ): Promise<
+        { path: string; cacheControl: string | null } | { status: number | null } | null
+      > => {
         const rawSourcePathname = sourceUrl.pathname;
         if (
           getRepeatedSlashRedirect(rawSourcePathname) ||
@@ -2908,9 +2932,18 @@ async function createPagesRouterRequestHandler(
             },
           },
         );
-        if (result.type !== "response") return null;
-        cancelResponseBody(result.response);
-        return isImageSourceBodyStatus(result.response.status) ? source : null;
+        if (result.type === "response") {
+          cancelResponseBody(result.response);
+          if (isImageSourceBodyStatus(result.response.status) && source !== null) return source;
+        }
+        // The status a direct request receives, such as middleware's denial
+        // or a missing page's 404.
+        return {
+          status: pagesImageSourceStatus(
+            result,
+            (pathname) => matchPageRoute?.(pathname, webRequest) != null,
+          ),
+        };
       };
 
       // ── Delegate steps 3–11 to the shared Pages Router pipeline ──
@@ -3089,7 +3122,7 @@ async function createPagesRouterRequestHandler(
             const source =
               sourcePathname !== null ? await resolvePublicImageSource(sourceUrl) : null;
             if (webRequest.signal.aborted) return true;
-            if (source !== null) {
+            if (source !== null && "path" in source) {
               // Middleware can rewrite the source to a file of another type.
               if (!isSafeSourcePath(staticCacheLookupPath(source.path) ?? source.path)) {
                 sendUnsafeContentType();
@@ -3097,8 +3130,13 @@ async function createPagesRouterRequestHandler(
               }
               if (await serveSource(source.path, source.cacheControl)) return true;
             }
-            res.writeHead(400);
-            res.end(INVALID_IMAGE_SOURCE_MESSAGE);
+            sendImageSourceError(
+              source !== null && "status" in source ? source.status : null,
+              (status, body) => {
+                res.writeHead(status);
+                res.end(body);
+              },
+            );
             return true;
           }
           if (

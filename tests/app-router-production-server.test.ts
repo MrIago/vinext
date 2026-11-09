@@ -2801,7 +2801,8 @@ describe("App Router Production server (startProdServer)", () => {
     for (const [query, status] of [
       ["url=%2Fheart.png&w=65&q=75", 400],
       ["url=%2Flogo%2Flogo.svg&w=64&q=75", 400],
-      ["url=%2Fmissing.png&w=64&q=75", 400],
+      // Next.js keeps a missing source's 404 (https://github.com/vercel/next.js/pull/97957).
+      ["url=%2Fmissing.png&w=64&q=75", 404],
     ] as const) {
       const res = await fetch(`${baseUrl}/_next/image?${query}`);
       expect(res.status, query).toBe(status);
@@ -2885,8 +2886,10 @@ describe("App Router Production server (startProdServer)", () => {
       const protectedImageRes = await fetch(
         `${tmpBaseUrl}/app/_next/image?url=%2Fapp%2Fmembers%20only%2Fprivate.png&w=640&q=75`,
       );
-      expect(protectedImageRes.status).toBe(400);
-      expect(await protectedImageRes.text()).toBe("The requested resource isn't a valid image.");
+      expect(protectedImageRes.status).toBe(403);
+      expect(await protectedImageRes.text()).toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
     } finally {
       basePathServer?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });

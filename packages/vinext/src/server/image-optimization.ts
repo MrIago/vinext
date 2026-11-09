@@ -279,8 +279,58 @@ export function isImageSourceBodyStatus(status: number): boolean {
  */
 export const INVALID_IMAGE_SOURCE_MESSAGE = "The requested resource isn't a valid image.";
 
+const IMAGE_SOURCE_ERROR = Symbol.for("vinext.imageSourceError");
+
+function markImageSourceError(response: Response): Response {
+  Reflect.set(response, IMAGE_SOURCE_ERROR, true);
+  return response;
+}
+
+/** Whether a source fetch already answered with the image endpoint's error. */
+export function isImageSourceErrorResponse(response: Response): boolean {
+  return Reflect.get(response, IMAGE_SOURCE_ERROR) === true;
+}
+
 export function invalidImageSourceResponse(): Response {
-  return new Response(INVALID_IMAGE_SOURCE_MESSAGE, { status: 400 });
+  return markImageSourceError(new Response(INVALID_IMAGE_SOURCE_MESSAGE, { status: 400 }));
+}
+
+/** Body Next.js answers for a local source the application did not serve. */
+export const INVALID_INTERNAL_IMAGE_RESPONSE_MESSAGE =
+  '"url" parameter is valid but internal response is invalid';
+
+/**
+ * The status Next.js answers for a local source the application answered
+ * with `status` and no file, as `fetchInternalImage` in
+ * packages/next/src/server/image-optimizer.ts throws it: the source's own
+ * error status, 500 in place of any status below 400 (`ImageError`), and 400
+ * for a success without a body. A success with a body that is no image is
+ * rejected later, with {@link invalidImageSourceResponse}.
+ */
+export function internalImageSourceErrorStatus(status: number): number {
+  if (status >= 200 && status < 300) return 400;
+  return status >= 400 ? status : 500;
+}
+
+/**
+ * Next.js' answer for a local source the application answered with `status`
+ * instead of a file. See {@link internalImageSourceErrorStatus}.
+ */
+export function imageSourceStatusResponse(status: number): Response {
+  if (isImageSourceBodyStatus(status)) return invalidImageSourceResponse();
+  return markImageSourceError(
+    new Response(INVALID_INTERNAL_IMAGE_RESPONSE_MESSAGE, {
+      status: internalImageSourceErrorStatus(status),
+    }),
+  );
+}
+
+/** The image endpoint's answer for a source fetch without an image body. */
+function failedImageSourceResponse(source: Response): Response {
+  if (isImageSourceErrorResponse(source)) return source;
+  source.body?.cancel().catch(() => {});
+  // A success without a body is an empty response, like a 204.
+  return imageSourceStatusResponse(source.ok ? 204 : source.status);
 }
 
 const RECURSIVE_IMAGE_URL_RE = /\/_(?:next|vinext)\/image(?:$|\/)/;
@@ -721,7 +771,7 @@ export async function handleImageOptimization(
   const isBuildAsset = isImageBuildAsset(fetchedSource);
   const source = await withSniffedImageContentType(fetchedSource);
   if (!source.ok || !source.body) {
-    return invalidImageSourceResponse();
+    return failedImageSourceResponse(source);
   }
 
   // Negotiate output format from Accept header
@@ -779,7 +829,7 @@ export async function handleImageOptimization(
         if (!sourceBody) {
           reader.cancel();
           const refetched = await handlers.fetchAsset(imageUrl, request);
-          if (!refetched.ok || !refetched.body) return invalidImageSourceResponse();
+          if (!refetched.ok || !refetched.body) return failedImageSourceResponse(refetched);
           reader = new ImageSourceReader(refetched.body, limit);
           sourceBody = reader.body()!;
         }
@@ -841,7 +891,7 @@ export async function handleImageOptimization(
       await handlers.fetchAsset(imageUrl, request),
     );
     if (!refetchedSource.ok || !refetchedSource.body) {
-      return invalidImageSourceResponse();
+      return failedImageSourceResponse(refetchedSource);
     }
 
     const refetchedContentType = refetchedSource.headers.get("Content-Type");
