@@ -419,6 +419,52 @@ export function applyIneligibleRouteCachePolicy(
   return stamped;
 }
 
+/**
+ * The HTTP error a prerendered document answers with: a redirect wins over an
+ * access fallback, and otherwise the error seen first does.
+ */
+function preferPrerenderHttpError(
+  current: AppPageSpecialError | null,
+  specialError: AppPageSpecialError | null,
+): AppPageSpecialError | null {
+  if (specialError === null) return current;
+  if (current === null) return specialError;
+  return specialError.kind === "redirect" && current.kind !== "redirect" ? specialError : current;
+}
+
+function withPrerenderHttpErrorCapture(
+  onError: (error: unknown) => unknown,
+  capture: (error: unknown) => void,
+): (error: unknown) => unknown {
+  return (error) => {
+    capture(error);
+    return onError(error);
+  };
+}
+
+/**
+ * A prerendered document a Suspense boundary caught an HTTP error in answers
+ * with that error's status, and a redirect's `location`. The prerender server
+ * marks it so the build writes it like a special error that escaped the shell.
+ */
+function applyPrerenderHttpErrorStatus(
+  response: Response,
+  httpError: AppPageSpecialError | null,
+  basePath: string | undefined,
+): Response {
+  if (httpError === null || response.status !== 200) return response;
+  const storedHeaders = resolveAppPageSpecialErrorStoredHeaders(httpError, basePath);
+  const headers = new Headers(response.headers);
+  if (storedHeaders?.location !== undefined) headers.set("location", storedHeaders.location);
+  getRequestExecutionContext()?.recordPrerenderSpecialError?.({
+    headers: storedHeaders ?? {},
+    status: httpError.statusCode,
+  });
+  const prerenderResponse = new Response(response.body, { headers, status: httpError.statusCode });
+  copyLinkHeaderProvenance(response.headers, prerenderResponse.headers);
+  return prerenderResponse;
+}
+
 /** Some early responses have immutable headers, so stamp a copy. */
 function cloneForStamping(response: Response): Response {
   const stamped = preserveFullyBufferedBodyMetadata(
@@ -1203,6 +1249,23 @@ async function renderAppPageLifecycleImpl(
   let dynamicUsedDuringHtmlRender = false;
   let renderEnd: number | undefined;
   let shellSpecialError: AppPageSpecialError | null = null;
+  // Like Next.js's prerender, a notFound(), forbidden(), unauthorized() or
+  // redirect() a Suspense boundary caught still sets the prerendered
+  // document's status, and a redirect its `location`, while the document keeps
+  // the layout and the boundary's fallback for the browser to recover from. A
+  // redirect wins over an access fallback; otherwise the first one seen does.
+  // A request-time render streams a 200 before the error, so it keeps it.
+  // Ported from Next.js: packages/next/src/server/app-render/app-render.tsx
+  // (setHTTPAccessFallbackOrRedirectStatus in prerenderToStream)
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
+  let prerenderHttpError: AppPageSpecialError | null = null;
+  const capturePrerenderHttpError = (error: unknown): void => {
+    if (options.isPrerender !== true || options.pprFallbackShellSignal !== undefined) return;
+    prerenderHttpError = preferPrerenderHttpError(
+      prerenderHttpError,
+      resolveAppPageSpecialError(error),
+    );
+  };
 
   const resolveHtmlCacheWrite = (dynamicUsedDuringRender: boolean) => {
     const htmlResponsePolicy = resolveAppPageHtmlResponsePolicy({
@@ -1319,10 +1382,10 @@ async function renderAppPageLifecycleImpl(
     resolveEarlyResponseCacheControl(options) === null;
 
   // Whether a prerender writes a special error that escaped the shell, as
-  // Next.js's build does. A speculative or fallback-shell prerender doesn't.
+  // Next.js's build does, for a route with or without segment config. A
+  // fallback-shell prerender doesn't.
   const mayPrerenderShellSpecialError = (): boolean =>
     options.isPrerender === true &&
-    options.isSpeculativePrerender !== true &&
     options.pprFallbackShellSignal === undefined &&
     shouldCaptureRscForCacheMetadata &&
     capturedRscDataRef.value !== null &&
@@ -1353,6 +1416,10 @@ async function renderAppPageLifecycleImpl(
     if (response.status !== specialError.statusCode) {
       return applyIneligibleRouteCachePolicy(response, options);
     }
+    // A redirect a Suspense boundary caught before the shell rejected keeps
+    // its status and location, and an earlier access fallback its status.
+    const responseError =
+      preferPrerenderHttpError(prerenderHttpError, specialError) ?? specialError;
     // The boundary renders as its document streams, so its tagged fetches,
     // cacheLife() and dynamic API use are known once the document is read.
     const body = await response.arrayBuffer();
@@ -1373,16 +1440,21 @@ async function renderAppPageLifecycleImpl(
     }
     applyPrerenderCacheLifeHeader(headers, requestCacheLife);
     applyPrerenderCacheTagsHeader(headers, cacheTags);
+    const storedHeaders = resolveAppPageSpecialErrorStoredHeaders(responseError, options.basePath);
+    if (responseError !== specialError) {
+      headers.delete("location");
+      if (storedHeaders?.location !== undefined) headers.set("location", storedHeaders.location);
+    }
     // Recorded outside the response, which middleware can also produce, with
     // the redirect's own location. The prerender server marks the response.
     getRequestExecutionContext()?.recordPrerenderSpecialError?.({
-      headers: resolveAppPageSpecialErrorStoredHeaders(specialError, options.basePath) ?? {},
-      status: response.status,
+      headers: storedHeaders ?? {},
+      status: responseError.statusCode,
     });
     const prerenderResponse = new Response(body, {
       headers,
-      status: response.status,
-      statusText: response.statusText,
+      status: responseError.statusCode,
+      statusText: responseError === specialError ? response.statusText : undefined,
     });
     copyLinkHeaderProvenance(response.headers, prerenderResponse.headers);
     return prerenderResponse;
@@ -1542,7 +1614,10 @@ async function renderAppPageLifecycleImpl(
         isStaticGeneration: options.isPrerender === true,
         isForceStatic: options.isForceStatic,
         isCacheCandidate: isCacheCandidateHtmlRender,
-        onSsrError: createAppPageSsrErrorHandler(onSsrError, rscErrorTracker.isCapturedError),
+        onSsrError: withPrerenderHttpErrorCapture(
+          createAppPageSsrErrorHandler(onSsrError, rscErrorTracker.isCapturedError),
+          capturePrerenderHttpError,
+        ),
         // A document that streams a special error a boundary caught carries
         // Next.js's `self.__next_f` Flight transport, as the boundary's own
         // document does.
@@ -1760,7 +1835,7 @@ async function renderAppPageLifecycleImpl(
     });
 
     if (options.isPrerender === true) {
-      return isrResponse;
+      return applyPrerenderHttpErrorStatus(isrResponse, prerenderHttpError, options.basePath);
     }
 
     return finalizeHtmlCacheWrite(isrResponse, {

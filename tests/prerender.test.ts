@@ -1423,6 +1423,74 @@ describe("prerenderApp — default mode (app-basic)", () => {
     expect(fs.existsSync(path.join(outDir, "error-server-test.html"))).toBe(false);
   });
 
+  // Ported from Next.js: test/e2e/prerendered-http-status-codes/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerendered-http-status-codes/index.test.ts
+  describe("HTTP errors a prerender throws", () => {
+    const base = "/nextjs-compat/prerendered-http-status-codes";
+    const readHtml = (route: string) =>
+      fs.readFileSync(path.join(outDir, `${route.slice(1)}.html`), "utf8");
+
+    it.each([
+      { route: "unauthorized", status: 401, location: undefined },
+      { route: "forbidden", status: 403, location: undefined },
+      { route: "not-found", status: 404, location: undefined },
+      { route: "redirect", status: 307, location: "/" },
+      { route: "permanent-redirect", status: 308, location: "/" },
+    ])("writes $status for $route inside Suspense, keeping the layout and fallback", (c) => {
+      const route = `${base}/with-suspense/${c.route}`;
+      const result = findRoute(results, route);
+      expect(result).toMatchObject({ status: "rendered", responseStatus: c.status });
+      if (result?.status !== "rendered") throw new Error("expected the page to render");
+      expect(result.headers?.location).toBe(c.location);
+      const html = readHtml(route);
+      expect(html).toContain('<h1 id="layout">Shared layout</h1>');
+      expect(html).toContain('<p id="suspense-fallback">Loading...</p>');
+    });
+
+    it.each([
+      { route: "unauthorized", status: 401, location: undefined },
+      { route: "forbidden", status: 403, location: undefined },
+      { route: "not-found", status: 404, location: undefined },
+      { route: "redirect", status: 307, location: "/" },
+      { route: "permanent-redirect", status: 308, location: "/" },
+    ])("writes $status for $route outside Suspense", (c) => {
+      const result = findRoute(results, `${base}/without-suspense/${c.route}`);
+      expect(result).toMatchObject({ status: "rendered", responseStatus: c.status });
+      if (result?.status !== "rendered") throw new Error("expected the page to render");
+      expect(result.headers?.location).toBe(c.location);
+    });
+
+    // A request-time render streams its 200 before the error.
+    it("leaves a notFound() after connection() to the request", () => {
+      expect(findRoute(results, `${base}/with-suspense/dynamic-not-found`)).toMatchObject({
+        status: "skipped",
+        reason: "dynamic",
+      });
+    });
+
+    describe.each(["suspense", "root"])("with the second error caught at %s", (boundary) => {
+      it.each([
+        ["not-found", "forbidden", 404, undefined],
+        ["forbidden", "not-found", 403, undefined],
+        ["unauthorized", "redirect", 307, "/second"],
+        ["redirect", "not-found", 307, "/first"],
+        ["redirect", "permanent-redirect", 307, "/first"],
+      ] as const)("%s then %s answers %i", (first, second, status, location) => {
+        const route = `${base}/precedence/${first}/${second}/${boundary}`;
+        const result = findRoute(results, route);
+        expect(result).toMatchObject({ status: "rendered", responseStatus: status });
+        if (result?.status !== "rendered") throw new Error("expected the page to render");
+        expect(result.headers?.location).toBe(location);
+        if (boundary === "suspense") {
+          const html = readHtml(route);
+          expect(html).toContain('<h1 id="precedence-layout">HTTP error precedence</h1>');
+          expect(html).toContain('<p id="first-fallback">First fallback</p>');
+          expect(html).toContain('<p id="second-fallback">Second fallback</p>');
+        }
+      });
+    });
+  });
+
   // ── Static routes with explicit config ────────────────────────────────────
 
   it("renders force-static page", () => {
@@ -1768,22 +1836,22 @@ describe("prerenderApp — default mode (app-basic)", () => {
   // Ported from Next.js: test/e2e/app-dir/rsc-redirect/rsc-redirect.test.ts
   // ('should get 307 status code for document request')
   //
-  // A speculative prerender of a route that calls `redirect()` must not
-  // follow the redirect server-side and cache the destination's HTML under
-  // the redirecting URL. Doing so makes the prod server reply with 200 and
-  // the destination's body on every document request to the redirecting
-  // route, instead of emitting an HTTP 307 with a Location header.
+  // A prerender of a route that calls `redirect()` must not follow the
+  // redirect server-side and cache the destination's HTML under the
+  // redirecting URL, which would make the prod server reply with 200 and the
+  // destination's body (#1530). As in Next.js's build, which prerenders a
+  // route without segment config too, it writes the redirect itself: a 307
+  // with its location.
   //
   // See: https://github.com/cloudflare/vinext/issues/1530
-  it("skips /redirect-test instead of capturing the destination HTML", () => {
+  it("writes /redirect-test as its redirect instead of the destination HTML", () => {
     const r = findRoute(results, "/redirect-test");
-    expect(r).toBeDefined();
-    expect(r?.status).toBe("skipped");
-    // No HTML/RSC must be written for the redirecting route — otherwise the
-    // prod server serves the cached destination body with status 200 for
-    // every document request to /redirect-test.
-    expect(fs.existsSync(path.join(outDir, "redirect-test.html"))).toBe(false);
-    expect(fs.existsSync(path.join(outDir, "redirect-test.rsc"))).toBe(false);
+    expect(r).toMatchObject({ status: "rendered", responseStatus: 307 });
+    if (r?.status !== "rendered") throw new Error("expected /redirect-test to render");
+    expect(r.headers?.location).toBe("/about");
+    expect(fs.readFileSync(path.join(outDir, "redirect-test.html"), "utf8")).not.toContain(
+      "This is the about page.",
+    );
   });
 
   // As in Next.js's build, a page's special error that escapes the shell is
@@ -1813,11 +1881,18 @@ describe("prerenderApp — default mode (app-basic)", () => {
     },
   );
 
-  // A Suspense boundary caught the special error, so the shell rendered.
-  it("writes a special error caught under loading.tsx as a 200", () => {
+  // A Suspense boundary caught the special error, so the shell rendered. As
+  // in Next.js's prerender, the document still answers with its status.
+  // Ported from Next.js: test/e2e/prerendered-http-status-codes/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerendered-http-status-codes/index.test.ts
+  it("writes a special error caught under loading.tsx with its status", () => {
     const r = findRoute(results, "/nextjs-compat/isr-special-error/loading-not-found");
-    expect(r).toMatchObject({ status: "rendered", revalidate: 60 });
-    expect(r).not.toHaveProperty("responseStatus");
+    expect(r).toMatchObject({ status: "rendered", revalidate: 60, responseStatus: 404 });
+    const html = fs.readFileSync(
+      path.join(outDir, "nextjs-compat/isr-special-error/loading-not-found.html"),
+      "utf8",
+    );
+    expect(html).toContain("<p>loading</p>");
   });
 
   // ── API routes — always skipped ────────────────────────────────────────────
