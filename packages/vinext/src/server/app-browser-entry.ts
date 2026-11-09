@@ -500,6 +500,18 @@ const DEFAULT_GLOBAL_ERROR_COMPONENT = DefaultGlobalError as React.ComponentType
   reset: () => void;
 }>;
 let latestRscHmrUpdateId = 0;
+// A server-component update can arrive while the initial RSC payload is still
+// resolving, before bootstrap installs the real handler below. Like Next.js
+// (vercel/next.js#100113), keep that it happened and apply the newest one once
+// the router is mounted: several early updates coalesce into one refresh.
+let rscHmrUpdateReceivedBeforeBootstrap = false;
+let rscHmrBootstrapHandler: (() => void) | null = null;
+if (import.meta.env.DEV && import.meta.hot) {
+  import.meta.hot.on("rsc:update", () => {
+    if (rscHmrBootstrapHandler) rscHmrBootstrapHandler();
+    else rscHmrUpdateReceivedBeforeBootstrap = true;
+  });
+}
 // Single-slot latch tracking the navId of the most recent synchronous
 // popstate snapshot restore. activeNavigationId is strictly monotonic, so
 // shouldSkipScrollRestore can only match the most-recently restored
@@ -3435,10 +3447,14 @@ function bootstrapHydration(
       }
     };
 
-    import.meta.hot.on("rsc:update", () => {
+    rscHmrBootstrapHandler = () => {
       const updateId = ++latestRscHmrUpdateId;
       void handleRscUpdate(updateId);
-    });
+    };
+    if (rscHmrUpdateReceivedBeforeBootstrap) {
+      rscHmrUpdateReceivedBeforeBootstrap = false;
+      rscHmrBootstrapHandler();
+    }
   }
 }
 
