@@ -7095,6 +7095,34 @@ describe("next/cache shim", () => {
     expect(r1).toBe(r2);
   });
 
+  // Ported from Next.js test/e2e/app-dir/use-cache-after-uncached-io:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache-after-uncached-io/use-cache-after-uncached-io.test.ts
+  // A cache read reached only after uncached IO outlived the prerender is not part of it:
+  // it must reject without running the function or filling the entry.
+  it("does not fill a use cache entry after the prerender has ended", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+    const handler = new MemoryCacheHandler();
+    const set = vi.spyOn(handler, "set");
+    setCacheHandler(handler);
+    let callCount = 0;
+    const cached = registerCachedFunction(async () => ++callCount, "test:after-prerender-abort");
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      workUnitAsyncStorage.run({ type: "prerender", renderSignal: controller.signal }, () =>
+        cached(),
+      ),
+    ).rejects.toThrow('"use cache" called after prerender ended');
+    expect(callCount).toBe(0);
+    expect(set).not.toHaveBeenCalled();
+  });
+
   // Ported from Next.js: packages/next/src/server/request/io.ts
   // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/io.ts
   it("io returns a hanging promise during prerender", async () => {
@@ -8029,6 +8057,61 @@ describe('"use cache" runtime', () => {
       expect(waitUntil).toHaveLength(1);
       expect(callCount).toBe(2);
       await expect(request()).resolves.toEqual({ tags: [], value: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ported from Next.js test/e2e/app-dir/use-cache-swr/use-cache-swr.test.ts:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache-swr/use-cache-swr.test.ts
+  // Requests that read a stale entry while its background regeneration (and its write)
+  // is in flight get the stale value without starting another regeneration.
+  it("deduplicates background regenerations of a stale cached value", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { cacheLife, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    let releaseWrite: (() => void) | undefined;
+    class SlowWriteHandler extends MemoryCacheHandler {
+      override async set(...args: Parameters<InstanceType<typeof MemoryCacheHandler>["set"]>) {
+        if (callCount > 1) await new Promise<void>((resolve) => (releaseWrite = resolve));
+        return super.set(...args);
+      }
+    }
+    setCacheHandler(new SlowWriteHandler());
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let callCount = 0;
+    try {
+      const cached = registerCachedFunction(async () => {
+        cacheLife({ revalidate: 1, expire: 60 });
+        return ++callCount;
+      }, "test:stale-background-dedupe");
+      const waitUntil: Promise<unknown>[] = [];
+      const request = () =>
+        runWithRequestContext(
+          createRequestContext({
+            unstableCacheRevalidation: "background",
+            executionContext: { waitUntil: (promise) => waitUntil.push(promise) },
+          }),
+          () => cached(),
+        );
+
+      await expect(request()).resolves.toBe(1);
+      await Promise.all(waitUntil);
+      waitUntil.length = 0;
+      vi.advanceTimersByTime(1_500);
+      await expect(request()).resolves.toBe(1);
+      // The regeneration ran, and its write is still pending.
+      await vi.waitFor(() => expect(releaseWrite).toBeDefined());
+      await expect(request()).resolves.toBe(1);
+      await expect(request()).resolves.toBe(1);
+      expect(callCount).toBe(2);
+      releaseWrite!();
+      await Promise.all(waitUntil);
+      await expect(request()).resolves.toBe(2);
+      expect(callCount).toBe(2);
     } finally {
       vi.useRealTimers();
     }

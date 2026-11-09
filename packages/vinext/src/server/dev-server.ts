@@ -8,6 +8,7 @@ import { importModule, reportRequestError } from "./instrumentation.js";
 import type { NextI18nConfig } from "../config/next-config.js";
 import { NEXTJS_CACHE_HEADER, NEXTJS_DEPLOYMENT_ID_HEADER } from "./headers.js";
 import { buildMissIsrCacheControl, ISR_NEVER_CACHE_CONTROL } from "./isr-decision.js";
+import { DEV_DOCUMENT_CACHE_CONTROL } from "./cache-control.js";
 import {
   PRERENDER_REVALIDATE_HEADER,
   PRERENDER_REVALIDATE_ONLY_GENERATED_HEADER,
@@ -162,7 +163,11 @@ function applyDevPagesPreviewResponse(res: ServerResponse, preview: PagesPreview
   for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
 }
 
-const DEV_PAGES_CACHE_CONTROL = "no-cache, must-revalidate";
+// Documents and data responses must not be stored in development: a browser
+// reuses a stored response for a history navigation without revalidating it,
+// so going back would restore a page from before the latest edit. Mirrors
+// pages-handler.ts from vercel/next.js#97505.
+const DEV_PAGES_CACHE_CONTROL = DEV_DOCUMENT_CACHE_CONTROL;
 const PAGES_CACHE_ONE_YEAR_SECONDS = 31_536_000;
 
 function applyDevPagesCacheHeaders(

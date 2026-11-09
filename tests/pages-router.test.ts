@@ -996,14 +996,14 @@ describe("Pages Router integration", () => {
     const first = await fetch(`${baseUrl}/isr-test`);
     expect(first.status).toBe(200);
     expect(first.headers.get("x-vinext-cache")).toBeNull();
-    expect(first.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(first.headers.get("cache-control")).toBe("no-store");
     const firstHtml = await first.text();
     expect(firstHtml).not.toContain("nonce=");
 
     const repeated = await fetch(`${baseUrl}/isr-test`);
     expect(repeated.status).toBe(200);
     expect(repeated.headers.get("x-vinext-cache")).toBeNull();
-    expect(repeated.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(repeated.headers.get("cache-control")).toBe("no-store");
     await repeated.text();
 
     const second = await fetch(`${baseUrl}/isr-test?mw-csp-nonce=pages-isr`);
@@ -1011,7 +1011,7 @@ describe("Pages Router integration", () => {
     expect(second.headers.get("content-security-policy")).toBe(
       "script-src 'nonce-pages-isr' 'strict-dynamic';",
     );
-    expect(second.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(second.headers.get("cache-control")).toBe("no-store");
     expect(second.headers.get("x-vinext-cache")).toBeNull();
     const secondHtml = await second.text();
     expect(secondHtml).toContain(
@@ -1096,13 +1096,25 @@ describe("Pages Router integration", () => {
     expect(setCookie).toContain("gssp_token=abc123");
   });
 
+  // Ported from Next.js: test/development/dev-cache-control/dev-cache-control.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/development/dev-cache-control/dev-cache-control.test.ts
+  // A stored dev document would be restored by a back navigation without
+  // revalidation, showing output from before the latest edit.
+  it("sends no-store for Pages Router documents and data in development", async () => {
+    const page = await fetch(`${baseUrl}/ssr`);
+    expect(page.headers.get("cache-control")).toBe("no-store");
+    const data = await fetch(`${baseUrl}/_next/data/test-build-id/ssr.json`);
+    expect(data.status).toBe(200);
+    expect(data.headers.get("cache-control")).toBe("no-store");
+  });
+
   // Regression for #1461: gSSP responses must carry the default Cache-Control
   // header that Next.js applies for getServerSideProps pages so CDNs and
   // browsers do not cache the per-request payload.
   it("sets the default Cache-Control header on getServerSideProps responses", async () => {
     const res = await fetch(`${baseUrl}/ssr`);
     expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 
   // Next.js development always overrides authored cache lifetimes.
@@ -1110,7 +1122,7 @@ describe("Pages Router integration", () => {
   it("uses the development Cache-Control even when getServerSideProps sets one", async () => {
     const res = await fetch(`${baseUrl}/ssr-cache-control`);
     expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 
   it("getServerSideProps calling res.end() short-circuits the response", async () => {
@@ -1237,7 +1249,7 @@ describe("Pages Router integration", () => {
     // The document 404 is a rendered page, which Next.js dev never caches.
     const notFoundDocument = await fetch(`${baseUrl}/gssp-not-found?hiding=true`);
     expect(notFoundDocument.status).toBe(404);
-    expect(notFoundDocument.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(notFoundDocument.headers.get("cache-control")).toBe("no-store");
   });
 
   it("keeps a getServerSideProps Cache-Control on redirects", async () => {
@@ -1321,7 +1333,7 @@ describe("Pages Router integration", () => {
       ]) {
         const notFoundDocument = await fetch(`${baseUrl}/gssp-not-found?${search}`);
         expect(notFoundDocument.status).toBe(404);
-        expect(notFoundDocument.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+        expect(notFoundDocument.headers.get("cache-control")).toBe("no-store");
       }
     },
   );
@@ -1537,7 +1549,7 @@ export async function getStaticPaths() {
       expect(first.status).toBe(404);
       expect(first.headers.get("x-nextjs-cache")).toBe("HIT");
       expect(first.headers.get("x-vinext-cache")).toBeNull();
-      expect(first.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(first.headers.get("cache-control")).toBe("no-store");
       const firstHtml = await first.text();
       expect(firstHtml).toContain('<p id="not-found">404 page 1</p>');
       expect(firstHtml).toContain('"paramsAreUndefined":true');
@@ -1556,7 +1568,7 @@ export async function getStaticPaths() {
       expect(second.status).toBe(404);
       expect(second.headers.get("x-nextjs-cache")).toBe("HIT");
       expect(second.headers.get("x-vinext-cache")).toBeNull();
-      expect(second.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(second.headers.get("cache-control")).toBe("no-store");
       const secondHtml = await second.text();
       expect(secondHtml).toContain('<p id="not-found">404 page 2</p>');
       expect(secondHtml).toContain('"paramsAreUndefined":true');
@@ -3450,7 +3462,7 @@ export const config = { matcher: "${matcher}" };
     expect(res.status).toBe(200);
     expect(res.headers.get("x-nextjs-cache")).toBe("MISS");
     expect(res.headers.get("x-vinext-cache")).toBeNull();
-    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
     const html = await res.text();
     expect(html).toContain("Loading product...");
     // The full-content branch must NOT render — getStaticProps was skipped.
@@ -3490,7 +3502,7 @@ export const config = { matcher: "${matcher}" };
     const finalRes = await fetch(`${baseUrl}/products/${slug}`);
     expect(finalRes.headers.get("x-nextjs-cache")).toBe("MISS");
     expect(finalRes.headers.get("x-vinext-cache")).toBeNull();
-    expect(finalRes.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(finalRes.headers.get("cache-control")).toBe("no-store");
     const finalHtml = await finalRes.text();
     expect(finalHtml).toContain("Loading product...");
   });
@@ -4831,7 +4843,7 @@ describe("Virtual server entry generation", () => {
       const firstHtml = await firstRes.text();
       expect(firstRes.status).toBe(200);
       expect(firstRes.headers.get("x-vinext-cache")).toBeNull();
-      expect(firstRes.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(firstRes.headers.get("cache-control")).toBe("no-store");
       expect(firstHtml).toContain("Global CSS ISR Test");
       for (const href of fixture.isrDevStylesheetHrefs) {
         expect(getStylesheetHrefs(firstHtml)).toContain(href);
@@ -4841,7 +4853,7 @@ describe("Virtual server entry generation", () => {
       const secondHtml = await secondRes.text();
       expect(secondRes.status).toBe(200);
       expect(secondRes.headers.get("x-vinext-cache")).toBeNull();
-      expect(secondRes.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(secondRes.headers.get("cache-control")).toBe("no-store");
       expect(secondHtml).toContain("Global CSS ISR Test");
       for (const href of fixture.isrDevStylesheetHrefs) {
         expect(getStylesheetHrefs(secondHtml)).toContain(href);
@@ -11438,7 +11450,7 @@ describe("custom App optional pageProps envelope parity", () => {
       expect(missResponse.status).toBe(200);
       expect(missResponse.headers.get("x-nextjs-cache")).toBe(mode === "dev" ? "HIT" : "MISS");
       if (mode === "dev") {
-        expect(missResponse.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+        expect(missResponse.headers.get("cache-control")).toBe("no-store");
       }
       const missHtml = await missResponse.text();
       expect(missHtml).toContain(
@@ -11533,7 +11545,7 @@ describe("custom App optional pageProps envelope parity", () => {
   it("keeps the development Cache-Control on a getServerSideProps notFound in dev", async () => {
     const response = await fetch(`${devUrl}/gssp-not-found`);
     expect(response.status).toBe(404);
-    expect(response.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(response.headers.get("cache-control")).toBe("no-store");
     await response.body?.cancel();
 
     // The getServerSideProps default is set before the 404 render, so a
