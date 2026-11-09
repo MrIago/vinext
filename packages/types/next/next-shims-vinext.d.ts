@@ -35,6 +35,19 @@ declare module "next/navigation" {
   };
 }
 
+// Cache Components parameter matching, newer than the vendored Next.js
+// declarations: https://github.com/vercel/next.js/blob/canary/packages/next/src/types.ts
+declare module "next" {
+  /**
+   * Optional contextual typing for parameter matching exports. Use
+   * `satisfies ParamMatching` to check modes without widening the object's keys,
+   * or provide parameter names for an explicit type annotation.
+   */
+  export type ParamMatching<ParamName extends string = string> = Partial<
+    Record<ParamName, "not-found" | "blocking" | "fallback" | "dynamic">
+  >;
+}
+
 // Cache Components render stage boundaries, newer than the vendored Next.js
 // declarations: https://github.com/vercel/next.js/blob/canary/packages/next/cache.d.ts
 declare module "next/cache" {

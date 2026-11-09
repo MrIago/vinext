@@ -52,12 +52,14 @@ export async function generateRouteTypes(
   const outPath = path.join(root, ".next", "types", "routes.d.ts");
   const pagesDir = findDir(root, "pages", "src/pages");
 
+  const declareParamMatching = await nextLacksParamMatchingType(root);
   const content = appDir
     ? renderRouteTypes(
         await collectRouteTypeModel(appDir, options.pageExtensions),
         pagesDir !== null,
+        declareParamMatching,
       )
-    : renderRouteTypes(emptyRouteTypeModel(), false);
+    : renderRouteTypes(emptyRouteTypeModel(), false, declareParamMatching);
 
   await fs.mkdir(path.dirname(outPath), { recursive: true });
   await fs.writeFile(outPath, content, "utf-8");
@@ -127,6 +129,43 @@ async function hasNextPackage(root: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Whether the installed `next` package predates the `ParamMatching` type
+ * (vercel/next.js#97393), so the generated types add it to the `next` module.
+ * Without `next` installed there is no module to add it to.
+ */
+async function nextLacksParamMatchingType(root: string): Promise<boolean> {
+  let typesPath: string;
+  try {
+    const packageJsonPath = createRequire(path.join(root, "package.json")).resolve(
+      "next/package.json",
+    );
+    typesPath = path.join(path.dirname(packageJsonPath), "dist", "types.d.ts");
+  } catch {
+    return false;
+  }
+  try {
+    return !(await fs.readFile(typesPath, "utf-8")).includes("ParamMatching");
+  } catch {
+    return false;
+  }
+}
+
+// The modes `unstable_paramMatching` accepts, as Next.js's `ParamMatching`:
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/types.ts
+const PARAM_MATCHING_TYPE_DECLARATION = `
+declare module "next" {
+  /**
+   * Optional contextual typing for parameter matching exports. Use
+   * \`satisfies ParamMatching\` to check modes without widening the object's keys,
+   * or provide parameter names for an explicit type annotation.
+   */
+  export type ParamMatching<ParamName extends string = string> = Partial<
+    Record<ParamName, "not-found" | "blocking" | "fallback" | "dynamic">
+  >;
+}
+`;
 
 type RouteTypeModel = {
   pageRoutes: string[];
@@ -220,7 +259,11 @@ async function collectRouteTypeModel(
   return model;
 }
 
-function renderRouteTypes(model: RouteTypeModel, hasPagesCompat: boolean): string {
+function renderRouteTypes(
+  model: RouteTypeModel,
+  hasPagesCompat: boolean,
+  declareParamMatching = false,
+): string {
   const allRoutes = uniqueSorted([
     ...model.pageRoutes,
     ...model.layoutRoutes,
@@ -277,7 +320,7 @@ ${renderLayoutSlotMap(model.layoutRoutes, model.layoutSlots)}
   }
 }
 
-${navigationCompat}
+${navigationCompat}${declareParamMatching ? PARAM_MATCHING_TYPE_DECLARATION : ""}
 
 export {};
 `;
