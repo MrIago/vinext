@@ -27,6 +27,7 @@ declare module "virtual:vinext-rsc-entry" {
   export const __imageConfig: {
     qualities?: number[];
     formats?: string[];
+    maximumDiskCacheSize?: number;
     localPatterns?: Array<{ pathname?: string; search?: string }>;
     dangerouslyAllowSVG?: boolean;
     dangerouslyAllowLocalIP?: boolean;
@@ -65,6 +66,7 @@ declare module "virtual:vinext-app-request-entry" {
   export const __imageConfig: {
     qualities?: number[];
     formats?: string[];
+    maximumDiskCacheSize?: number;
     localPatterns?: Array<{ pathname?: string; search?: string }>;
     dangerouslyAllowSVG?: boolean;
     dangerouslyAllowLocalIP?: boolean;

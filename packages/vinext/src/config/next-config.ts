@@ -395,6 +395,11 @@ export type NextConfig = {
      * order. Defaults to `["image/webp"]`, as in Next.js.
      */
     formats?: Array<"image/avif" | "image/webp">;
+    /**
+     * Bytes of optimized images the Node.js server keeps in
+     * `<outDir>/cache/images`. `0` disables the cache, as in Next.js.
+     */
+    maximumDiskCacheSize?: number;
     /** Least max-age, in seconds, of an image the endpoint serves as-is. Defaults to 14400. */
     minimumCacheTTL?: number;
     /**

@@ -34,7 +34,11 @@ import {
   staticFileCacheControl,
 } from "./static-file-cache.js";
 import { signalFromNodeResponse } from "./node-response-signal.js";
-import { optimizeNodeImage, resolveNodeImageOptimizer } from "./node-image-optimization.js";
+import {
+  NodeImageCache,
+  optimizeNodeImage,
+  resolveNodeImageOptimizer,
+} from "./node-image-optimization.js";
 import {
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,
@@ -863,24 +867,27 @@ async function serveNodeOptimizedImage(
   allowedWidths: number[],
   imageConfig: ImageConfig | undefined,
   optimizerRoots: readonly string[],
+  imageCache: NodeImageCache,
 ): Promise<boolean> {
   const lookupPath = staticCacheLookupPath(sourcePath);
   const file = lookupPath === null ? undefined : cache.lookup(lookupPath)?.original;
   if (!file) return false;
   const optimizer = await resolveNodeImageOptimizer(optimizerRoots);
   if (!optimizer) return false;
-  const response = await optimizeNodeImage(
-    imageRequest,
-    {
-      buffer: file.buffer,
-      path: file.path,
-      contentType,
-      isBuildAsset: publicFileCacheControl === undefined,
-      cacheControl: publicFileCacheControl ?? staticFileCacheControl(false),
-    },
-    optimizer,
-    allowedWidths,
-    imageConfig,
+  const response = await imageCache.handle(imageRequest, imageConfig, () =>
+    optimizeNodeImage(
+      imageRequest,
+      {
+        buffer: file.buffer,
+        path: file.path,
+        contentType,
+        isBuildAsset: publicFileCacheControl === undefined,
+        cacheControl: publicFileCacheControl ?? staticFileCacheControl(false),
+      },
+      optimizer,
+      allowedWidths,
+      imageConfig,
+    ),
   );
   if (imageRequest.signal.aborted) {
     cancelResponseBody(response, imageRequest.signal.reason);
@@ -2133,6 +2140,11 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   const staticCache = await StaticFileCache.create(clientDir);
   // Like `next`, which lists `sharp` as an optional dependency, the app owns it.
   const imageOptimizerRoots = [serverDir, process.cwd()];
+  // Like Next.js' `.next/cache/images`, beside the build output.
+  const imageCache = new NodeImageCache(
+    path.join(path.dirname(clientDir), "cache", "images"),
+    imageConfig?.maximumDiskCacheSize,
+  );
 
   // Image optimization passthrough (Node.js prod server has no Images binding;
   // serves the original file with cache headers and security headers). Runs
@@ -2225,6 +2237,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
           appImageAllowedWidths,
           imageConfig,
           imageOptimizerRoots,
+          imageCache,
         )
       ) {
         return true;
@@ -2699,6 +2712,7 @@ async function createPagesRouterRequestHandler(
         dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,
         qualities: vinextConfig.images.qualities,
         formats: vinextConfig.images.formats,
+        maximumDiskCacheSize: vinextConfig.images.maximumDiskCacheSize,
         localPatterns: vinextConfig.images.localPatterns,
         contentDispositionType: vinextConfig.images.contentDispositionType,
         contentSecurityPolicy: vinextConfig.images.contentSecurityPolicy,
@@ -2722,6 +2736,11 @@ async function createPagesRouterRequestHandler(
   const staticCache = await StaticFileCache.create(clientDir);
   // Like `next`, which lists `sharp` as an optional dependency, the app owns it.
   const imageOptimizerRoots = [serverDir, process.cwd()];
+  // Like Next.js' `.next/cache/images`, beside the build output.
+  const imageCache = new NodeImageCache(
+    path.join(path.dirname(clientDir), "cache", "images"),
+    pagesImageConfig?.maximumDiskCacheSize,
+  );
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     stripNodeRequestUrlFragment(req);
@@ -3227,6 +3246,7 @@ async function createPagesRouterRequestHandler(
                   allowedImageWidths,
                   pagesImageConfig,
                   imageOptimizerRoots,
+                  imageCache,
                 )
               ) {
                 return true;

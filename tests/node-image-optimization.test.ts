@@ -6,6 +6,7 @@ import type { Server } from "node:http";
 import { build, createBuilder } from "vite-plus";
 import vinext from "../packages/vinext/src/index.js";
 import { loadSharp, type Sharp } from "../packages/vinext/src/server/image-sharp.js";
+import { requestNodeServerWithHost } from "./helpers.js";
 
 // sharp is no dependency of vinext; the workspace has it through other
 // packages, in pnpm's hoisted virtual store.
@@ -205,6 +206,29 @@ describe("Node production server optimizes images with the app's sharp", () => {
       });
     });
 
+    it(`${router} router: caches the variant on disk and revalidates it by ETag`, async () => {
+      const url = `${urls[router]}/_next/image?url=%2Fphoto.png&w=256&q=75`;
+      const headers = { Accept: "image/webp" };
+      const first = await fetch(url, { headers });
+      expect(first.headers.get("x-nextjs-cache")).toBe("MISS");
+      const body = await first.arrayBuffer();
+      const repeat = await fetch(url, { headers });
+      expect(repeat.headers.get("x-nextjs-cache")).toBe("HIT");
+      expect(repeat.headers.get("Content-Type")).toBe("image/webp");
+      expect(repeat.headers.get("ETag")).toBe(first.headers.get("ETag"));
+      expect(new Uint8Array(await repeat.arrayBuffer())).toEqual(new Uint8Array(body));
+      const port = Number(new URL(url).port);
+      const notModified = await requestNodeServerWithHost(
+        port,
+        new URL(url).pathname + new URL(url).search,
+        `127.0.0.1:${port}`,
+        { ...headers, "If-None-Match": first.headers.get("ETag")! },
+      );
+      expect(notModified.status).toBe(304);
+      const cacheDir = path.join(router === "app" ? dirs[1] : dirs[0], "dist", "cache", "images");
+      expect((await fs.readdir(cacheDir)).length).toBeGreaterThan(0);
+    });
+
     it(`${router} router: keeps a PNG for a client that accepts no WebP`, async () => {
       const res = await fetch(`${urls[router]}/_next/image?url=%2Fphoto.png&w=128&q=75`, {
         headers: { Accept: "image/png,*/*" },
@@ -214,4 +238,148 @@ describe("Node production server optimizes images with the app's sharp", () => {
       expect(await metadata(await res.arrayBuffer())).toMatchObject({ format: "png", width: 128 });
     });
   }
+});
+
+// Ported from Next.js: test/e2e/image-optimizer/util.ts (x-nextjs-cache MISS
+// then HIT, ETag and 304), test/e2e/image-optimizer/max-disk-size-cache-zero.test.ts
+// and test/unit/image-optimizer/lru-disk-eviction.test.ts.
+// https://github.com/vercel/next.js/blob/canary/test/e2e/image-optimizer/util.ts
+// https://github.com/vercel/next.js/blob/canary/test/unit/image-optimizer/lru-disk-eviction.test.ts
+describe("Node image disk cache", () => {
+  const dirs: string[] = [];
+  afterAll(async () => {
+    for (const dir of dirs) await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  async function cacheDir(): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-image-cache-"));
+    dirs.push(dir);
+    return path.join(dir, "cache", "images");
+  }
+
+  const request = (search: string, headers: Record<string, string> = {}) =>
+    new Request(`http://localhost/_next/image?${search}`, {
+      headers: { Accept: "image/webp", ...headers },
+    });
+
+  function optimizer(maxAge = 60) {
+    let calls = 0;
+    return {
+      get calls() {
+        return calls;
+      },
+      optimize: async () => {
+        calls++;
+        return new Response(`image ${calls}`, {
+          headers: {
+            "Content-Type": "image/webp",
+            "Cache-Control": `public, max-age=${maxAge}, must-revalidate`,
+            "Content-Security-Policy": "script-src 'none'; frame-src 'none'; sandbox;",
+            Vary: "Accept",
+            "X-Nextjs-Cache": "MISS",
+          },
+        });
+      },
+    };
+  }
+
+  it("serves a cached variant as a HIT with its ETag, and 304 on a match", async () => {
+    const { NodeImageCache } =
+      await import("../packages/vinext/src/server/node-image-optimization.js");
+    const cache = new NodeImageCache(await cacheDir());
+    const source = optimizer();
+
+    const miss = await cache.handle(request("url=%2Fa.png&w=64&q=75"), undefined, source.optimize);
+    expect(miss.headers.get("x-nextjs-cache")).toBe("MISS");
+    const etag = miss.headers.get("ETag");
+    expect(etag).toMatch(/^[\w-]{43}$/);
+    expect(await miss.text()).toBe("image 1");
+
+    const hit = await cache.handle(request("url=%2Fa.png&w=64&q=75"), undefined, source.optimize);
+    expect(hit.headers.get("x-nextjs-cache")).toBe("HIT");
+    expect(hit.headers.get("x-vinext-cache")).toBe("HIT");
+    expect(hit.headers.get("ETag")).toBe(etag);
+    expect(hit.headers.get("Cache-Control")).toBe("public, max-age=60, must-revalidate");
+    expect(hit.headers.get("Content-Security-Policy")).toBe(
+      "script-src 'none'; frame-src 'none'; sandbox;",
+    );
+    expect(await hit.text()).toBe("image 1");
+    expect(source.calls).toBe(1);
+
+    const notModified = await cache.handle(
+      request("url=%2Fa.png&w=64&q=75", { "If-None-Match": etag! }),
+      undefined,
+      source.optimize,
+    );
+    expect(notModified.status).toBe(304);
+    expect(notModified.headers.get("x-nextjs-cache")).toBeNull();
+
+    // Another width, or a client that accepts another format, is another variant.
+    await cache.handle(request("url=%2Fa.png&w=128&q=75"), undefined, source.optimize);
+    await cache.handle(
+      request("url=%2Fa.png&w=64&q=75", { Accept: "image/png" }),
+      undefined,
+      source.optimize,
+    );
+    expect(source.calls).toBe(3);
+  });
+
+  it("serves an expired variant STALE and optimizes it again once in the background", async () => {
+    const { NodeImageCache } =
+      await import("../packages/vinext/src/server/node-image-optimization.js");
+    const cache = new NodeImageCache(await cacheDir());
+    const source = optimizer(0);
+    const config = { minimumCacheTTL: 0 };
+
+    await cache.handle(request("url=%2Fb.png&w=64&q=75"), config, source.optimize);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const [first, second] = await Promise.all([
+      cache.handle(request("url=%2Fb.png&w=64&q=75"), config, source.optimize),
+      cache.handle(request("url=%2Fb.png&w=64&q=75"), config, source.optimize),
+    ]);
+    expect(first.headers.get("x-nextjs-cache")).toBe("STALE");
+    expect(second.headers.get("x-nextjs-cache")).toBe("STALE");
+    expect(await first.text()).toBe("image 1");
+    await expect.poll(() => source.calls).toBe(2);
+    await expect
+      .poll(async () =>
+        (await cache.handle(request("url=%2Fb.png&w=64&q=75"), config, source.optimize)).text(),
+      )
+      .toBe("image 2");
+  });
+
+  it("keeps nothing under images.maximumDiskCacheSize: 0", async () => {
+    const { NodeImageCache } =
+      await import("../packages/vinext/src/server/node-image-optimization.js");
+    const dir = await cacheDir();
+    const cache = new NodeImageCache(dir, 0);
+    const source = optimizer();
+    for (let i = 0; i < 2; i++) {
+      const res = await cache.handle(request("url=%2Fc.png&w=64&q=75"), undefined, source.optimize);
+      expect(res.headers.get("x-nextjs-cache")).toBe("MISS");
+      expect(res.headers.get("ETag")).toBeTruthy();
+    }
+    expect(source.calls).toBe(2);
+    await expect(fs.access(dir)).rejects.toThrow();
+  });
+
+  it("evicts the least recently used variants past images.maximumDiskCacheSize", async () => {
+    const { NodeImageCache } =
+      await import("../packages/vinext/src/server/node-image-optimization.js");
+    const dir = await cacheDir();
+    // Each body is 7 bytes ("image N"): room for two.
+    const cache = new NodeImageCache(dir, 15);
+    const source = optimizer();
+    for (const name of ["d", "e"]) {
+      await cache.handle(request(`url=%2F${name}.png&w=64&q=75`), undefined, source.optimize);
+    }
+    // Using d makes e the least recently used one.
+    await cache.handle(request("url=%2Fd.png&w=64&q=75"), undefined, source.optimize);
+    await cache.handle(request("url=%2Ff.png&w=64&q=75"), undefined, source.optimize);
+    expect(await fs.readdir(dir)).toHaveLength(2);
+    const d = await cache.handle(request("url=%2Fd.png&w=64&q=75"), undefined, source.optimize);
+    expect(d.headers.get("x-nextjs-cache")).toBe("HIT");
+    const e = await cache.handle(request("url=%2Fe.png&w=64&q=75"), undefined, source.optimize);
+    expect(e.headers.get("x-nextjs-cache")).toBe("MISS");
+  });
 });

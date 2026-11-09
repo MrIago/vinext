@@ -107,6 +107,11 @@ export type ImageConfig = {
    * preference order. Default: ["image/webp"], as in Next.js.
    */
   formats?: string[];
+  /**
+   * Bytes of optimized images the Node.js server keeps on disk; 0 disables
+   * the cache, as in Next.js.
+   */
+  maximumDiskCacheSize?: number;
   /** Least max-age, in seconds, of an image served as-is. Default: 14400. */
   minimumCacheTTL?: number;
   /**
@@ -463,6 +468,26 @@ function acceptQuality(acceptHeader: string, mediaType: string): number {
 }
 
 /**
+ * The `images.formats` entry the Accept header prefers, or "" when it accepts
+ * none, like Next.js' getSupportedMimeType (part of its image cache key).
+ */
+export function supportedImageFormat(
+  acceptHeader: string | null,
+  formats: readonly string[] = DEFAULT_IMAGE_FORMATS,
+): string {
+  let selected = "";
+  let selectedQuality = 0;
+  for (const format of formats) {
+    const quality = acceptHeader ? acceptQuality(acceptHeader, format) : 0;
+    if (quality > selectedQuality) {
+      selected = format;
+      selectedQuality = quality;
+    }
+  }
+  return selected;
+}
+
+/**
  * Negotiate the output format like Next.js: the `images.formats` entry the
  * Accept header prefers (listed order breaks ties), else the source's own
  * type, with a WebP or AVIF source sent as JPEG to a client that accepts
@@ -478,15 +503,7 @@ export function negotiateImageFormat(
   formats: readonly string[] = DEFAULT_IMAGE_FORMATS,
   sourceMediaType: string | null = null,
 ): string {
-  let selected = "";
-  let selectedQuality = 0;
-  for (const format of formats) {
-    const quality = acceptHeader ? acceptQuality(acceptHeader, format) : 0;
-    if (quality > selectedQuality) {
-      selected = format;
-      selectedQuality = quality;
-    }
-  }
+  const selected = supportedImageFormat(acceptHeader, formats);
   if (selected) return selected;
   if (!sourceMediaType || sourceMediaType === "image/webp" || sourceMediaType === "image/avif") {
     return "image/jpeg";
