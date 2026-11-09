@@ -8384,6 +8384,135 @@ describe('"use cache" runtime', () => {
     });
   });
 
+  // Ported from Next.js: packages/next/src/server/lib/incremental-cache/index.ts
+  // (IncrementalCache.get reads the resume data cache before an on-demand
+  // revalidation bypasses persisted entries; vercel/next.js#101077)
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/data-cache-revalidation/data-cache-revalidation.test.ts
+  it("reads and collects unstable_cache entries through the resume data cache", async () => {
+    const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    const { _markPendingRevalidatedTag, _setResumeDataCacheCollector, _setResumeDataCacheSeed } =
+      await import("../packages/vinext/src/shims/cache-request-state.js");
+    const { createResumeDataCache } =
+      await import("../packages/vinext/src/shims/resume-data-cache.js");
+    setCacheHandler(new MemoryCacheHandler());
+
+    let calls = 0;
+    const cached = unstable_cache(async () => ++calls, ["rdc-unstable-cache"], {
+      tags: ["rdc-unstable"],
+    });
+    const invoke = (
+      rdc: {
+        collector?: ReturnType<typeof createResumeDataCache>;
+        seed?: ReturnType<typeof createResumeDataCache>;
+      },
+      context: Parameters<typeof createRequestContext>[0] = {},
+      before?: () => void,
+    ) =>
+      runWithRequestContext(createRequestContext(context), () => {
+        _setResumeDataCacheCollector(rdc.collector ?? null);
+        _setResumeDataCacheSeed(rdc.seed ?? null);
+        before?.();
+        return cached();
+      });
+
+    // A miss is collected, like a write.
+    const warmup = createResumeDataCache();
+    await expect(invoke({ collector: warmup })).resolves.toBe(1);
+    expect(warmup.fetch.size).toBe(1);
+    // So is a hit.
+    const hit = createResumeDataCache();
+    await expect(invoke({ collector: hit })).resolves.toBe(1);
+    expect([...hit.fetch.keys()]).toEqual([...warmup.fetch.keys()]);
+
+    // An on-demand revalidation reuses the render's resume data cache before
+    // it bypasses the stored entry...
+    setCacheHandler(new MemoryCacheHandler());
+    await expect(invoke({ seed: warmup }, { isOnDemandRevalidate: true })).resolves.toBe(1);
+    expect(calls).toBe(1);
+    // ...and still recomputes without one.
+    await expect(invoke({}, { isOnDemandRevalidate: true })).resolves.toBe(2);
+    // A tag this request revalidated bypasses it.
+    await expect(
+      invoke({ seed: warmup }, {}, () => _markPendingRevalidatedTag("rdc-unstable")),
+    ).resolves.toBe(3);
+  });
+
+  // Ported from Next.js: packages/next/src/server/use-cache/use-cache-wrapper.ts
+  // (background revalidation writes only to the cache handler; vercel/next.js#100447)
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache-swr/use-cache-swr.test.ts
+  it.each(["use cache", "unstable_cache"] as const)(
+    "keeps the stale %s value a render served in its resume data cache",
+    async (kind) => {
+      const { registerCachedFunction } =
+        await import("../packages/vinext/src/shims/cache-runtime.js");
+      const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+        await import("../packages/vinext/src/shims/cache.js");
+      const { createRequestContext, runWithRequestContext } =
+        await import("../packages/vinext/src/shims/unified-request-context.js");
+      const { _setResumeDataCacheCollector } =
+        await import("../packages/vinext/src/shims/cache-request-state.js");
+      const { createResumeDataCache } =
+        await import("../packages/vinext/src/shims/resume-data-cache.js");
+      let stale = false;
+      // Serves every stored entry as stale once asked to.
+      class StaleHandler extends MemoryCacheHandler {
+        override async get(...args: Parameters<InstanceType<typeof MemoryCacheHandler>["get"]>) {
+          const entry = await super.get(...args);
+          return entry && stale ? { ...entry, cacheState: "stale" as const } : entry;
+        }
+      }
+      setCacheHandler(new StaleHandler());
+
+      let calls = 0;
+      let regenerated!: () => void;
+      const regeneration = new Promise<void>((resolve) => (regenerated = resolve));
+      const generate = async () => {
+        calls++;
+        if (calls > 1) setTimeout(regenerated, 0);
+        return `value ${calls}`;
+      };
+      const cached =
+        kind === "use cache"
+          ? registerCachedFunction(generate, "test:rdc-stale-served")
+          : unstable_cache(generate, ["rdc-stale-served"]);
+      const collect = async () => {
+        const collector = createResumeDataCache();
+        const result = await runWithRequestContext(
+          createRequestContext({ unstableCacheRevalidation: "background" }),
+          async () => {
+            _setResumeDataCacheCollector(collector);
+            const value = await cached();
+            await regeneration;
+            // The regeneration's write settles after it returns.
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            return value;
+          },
+        );
+        return { collector, result };
+      };
+
+      try {
+        await runWithRequestContext(createRequestContext(), () => cached());
+        stale = true;
+        const { collector, result } = await collect();
+        expect(result).toBe("value 1");
+        expect(calls).toBe(2);
+        // The render's entry is still the value it served, not the regenerated one.
+        const entries = [...collector.cache.values(), ...collector.fetch.values()];
+        expect(entries).toHaveLength(1);
+        const body = entries[0].body ?? "";
+        const decoded = kind === "use cache" ? Buffer.from(body, "base64").toString("utf8") : body;
+        expect(decoded).toContain("value 1");
+        expect(decoded).not.toContain("value 2");
+      } finally {
+        setCacheHandler(new MemoryCacheHandler());
+      }
+    },
+  );
+
   it("leaves a cache hit without a lifetime out of the resume data cache", async () => {
     const { registerCachedFunction } =
       await import("../packages/vinext/src/shims/cache-runtime.js");

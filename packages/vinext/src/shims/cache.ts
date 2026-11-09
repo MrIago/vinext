@@ -37,6 +37,10 @@ import {
   type CacheHandlerValue,
 } from "./cache-handler.js";
 import { getRequestExecutionContext } from "./request-context.js";
+import {
+  collectFetchResumeDataCacheEntry,
+  readFetchResumeDataCacheEntry,
+} from "./resume-data-cache.js";
 import { isStagedCacheabilityProbeActive } from "./cacheability-classification.js";
 import { isPathKnownNotEdgeCached } from "./cdn-purge-routes.js";
 import {
@@ -657,6 +661,9 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
   revalidateSeconds: number | false | undefined,
   staleEntry: CacheHandlerValue | undefined,
   deferWrite: boolean,
+  // A background revalidation writes only to the cache handler: the render's
+  // resume data cache keeps the stale value it served.
+  collectsResumeData = true,
 ): Promise<Result> {
   // As in Next.js, the callback gets the caller's arguments, which are keyed
   // when the cached function is called but read only after the cache is.
@@ -680,6 +687,7 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
     // Next.js behavior for unstable_cache without explicit revalidate.
     revalidate: typeof revalidateSeconds === "number" ? revalidateSeconds : false,
   };
+  if (collectsResumeData) collectFetchResumeDataCacheEntry(cacheKey, cacheValue.data);
 
   // A failed write skips caching but must not replace a successful result with
   // an error, matching fetch() caching here and Next.js's IncrementalCache.set.
@@ -759,6 +767,24 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
 
     const isDraftMode = isDraftModeEnabled();
     let staleEntry: CacheHandlerValue | undefined;
+    // Like Next.js's IncrementalCache.get, a render with a resume data cache
+    // reads its entry first, so a resumed shell or a prerender's final pass
+    // reuses what the shell or the warmup pass computed. An on-demand
+    // revalidation reads it too, before it bypasses the stored entry. Only a
+    // tag this request revalidated bypasses it.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/incremental-cache/index.ts
+    if (
+      !isDraftMode &&
+      !isNestedUnstableCacheCall() &&
+      !_hasPendingRevalidatedTag([...tags, ...getCurrentFetchSoftTags()])
+    ) {
+      const resumeEntry = readFetchResumeDataCacheEntry(cacheKey);
+      const resumed = resumeEntry && tryDeserializeUnstableCacheResult(resumeEntry.body);
+      if (resumeEntry && resumed?.ok) {
+        collectFetchResumeDataCacheEntry(cacheKey, resumeEntry);
+        return resumed.value;
+      }
+    }
     // Like Next.js, an unstable_cache nested in another's callback skips the
     // read and reruns, so regenerating the outer entry also refreshes what it
     // calls, and so does an on-demand revalidation (`res.revalidate()`). The
@@ -781,6 +807,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
         if (cached.ok) {
           if (existing.cacheState === "stale") {
             if (shouldServeStaleUnstableCacheEntry()) {
+              collectFetchResumeDataCacheEntry(cacheKey, existing.value.data);
               scheduleUnstableCacheBackgroundRevalidation(cacheKey, () =>
                 refreshUnstableCacheResult(
                   fn,
@@ -791,11 +818,13 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
                   revalidateSeconds,
                   staleEntry,
                   false,
+                  false,
                 ),
               );
               return cached.value;
             }
           } else {
+            collectFetchResumeDataCacheEntry(cacheKey, existing.value.data);
             return cached.value;
           }
         }
