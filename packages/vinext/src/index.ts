@@ -4518,7 +4518,17 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
           viteConfig.environments = {
             rsc: {
-              ...nitroDevEnvironmentResolve,
+              // Nitro bundles the server output itself, but Vite would still
+              // externalize node_modules dependencies here and Nitro would then
+              // resolve them without the "react-server" condition (#3219).
+              // Bundle them in the RSC environment so package export
+              // conditions apply, keeping the resolved server externals (the
+              // caller's `serverExternalPackages` included) external, as the
+              // non-Nitro branch below does. Cloudflare's plugin already
+              // bundles its worker environments.
+              ...(hasNitroPlugin && !hasCloudflarePlugin && userSsrExternal !== true
+                ? { resolve: { noExternal: true as const, external: [...userSsrExternal] } }
+                : nitroDevEnvironmentResolve),
               ...(hasCloudflarePlugin || hasNitroPlugin
                 ? {}
                 : {
