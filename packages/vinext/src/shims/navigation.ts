@@ -406,8 +406,17 @@ export type PrefetchCacheEntry = {
   reuseAfterHistoryRestore?: boolean;
   searchAgnosticShell?: boolean;
   size?: number;
+  /**
+   * For a static-shell prefetch, the stage it asked for: the App Shell, or a
+   * partial prefetch to the prefetch or navigation stage. Unset for the
+   * static shell of a route without Partial Prefetching.
+   */
+  stage?: StaticShellPrefetchStage;
   timestamp: number;
 };
+
+/** The stage a Cache Components shell prefetch reaches, as Next.js's `AppStage`. */
+export type StaticShellPrefetchStage = "shell" | "prefetch" | "navigation";
 
 export function getCurrentInterceptionContext(): string | null {
   if (isServer) {
@@ -796,6 +805,150 @@ export function hasFreshLearningOnlyPrefetchCacheEntry(
   return false;
 }
 
+// Next.js's segment cache models a prefetched entry along two independent
+// axes (vercel/next.js#99706): the stage its render reached (`AppStage`) and
+// what's still missing at that stage (`Completeness`). Both are ordered.
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/segment-cache/types.ts
+const STATIC_SHELL_STAGE_ORDER: Record<StaticShellPrefetchStage, number> = {
+  shell: 0,
+  prefetch: 1,
+  navigation: 2,
+};
+const COMPLETENESS_NEEDS_RUNTIME = 0;
+const COMPLETENESS_CACHE_COMPLETE = 1;
+const COMPLETENESS_FULLY_COMPLETE = 2;
+
+/**
+ * A static-shell entry's stage and completeness. A shell with no holes is
+ * fully complete and, like Next.js's `writeSegmentDataIntoCache`, recorded at
+ * the navigation stage whatever it asked for. A partial one has everything
+ * cacheable up to its stage. A static shell of a route without Partial
+ * Prefetching is treated as needing runtime data, as Next.js's
+ * `getStaticRequestCompleteness` does. Null while it's in flight.
+ */
+function getStaticShellEntryRank(
+  entry: PrefetchCacheEntry,
+): { completeness: number; stage: number } | null {
+  const shell = entry.snapshot?.staticShell;
+  if (entry.prefetchKind !== "static-shell" || entry.pending !== undefined) return null;
+  if (shell === "complete" || shell === "runtime") {
+    return {
+      completeness: COMPLETENESS_FULLY_COMPLETE,
+      stage: STATIC_SHELL_STAGE_ORDER.navigation,
+    };
+  }
+  if (shell !== "partial") return null;
+  return entry.stage === undefined
+    ? { completeness: COMPLETENESS_NEEDS_RUNTIME, stage: STATIC_SHELL_STAGE_ORDER.shell }
+    : { completeness: COMPLETENESS_CACHE_COMPLETE, stage: STATIC_SHELL_STAGE_ORDER[entry.stage] };
+}
+
+/**
+ * Whether `existing` is strictly better than `candidate`, as Next.js's
+ * `isExistingSegmentEntryPreferred`: the more complete entry wins whatever its
+ * stage; equally complete, the deeper stage wins; tied, the newer one does.
+ */
+function isExistingStaticShellPreferred(
+  existing: { completeness: number; stage: number },
+  candidate: { completeness: number; stage: number },
+): boolean {
+  if (existing.completeness !== candidate.completeness) {
+    return existing.completeness > candidate.completeness;
+  }
+  return existing.stage > candidate.stage;
+}
+
+/**
+ * Whether `entry` has everything `other` has, as Next.js's
+ * `doesEntryCoverEntry`: at least the same stage and completeness.
+ */
+function doesStaticShellRankCover(
+  entry: { completeness: number; stage: number },
+  other: { completeness: number; stage: number },
+): boolean {
+  return entry.stage >= other.stage && entry.completeness >= other.completeness;
+}
+
+function forEachStaticShellEntryForUrl(
+  rscUrls: readonly string[],
+  interceptionContext: string | null,
+  mountedSlotsHeader: string | null,
+  visit: (cacheKey: string, entry: PrefetchCacheEntry) => void,
+): void {
+  const normalizedTargets = new Set(
+    rscUrls
+      .map((lookupRscUrl) => normalizeRscCacheLookupUrl(lookupRscUrl))
+      .filter((lookupRscUrl): lookupRscUrl is string => lookupRscUrl !== null),
+  );
+  if (normalizedTargets.size === 0) return;
+  for (const [cacheKey, entry] of getPrefetchCache()) {
+    if (entry.prefetchKind !== "static-shell") continue;
+    const source = parsePrefetchCacheKey(cacheKey);
+    if (source.interceptionContext !== interceptionContext) continue;
+    const normalizedSource = normalizeRscCacheLookupUrl(source.rscUrl);
+    if (normalizedSource === null || !normalizedTargets.has(normalizedSource)) continue;
+    if (!isPrefetchCacheEntryCompatibleWithMountedSlots(entry, mountedSlotsHeader)) continue;
+    visit(cacheKey, entry);
+  }
+}
+
+/**
+ * Whether a fresh static-shell prefetch of the URL already has everything a
+ * prefetch to `stage` would bring, so the prefetch needs no request. Like
+ * Next.js's scheduler, an entry from a deeper stage, or one with no holes,
+ * serves a shallower prefetch.
+ */
+export function hasCoveringStaticShellPrefetch(
+  rscUrl: string,
+  interceptionContext: string | null,
+  mountedSlotsHeader: string | null,
+  stage: StaticShellPrefetchStage | undefined,
+  additionalRscUrls: readonly string[] = [],
+): boolean {
+  const wanted = {
+    completeness: stage === undefined ? COMPLETENESS_NEEDS_RUNTIME : COMPLETENESS_CACHE_COMPLETE,
+    stage: STATIC_SHELL_STAGE_ORDER[stage ?? "shell"],
+  };
+  const now = Date.now();
+  let covered = false;
+  forEachStaticShellEntryForUrl(
+    [rscUrl, ...additionalRscUrls],
+    interceptionContext,
+    mountedSlotsHeader,
+    (_cacheKey, entry) => {
+      if (covered || resolvePrefetchCacheEntryExpiresAt(entry) <= now) return;
+      const rank = getStaticShellEntryRank(entry);
+      if (rank !== null && doesStaticShellRankCover(rank, wanted)) covered = true;
+    },
+  );
+  return covered;
+}
+
+/**
+ * Drop the URL's other static-shell entries a newly settled one covers, as
+ * Next.js's shadow eviction does: they'd never be preferred over it again.
+ */
+function evictStaticShellEntriesCoveredBy(
+  cacheKey: string,
+  entry: PrefetchCacheEntry,
+  interceptionContext: string | null,
+): void {
+  const rank = getStaticShellEntryRank(entry);
+  if (rank === null) return;
+  const cache = getPrefetchCache();
+  forEachStaticShellEntryForUrl(
+    [parsePrefetchCacheKey(cacheKey).rscUrl],
+    interceptionContext,
+    resolvePrefetchCacheEntryMountedSlotsHeader(entry),
+    (otherKey, other) => {
+      if (otherKey === cacheKey || other === entry) return;
+      const otherRank = getStaticShellEntryRank(other);
+      if (otherRank === null || !doesStaticShellRankCover(rank, otherRank)) return;
+      deletePrefetchCacheEntry(cache, getPrefetchedUrls(), otherKey, other, false);
+    },
+  );
+}
+
 /**
  * A settled, fresh static shell a navigation to the URL can show while the
  * page renders. It stays cached for later navigations, as it holds no dynamic
@@ -807,26 +960,27 @@ export function peekStaticShellPrefetchForNavigation(
   mountedSlotsHeader: string | null = null,
   additionalRscUrls: readonly string[] = [],
 ): CachedRscResponse | null {
-  const normalizedTargets = new Set(
-    [rscUrl, ...additionalRscUrls]
-      .map((lookupRscUrl) => normalizeRscCacheLookupUrl(lookupRscUrl))
-      .filter((lookupRscUrl): lookupRscUrl is string => lookupRscUrl !== null),
-  );
-  if (normalizedTargets.size === 0) return null;
   const now = Date.now();
-  for (const [cacheKey, entry] of getPrefetchCache()) {
-    if (entry.prefetchKind !== "static-shell" || entry.snapshot?.staticShell !== "partial") {
-      continue;
-    }
-    if (entry.pending !== undefined || resolvePrefetchCacheEntryExpiresAt(entry) <= now) continue;
-    const source = parsePrefetchCacheKey(cacheKey);
-    if (source.interceptionContext !== interceptionContext) continue;
-    const normalizedSource = normalizeRscCacheLookupUrl(source.rscUrl);
-    if (normalizedSource === null || !normalizedTargets.has(normalizedSource)) continue;
-    if (!isPrefetchCacheEntryCompatibleWithMountedSlots(entry, mountedSlotsHeader)) continue;
-    return entry.snapshot;
-  }
-  return null;
+  // Each stage's shell is its own request. Like Next.js's segment cache, the
+  // most complete one wins whatever stage it came from, then the deepest
+  // (vercel/next.js#99706).
+  let best: { rank: { completeness: number; stage: number }; snapshot: CachedRscResponse } | null =
+    null;
+  forEachStaticShellEntryForUrl(
+    [rscUrl, ...additionalRscUrls],
+    interceptionContext,
+    mountedSlotsHeader,
+    (_cacheKey, entry) => {
+      if (entry.snapshot?.staticShell !== "partial") return;
+      if (resolvePrefetchCacheEntryExpiresAt(entry) <= now) return;
+      const rank = getStaticShellEntryRank(entry);
+      if (rank === null) return;
+      if (best === null || !isExistingStaticShellPreferred(best.rank, rank)) {
+        best = { rank, snapshot: entry.snapshot };
+      }
+    },
+  );
+  return (best as { snapshot: CachedRscResponse } | null)?.snapshot ?? null;
 }
 
 /**
@@ -1734,6 +1888,7 @@ export function prefetchRscResponse(
     prefetchKind?: PrefetchCacheKind;
     prepareSnapshot?: (snapshot: CachedRscResponse) => Promise<AppElements>;
     searchAgnosticShell?: boolean;
+    stage?: StaticShellPrefetchStage;
   } = {},
 ): void {
   const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
@@ -1756,6 +1911,7 @@ export function prefetchRscResponse(
       behavior.prefetchKind ??
       (behavior.optimisticRouteShell === true ? "loading-shell" : "navigation"),
     searchAgnosticShell: behavior.searchAgnosticShell === true,
+    ...(behavior.stage === undefined ? {} : { stage: behavior.stage }),
     timestamp: now,
   };
   if (behavior.dynamicStaleTime === "learning-only" && behavior.searchAgnosticShell !== true) {
@@ -1855,6 +2011,7 @@ export function prefetchRscResponse(
       if (entry.snapshot) {
         entry.outcome = "cache-seeded";
         schedulePrefetchInvalidation(cacheKey, entry);
+        evictStaticShellEntriesCoveredBy(cacheKey, entry, interceptionContext);
       }
     });
 
@@ -3597,6 +3754,21 @@ const _appRouter: AppRouterInstance = {
       ) {
         return;
       }
+      // A fresh shell of this URL from a stage at least as deep serves the
+      // prefetch, as Next.js's segment cache serves a shallower one.
+      if (
+        !reusable &&
+        policy.staticShell === true &&
+        hasCoveringStaticShellPrefetch(
+          rscUrl,
+          interceptionContext,
+          mountedSlotsHeader,
+          policy.prefetchStage,
+          additionalRscUrls,
+        )
+      ) {
+        return;
+      }
       // Another URL's shell serves this one when they agree on the params it
       // read. A client rewrite's target isn't the URL the shell keys on.
       if (
@@ -3676,6 +3848,7 @@ const _appRouter: AppRouterInstance = {
               prefetchKind: policy.staticShell === true ? "static-shell" : "navigation",
               prepareSnapshot:
                 policy.staticShell === true ? prepareNavigationPrefetchSnapshot : undefined,
+              ...(policy.prefetchStage === undefined ? {} : { stage: policy.prefetchStage }),
             },
       );
     })()

@@ -507,6 +507,7 @@ function prefetchUrl(
           prepareNavigationPrefetchSnapshot,
           promotePrefetchCacheEntryForNavigation,
           seedFullPrefetchFromVisitedResponse,
+          hasCoveringStaticShellPrefetch,
           seedStaticShellPrefetchFromVaryingShell,
           hasNavigationFreshVisitedResponse,
           DYNAMIC_NAVIGATION_CACHE_TTL,
@@ -794,6 +795,21 @@ function prefetchUrl(
         ) {
           return;
         }
+        // A fresh shell of this URL from a stage at least as deep serves the
+        // prefetch, as Next.js's segment cache serves a shallower one.
+        if (
+          autoPrefetch.staticShell === true &&
+          !autoPrefetch.cacheForNavigation &&
+          hasCoveringStaticShellPrefetch(
+            rscUrl,
+            interceptionContext,
+            mountedSlotsHeader,
+            autoPrefetch.prefetchStage,
+            additionalRscUrls,
+          )
+        ) {
+          return;
+        }
         // Another URL's shell serves this one when they agree on the params it
         // read. A client rewrite's target isn't the URL the shell keys on.
         if (
@@ -893,6 +909,9 @@ function prefetchUrl(
                 ? prepareNavigationPrefetchSnapshot
                 : undefined,
             searchAgnosticShell: isAutomaticSearchParamShell && !hasSearchAgnosticShell,
+            ...(autoPrefetch.prefetchStage === undefined
+              ? {}
+              : { stage: autoPrefetch.prefetchStage }),
           },
         );
       } else if (HAS_PAGES_ROUTER && window.__NEXT_DATA__) {

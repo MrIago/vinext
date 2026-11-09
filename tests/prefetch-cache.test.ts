@@ -3638,6 +3638,98 @@ describe("static-shell prefetch", () => {
     },
   );
 
+  // Ported from Next.js's split of the segment cache's fetch strategy into a
+  // stage and a completeness (vercel/next.js#99706): the more complete entry
+  // wins whatever stage it came from, then the deeper stage, and an entry
+  // covering a shallower prefetch serves it without a request.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/segment-cache/cache.ts
+  describe("stage and completeness", () => {
+    function mockPartialPrefetchingRoute(
+      respond: (renderMode: string | null) => { body: string; shell: string },
+    ) {
+      (globalThis as any).window.__VINEXT_LINK_PREFETCH_ROUTES__ = [
+        {
+          canPrefetchLoadingShell: false,
+          isDynamic: false,
+          partialPrefetching: true,
+          patternParts: ["test"],
+        },
+      ];
+      const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const mode =
+          (init?.headers as Headers | undefined)?.get("X-Vinext-Rsc-Render-Mode") ?? null;
+        const { body, shell } = respond(mode);
+        return new Response(body, {
+          headers: { "content-type": "text/x-component", "X-Vinext-Static-Shell": shell },
+        });
+      });
+      (globalThis as any).fetch = fetch;
+      (globalThis as any).window[Symbol.for("vinext.navigationRuntime")] = {
+        bootstrap: { routeManifest: null, rsc: undefined },
+        functions: {
+          getPrefetchRouterState: () => ({ pathAndSearch: "/current", routeId: "route:/current" }),
+          navigate: vi.fn(),
+        },
+      };
+      return fetch;
+    }
+
+    async function prefetchAndSettle(
+      fetch: ReturnType<typeof vi.fn>,
+      kind: "navigation" | undefined,
+    ): Promise<string> {
+      const calls = fetch.mock.calls.length;
+      appRouterInstance.prefetch("/test", kind === undefined ? undefined : ({ kind } as never));
+      await waitForPrefetchSetup(() => fetch.mock.calls.length === calls + 1);
+      const rscUrl = toRscUrlString(fetch.mock.calls[calls]![0]);
+      const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, null);
+      await waitForPrefetchSetup(
+        () => getPrefetchCache().get(cacheKey)?.outcome === "cache-seeded",
+      );
+      return rscUrl;
+    }
+
+    it("shows the deeper partial prefetch and drops the shell it covers", async () => {
+      useCacheComponentsProduction();
+      const fetch = mockPartialPrefetchingRoute((mode) => ({
+        body: mode === "prefetch-partial-navigation" ? "0:navigation" : "0:app-shell",
+        shell: "partial",
+      }));
+      const shellUrl = await prefetchAndSettle(fetch, undefined);
+      const navigationUrl = await prefetchAndSettle(fetch, "navigation");
+
+      expect(getPrefetchCache().has(AppElementsWire.encodeCacheKey(shellUrl, null))).toBe(false);
+      const shown = peekStaticShellPrefetchForNavigation(shellUrl);
+      expect(new TextDecoder().decode(shown!.buffer)).toBe("0:navigation");
+      expect(peekStaticShellPrefetchForNavigation(navigationUrl)).toBe(shown);
+    });
+
+    it("serves a later App Shell prefetch from a deeper one, with no request", async () => {
+      useCacheComponentsProduction();
+      const fetch = mockPartialPrefetchingRoute(() => ({
+        body: "0:navigation",
+        shell: "partial",
+      }));
+      await prefetchAndSettle(fetch, "navigation");
+
+      appRouterInstance.prefetch("/test");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a complete App Shell over a deeper prefetch that would be partial", async () => {
+      useCacheComponentsProduction();
+      const fetch = mockPartialPrefetchingRoute(() => ({ body: "0:page", shell: "complete" }));
+      const shellUrl = await prefetchAndSettle(fetch, undefined);
+
+      // The shell had no holes, so it's the page at every stage.
+      appRouterInstance.prefetch("/test", { kind: "navigation" } as never);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(consumePrefetchResponse(shellUrl, null, null)?.staticShell).toBe("complete");
+    });
+  });
+
   it("keeps the full prefetch of a route that doesn't opt into Partial Prefetching", async () => {
     useCacheComponentsProduction();
     const { resolvePartialAppRoutePrefetch } =
