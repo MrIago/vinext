@@ -329,6 +329,19 @@ function haveSamePageParams(first: AppPageParams, second: AppPageParams): boolea
   return true;
 }
 
+/**
+ * `cleanPathname` is already decoded once, but the matcher decodes its captures
+ * as if they were raw. A literal `%` (from `%25`) then fails that second
+ * decode or turns into another character, so the cache path no longer matches
+ * the request's own params. Escaping the literal percents first makes the
+ * matcher's decode a no-op for them. The `%2F`-style escapes that decoding
+ * keeps for path delimiters stay as they are. Next.js stopped decoding these
+ * captures twice in vercel/next.js#99121.
+ */
+function escapeDecodedPathnamePercents(pathname: string): string {
+  return pathname.replace(/%(?!2f|23|3f|5c)/gi, "%25");
+}
+
 function rewriteCachePathname(sourcePathname: string, resolvedPathname: string): string {
   return `${sourcePathname}?__vinext_rewrite=${encodeURIComponent(resolvedPathname)}`;
 }
@@ -2846,7 +2859,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     route.routeHandler != null ||
     typeof route.__loadRouteHandler === "function";
   if ((!isInterceptionMatch || requestPathnameDiffersFromCachePath) && options.matchRequestRoute) {
-    const cachePathMatch = options.matchRoute(cleanPathname);
+    const cachePathMatch = options.matchRoute(escapeDecodedPathnamePercents(cleanPathname));
     if (
       (requestPathnameDiffersFromCachePath && rawRequestPathnameIsObservable) ||
       !cachePathMatch ||
