@@ -50,6 +50,7 @@ import {
   _isOnDemandRevalidate,
   _setRequestScopedCacheLife,
   cacheLifeProfiles,
+  shouldRevalidateStaleCacheEntryInForeground,
 } from "./cache-request-state.js";
 import { getRegisteredCacheContext } from "./internal/cache-context-accessor.js";
 import { getRequestExecutionContext } from "./request-context.js";
@@ -849,10 +850,6 @@ function lowerCurrentFetchRevalidate(revalidateSeconds: number): void {
   }
 }
 
-function shouldRefreshStaleFetchInForeground(): boolean {
-  return _getState().refreshStaleFetchesInForeground;
-}
-
 async function buildFetchCacheValue(
   response: Response,
   tags: string[],
@@ -978,10 +975,6 @@ export function setCurrentForceDynamicFetchDefault(enabled: boolean): void {
 /** Mark the current Pages Router render as a preview/draft render. */
 export function setCurrentFetchDraftMode(enabled: boolean): void {
   _getState().isDraftMode = enabled;
-}
-
-export function setRefreshStaleFetchesInForeground(enabled: boolean): void {
-  _getState().refreshStaleFetchesInForeground = enabled;
 }
 
 function isNoStoreFetch(
@@ -1590,12 +1583,14 @@ function createPatchedFetch(): typeof globalThis.fetch {
           );
         }
 
-        // Stale entry — we could do stale-while-revalidate here, but for fetch()
-        // the simpler approach is to just re-fetch (the page-level ISR handles SWR).
-        // However, if we have a stale entry, return it and trigger background refetch.
+        // Stale entry: like Next.js's patch-fetch, refetch in the foreground when
+        // the consumer will persist the response in a server cache (static
+        // generation, an ISR regeneration, an enclosing "use cache", a fallback
+        // shell's resume data cache), otherwise serve it and refetch in the
+        // background.
         if (cached?.value && cached.value.kind === "FETCH" && cached.cacheState === "stale") {
           staleEntry = cached;
-          if (shouldRefreshStaleFetchInForeground()) {
+          if (shouldRevalidateStaleCacheEntryInForeground()) {
             const freshResponse = await dedupeFetch(input, fetchInit);
             // A failed write keeps the fresh response rather than fetching again.
             const freshValue = await writeFetchCacheResponse(
@@ -1794,7 +1789,6 @@ export async function runWithFetchCache<T>(fn: () => Promise<T>): Promise<T> {
       uCtx.currentRequestTags = [];
       uCtx.currentFetchSoftTags = [];
       uCtx.dynamicFetchUrls = new Set<string>();
-      uCtx.refreshStaleFetchesInForeground = false;
       uCtx.isFetchDedupeActive = true;
       uCtx.currentFetchDedupeEntries = new Map();
       uCtx.nextFetchId = 1;
@@ -1809,7 +1803,6 @@ export async function runWithFetchCache<T>(fn: () => Promise<T>): Promise<T> {
       currentForceDynamicFetchDefault: false,
       isDraftMode: false,
       dynamicFetchUrls: new Set<string>(),
-      refreshStaleFetchesInForeground: false,
       isFetchDedupeActive: true,
       currentFetchDedupeEntries: new Map(),
       nextFetchId: 1,

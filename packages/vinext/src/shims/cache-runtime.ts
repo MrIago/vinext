@@ -39,7 +39,7 @@ import {
   _setRequestScopedCacheLife,
   _registerCacheContextAccessor,
   runWithDetachedCacheObservations,
-  shouldServeStaleUnstableCacheEntry,
+  shouldRevalidateStaleCacheEntryInForeground,
   type CacheLifeConfig,
 } from "./cache-request-state.js";
 import { VINEXT_RSC_MARKER_HEADER } from "../server/headers.js";
@@ -621,18 +621,12 @@ export type RegisterCachedFunctionOptions = {
 };
 
 // Like Next.js, an entry past its `expire` is a miss: it is regenerated, never served. A
-// stale entry is served only by a dynamic render, which regenerates it in the background;
-// static generation (a prerender, a cacheability probe, an ISR regeneration) regenerates it
-// first. The request's revalidation mode is set before its prerender work unit, so check
-// the prerender conditions too.
+// stale entry is served only when nothing will persist the value, and then regenerates in
+// the background; see `shouldRevalidateStaleCacheEntryInForeground`.
 function isServableCacheState(cacheState: string | undefined): boolean {
   if (cacheState === "expired") return false;
   if (cacheState !== "stale") return true;
-  return (
-    shouldServeStaleUnstableCacheEntry() &&
-    process.env.VINEXT_PRERENDER !== "1" &&
-    !isRouteCacheabilityProbe()
-  );
+  return !shouldRevalidateStaleCacheEntryInForeground();
 }
 
 // Like Next.js, the background regeneration feeds neither its cache life nor its tags (its
