@@ -718,6 +718,11 @@ export type ResolvedNextConfig = {
    * requires the segment-cache architecture which is not yet implemented.
    */
   appShells: boolean;
+  /**
+   * `experimental.prepareNavigation`: exposes `router.experimental_prepare()`
+   * (vercel/next.js#101050).
+   */
+  prepareNavigation: boolean;
   /** Resolved build ID (from generateBuildId, or a random UUID if not provided). */
   buildId: string;
   /** Resolved deployment ID from next.config.js or NEXT_DEPLOYMENT_ID. */
@@ -2183,6 +2188,7 @@ export async function resolveNextConfig(
       cacheMaxMemorySize: undefined,
       enablePrerenderSourceMaps: true,
       appShells: false,
+      prepareNavigation: false,
       hashSalt: process.env.NEXT_HASH_SALT ?? "",
       buildId,
       deploymentId,
@@ -2661,6 +2667,7 @@ export async function resolveNextConfig(
     cacheMaxMemorySize,
     enablePrerenderSourceMaps: config.enablePrerenderSourceMaps ?? true,
     appShells,
+    prepareNavigation: experimental?.prepareNavigation === true,
     hashSalt,
     buildId,
     deploymentId,

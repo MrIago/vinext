@@ -97,7 +97,11 @@ import {
   VINEXT_VARY_PARAMS_HEADER,
   type AppRscRenderMode,
 } from "../server/app-rsc-render-mode.js";
-import type { AppRouterInstance } from "./internal/app-router-context.js";
+import type {
+  AppRouterInstance,
+  NavigateOptions,
+  PreparedNavigation,
+} from "./internal/app-router-context.js";
 import {
   resolveDirectHybridClientRouteOwner,
   type HybridClientOwner,
@@ -3097,6 +3101,47 @@ const _appRouter: AppRouterInstance = {
       });
   },
 };
+
+if (process.env.__NEXT_PREPARE_NAVIGATION) {
+  /**
+   * `router.experimental_prepare(href)` (vercel/next.js#101050): send the
+   * navigation's full dynamic request now, without touching the URL, history
+   * or rendered tree, and commit it later with `push`/`replace`, as on
+   * pointerdown then click. The URL is resolved now, so a relative href
+   * commits against the page it was prepared from. The commit is a regular
+   * navigation that reuses the prepared payload, still in flight or not;
+   * a refresh or Server Action clears it with the rest of the navigation
+   * cache, as Next.js invalidates its bfcache.
+   *
+   * Difference from Next.js: the prepared payload follows a full prefetch's
+   * lifetime here, so a commit long after preparing fetches fresh data
+   * instead of showing the old payload.
+   */
+  _appRouter.experimental_prepare = (href: string): PreparedNavigation => {
+    assertSafeNavigationUrl(href);
+    const preparedHref = isServer ? href : new URL(href, window.location.href).href;
+    if (!isServer) _appRouter.prefetch(preparedHref, { kind: "full" });
+    let didCommit = false;
+    const commit = (kind: "push" | "replace", options?: NavigateOptions): void => {
+      if (didCommit) {
+        if (process.env.NODE_ENV !== "production") {
+          console.error(
+            `The prepared navigation to "${href}" was already committed. Calling ` +
+              "`push` or `replace` again has no effect. To navigate again, call " +
+              "`router.experimental_prepare()` again, or use `router.push()`.",
+          );
+        }
+        return;
+      }
+      didCommit = true;
+      _appRouter[kind](preparedHref, options);
+    };
+    return {
+      push: (options) => commit("push", options),
+      replace: (options) => commit("replace", options),
+    };
+  };
+}
 
 if (process.env.__NEXT_GESTURE_TRANSITION) {
   _appRouter.experimental_gesturePush = (href: string, options?: { scroll?: boolean }): void => {

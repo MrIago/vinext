@@ -3517,6 +3517,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         defines["process.env.__NEXT_CACHE_COMPONENTS"] = JSON.stringify(
           nextConfig.cacheComponents ?? false,
         );
+        // Gates router.experimental_prepare(), as Next.js's define-env entry.
+        defines["process.env.__NEXT_PREPARE_NAVIGATION"] = JSON.stringify(
+          nextConfig.prepareNavigation ?? false,
+        );
         // Boolean like Next.js' define-env entry; gates whether the static stage
         // of a navigation response is cached for `staleTimes.static`.
         defines["process.env.__NEXT_EXPERIMENTAL_CACHED_NAVIGATIONS"] = JSON.stringify(
