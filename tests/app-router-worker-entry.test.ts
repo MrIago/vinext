@@ -166,6 +166,9 @@ export function registerConfiguredCacheAdapters(env) {
   };
 }
 
+// Each server below loads modules once and never reacts to file changes, so
+// it runs without a watcher. Its root is the repo, and a watcher would crawl
+// every nested checkout (worktrees included) for no benefit.
 describe("App Router Production server worker entry compatibility", () => {
   it("loads the configured data adapter only when request-stage middleware uses it", async () => {
     const globals = globalThis as unknown as Record<PropertyKey, unknown>;
@@ -193,7 +196,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -243,7 +246,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -319,7 +322,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -412,7 +415,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -524,7 +527,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -594,7 +597,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -692,7 +695,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(import.meta.dirname, "../packages/vinext/src/server/app-router-entry.ts"),
@@ -972,7 +975,7 @@ export default {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(import.meta.dirname, "../packages/vinext/src/server/app-router-entry.ts"),
@@ -1044,7 +1047,7 @@ export default {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const workerEntry = (await server.ssrLoadModule(
         path.resolve(import.meta.dirname, entryPaths[0]),

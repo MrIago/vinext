@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import MagicString from "magic-string";
 import type { RscPluginManager } from "@vitejs/plugin-rsc";
 import path from "pathslash";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
@@ -11,6 +12,7 @@ import {
   resolveClientReferenceImportIds,
   type ActionOwnerRouteReachability,
 } from "../build/action-owner-manifest.js";
+import { magicStringTransformResult } from "./transform-result.js";
 
 export const ACTION_OWNER_MANIFEST_ID = "virtual:vinext-action-owner-manifest";
 
@@ -96,7 +98,11 @@ export function createActionOwnerManifestPlugin(options: {
         ACTION_OWNER_MANIFEST_FILE,
       );
       if (!relativePath.startsWith(".")) relativePath = `./${relativePath}`;
-      return { code: code.replaceAll(ACTION_OWNER_MANIFEST_ID, relativePath) };
+      // Edit through MagicString so the chunk keeps a sourcemap; returning
+      // bare code from renderChunk makes Rolldown warn SOURCEMAP_BROKEN.
+      const output = new MagicString(code);
+      output.replaceAll(ACTION_OWNER_MANIFEST_ID, relativePath);
+      return magicStringTransformResult(output);
     },
     buildApp: {
       order: "post",
