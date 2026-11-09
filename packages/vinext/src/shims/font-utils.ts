@@ -147,3 +147,116 @@ export function getFontMimeType(pathOrUrl: string): string {
   if (pathOrUrl.endsWith(".eot")) return "font/eot";
   return "font/woff2";
 }
+
+// The font stylesheet URLs collected during SSR, rendered as
+// `<link rel="stylesheet">` by every router through `getSSRFontLinks()` in
+// the Google font shim. Both shims write to it, so it lives on a
+// `Symbol.for` slot like the rest of the shims' shared state.
+const _SSR_FONT_URLS_KEY = Symbol.for("vinext.font.ssrFontUrls");
+type _FontUrlsGlobal = typeof globalThis & { [_SSR_FONT_URLS_KEY]?: string[] };
+
+export function getSSRFontStylesheetUrls(): string[] {
+  return ((globalThis as _FontUrlsGlobal)[_SSR_FONT_URLS_KEY] ??= []);
+}
+
+/**
+ * Load a font stylesheet: collected for the server-rendered head, or linked
+ * from the document on the client unless the server already rendered it.
+ */
+export function addFontStylesheet(url: string): void {
+  if (typeof document === "undefined") {
+    const urls = getSSRFontStylesheetUrls();
+    if (!urls.includes(url)) urls.push(url);
+    return;
+  }
+  for (const link of document.querySelectorAll('link[rel="stylesheet"]')) {
+    if (link.getAttribute("href")?.split("?")[0] === url.split("?")[0]) return;
+  }
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = url;
+  document.head.appendChild(link);
+}
+
+/**
+ * Validate a CSS property name for use in declarations.
+ *
+ * Only allows standard CSS property names (lowercase letters and hyphens)
+ * and custom properties (--prefixed). Rejects anything that could inject
+ * CSS rules via crafted property names.
+ */
+function sanitizeCSSProperty(prop: string): string | undefined {
+  if (/^(--)?[a-zA-Z][a-zA-Z0-9-]*$/.test(prop)) return prop;
+  return undefined;
+}
+
+export type LocalFontSrc = {
+  path: string;
+  weight?: string;
+  style?: string;
+};
+
+type LocalFontFaceOptions = {
+  display?: string;
+  weight?: string;
+  style?: string;
+  declarations?: Array<{ prop: string; value: string }>;
+};
+
+/**
+ * The `@font-face` rules for a `next/font/local` call. Shared by the
+ * `vinext:local-fonts` transform, which extracts them into a stylesheet at
+ * build time, and the runtime shim, which injects them for calls the
+ * transform could not analyze, so both produce the same CSS.
+ */
+export function generateLocalFontFaceCSS(
+  family: string,
+  options: LocalFontFaceOptions,
+  sources: LocalFontSrc[],
+): string {
+  const display = options.display ?? "swap";
+  const rules: string[] = [];
+
+  for (const src of sources) {
+    // Do not invent a default weight when neither level specifies one. The
+    // @font-face descriptor defaults to `auto`; emitting `400` instead clamps
+    // a variable font's `wght` axis. Next.js likewise omits it in this case.
+    const configuredWeight = src.weight ?? options.weight;
+    const weight =
+      configuredWeight === undefined
+        ? undefined
+        : (sanitizeFontDescriptorValue(configuredWeight) ?? "400");
+    const style = sanitizeFontDescriptorValue(src.style ?? options.style ?? "normal") ?? "normal";
+    const format = src.path.endsWith(".woff2")
+      ? "woff2"
+      : src.path.endsWith(".woff")
+        ? "woff"
+        : src.path.endsWith(".ttf")
+          ? "truetype"
+          : src.path.endsWith(".otf")
+            ? "opentype"
+            : "woff2";
+
+    rules.push(`@font-face {
+  font-family: '${escapeCSSString(family)}';
+  src: url('${escapeCSSString(src.path)}') format('${format}');
+${weight === undefined ? "" : `  font-weight: ${weight};\n`}  font-style: ${style};
+  font-display: ${display};
+}`);
+  }
+
+  // Add extra declarations if provided — sanitize prop/value to prevent injection
+  if (options.declarations) {
+    for (const decl of options.declarations) {
+      const safeProp = sanitizeCSSProperty(decl.prop);
+      const safeValue = sanitizeFontDescriptorValue(decl.value);
+      if (safeProp && safeValue) {
+        rules.push(
+          `@font-face { font-family: '${escapeCSSString(family)}'; ${safeProp}: ${safeValue}; }`,
+        );
+      }
+    }
+  }
+
+  return rules.join("\n");
+}

@@ -28,7 +28,7 @@ vinext reimplements the Next.js API surface on Vite rather than consuming `next 
 These are active compatibility areas, not permanent exclusions:
 
 - **Cache Components and Partial Prerendering:** `"use cache"` is partially implemented, but full `cacheComponents` behavior is still incomplete. Cache profiles, tags, partial shells, resume behavior, prefetching, and some dev/build cache semantics do not yet match Next.js in every case.
-- **Build-time image and font optimization:** images can be optimized at request time on Cloudflare, but vinext does not yet reproduce Next.js's complete build-time image pipeline. Google Fonts are loaded from the CDN, and local font CSS is injected at runtime rather than extracted during the build.
+- **Build-time image and font optimization:** images can be optimized at request time on Cloudflare, but vinext does not yet reproduce Next.js's complete build-time image pipeline.
 - **Platform-specific and advanced Next.js behavior:** `preferredRegion` route config is ignored, and `runtime` doesn't choose where a route runs (outside `cacheComponents`, a `runtime = "edge"` App Router page is never ISR-cached, as in Next.js), and some recently introduced or undocumented Next.js behavior may not yet be reproduced.
 
 Run `vinext check` against an existing application before migrating. If a gap is not listed here, check the [open issues](https://github.com/cloudflare/vinext/issues) or file a focused reproduction.
@@ -630,8 +630,8 @@ Every `next/*` import is shimmed to a Vite-compatible implementation.
 | `next/headers`      | ✅  | Async `headers()`, `cookies()`, `draftMode()`                                                                                          |
 | `next/dynamic`      | ✅  | `ssr: true`, `ssr: false`, `loading` component                                                                                         |
 | `next/script`       | ✅  | All 4 strategies (`beforeInteractive`, `afterInteractive`, `lazyOnload`, `worker`)                                                     |
-| `next/font/google`  | 🟡  | Runtime CDN loading. No self-hosting, font subsetting, or fallback metrics                                                             |
-| `next/font/local`   | 🟡  | Runtime `@font-face` injection. Not extracted at build time                                                                            |
+| `next/font/google`  | ✅  | Self-hosted at build time with subset-filtered preloads and fallback metrics. Options the build can't read fall back to the CDN        |
+| `next/font/local`   | 🟡  | `@font-face` and fallback metrics extracted at build time. Alias, absolute, or dynamic `src` falls back to runtime injection           |
 | `next/og`           | ✅  | OG image generation via `@vercel/og` (Satori + resvg)                                                                                  |
 | `next/cache`        | ✅  | `revalidateTag`, `revalidatePath`, `unstable_cache`, pluggable `CacheHandler`, `"use cache"` with `cacheLife()` and `cacheTag()`       |
 | `next/form`         | ✅  | GET form interception + POST server action delegation                                                                                  |

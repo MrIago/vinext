@@ -17,27 +17,16 @@
  */
 import { fnv1a64 } from "../utils/hash.js";
 import {
-  escapeCSSString,
+  addFontStylesheet,
   formatFontClassRule,
+  generateLocalFontFaceCSS,
   getFontMimeType,
   resolveSingleFaceStyle,
   sanitizeCSSVarName,
   sanitizeFallback,
-  sanitizeFontDescriptorValue,
   type FontStyle,
+  type LocalFontSrc,
 } from "./font-utils.js";
-
-/**
- * Validate a CSS property name for use in declarations.
- *
- * Only allows standard CSS property names (lowercase letters and hyphens)
- * and custom properties (--prefixed). Rejects anything that could inject
- * CSS rules via crafted property names.
- */
-function sanitizeCSSProperty(prop: string): string | undefined {
-  if (/^(--)?[a-zA-Z][a-zA-Z0-9-]*$/.test(prop)) return prop;
-  return undefined;
-}
 
 function sanitizeInternalFontFamily(name: unknown): string | undefined {
   if (typeof name !== "string" || name.length === 0) return undefined;
@@ -74,12 +63,6 @@ const _g = globalThis as _FontLocalGlobal;
 
 const injectedFonts = (_g[_INJECTED_FONTS_KEY] ??= new Set<string>());
 
-type LocalFontSrc = {
-  path: string;
-  weight?: string;
-  style?: string;
-};
-
 type CssVariable = `--${string}`;
 
 type LocalFontOptions<T extends CssVariable | undefined = CssVariable | undefined> = {
@@ -95,6 +78,8 @@ type LocalFontOptions<T extends CssVariable | undefined = CssVariable | undefine
   _vinext?: {
     font?: {
       family?: unknown;
+      adjustedFallbackCSS?: unknown;
+      stylesheet?: unknown;
     };
   };
 };
@@ -107,58 +92,6 @@ type FontResult = {
 
 type NextFont = Omit<FontResult, "variable"> & { variable?: undefined };
 type NextFontWithVariable = Omit<NextFont, "variable"> & { variable: string };
-
-function generateFontFaceCSS(
-  family: string,
-  options: LocalFontOptions,
-  sources: LocalFontSrc[],
-): string {
-  const display = options.display ?? "swap";
-  const rules: string[] = [];
-
-  for (const src of sources) {
-    // Do not invent a default weight when neither level specifies one. The
-    // @font-face descriptor defaults to `auto`; emitting `400` instead clamps
-    // a variable font's `wght` axis. Next.js likewise omits it in this case.
-    const configuredWeight = src.weight ?? options.weight;
-    const weight =
-      configuredWeight === undefined
-        ? undefined
-        : (sanitizeFontDescriptorValue(configuredWeight) ?? "400");
-    const style = sanitizeFontDescriptorValue(src.style ?? options.style ?? "normal") ?? "normal";
-    const format = src.path.endsWith(".woff2")
-      ? "woff2"
-      : src.path.endsWith(".woff")
-        ? "woff"
-        : src.path.endsWith(".ttf")
-          ? "truetype"
-          : src.path.endsWith(".otf")
-            ? "opentype"
-            : "woff2";
-
-    rules.push(`@font-face {
-  font-family: '${escapeCSSString(family)}';
-  src: url('${escapeCSSString(src.path)}') format('${format}');
-${weight === undefined ? "" : `  font-weight: ${weight};\n`}  font-style: ${style};
-  font-display: ${display};
-}`);
-  }
-
-  // Add extra declarations if provided — sanitize prop/value to prevent injection
-  if (options.declarations) {
-    for (const decl of options.declarations) {
-      const safeProp = sanitizeCSSProperty(decl.prop);
-      const safeValue = sanitizeFontDescriptorValue(decl.value);
-      if (safeProp && safeValue) {
-        rules.push(
-          `@font-face { font-family: '${escapeCSSString(family)}'; ${safeProp}: ${safeValue}; }`,
-        );
-      }
-    }
-  }
-
-  return rules.join("\n");
-}
 
 // SSR: collect font styles for injection in <head>
 const ssrFontStyles = (_g[_SSR_FONT_STYLES_KEY] ??= []);
@@ -301,10 +234,12 @@ function createLocalFontIdentity(
   options: LocalFontOptions,
   sources: LocalFontSrc[],
   internalFamily: string | undefined,
+  adjustedFallbackCSS: string | undefined,
 ): string {
   return fnv1a64(
     JSON.stringify([
       internalFamily ?? "",
+      adjustedFallbackCSS ?? "",
       sources.map((source) => [source.path, source.weight ?? "", source.style ?? ""]),
       options.display ?? "swap",
       options.weight ?? "",
@@ -341,13 +276,27 @@ function localFont<T extends CssVariable | undefined = undefined>(
 function localFont(options: LocalFontOptions): FontResult {
   const sources = normalizeSources(options);
   const internalFamily = sanitizeInternalFontFamily(options._vinext?.font?.family);
-  const id = createLocalFontIdentity(options, sources, internalFamily);
+  // The vinext:local-fonts transform builds the adjusted fallback face for the
+  // transform-provided family (`'<family> Fallback'`, like Next.js), so it only
+  // applies alongside that family.
+  const internalFallbackCSS = options._vinext?.font?.adjustedFallbackCSS;
+  const adjustedFallbackCSS =
+    internalFamily &&
+    options.adjustFontFallback !== false &&
+    typeof internalFallbackCSS === "string"
+      ? internalFallbackCSS
+      : undefined;
+  const id = createLocalFontIdentity(options, sources, internalFamily, adjustedFallbackCSS);
   const singleSource = sources.length === 1 ? sources[0] : undefined;
   const family = internalFamily ?? `__local_font_${id}`;
   const className = `__font_local_${id}`;
   const fallback = options.fallback ?? ["sans-serif"];
   // Sanitize each fallback name to prevent CSS injection via crafted values
-  const fontFamily = `'${family}', ${fallback.map(sanitizeFallback).join(", ")}`;
+  const fontFamily = [
+    `'${family}'`,
+    ...(adjustedFallbackCSS ? [`'${family} Fallback'`] : []),
+    ...fallback.map(sanitizeFallback),
+  ].join(", ");
   // Validate CSS variable name — reject anything that could inject CSS
   const cssVarName = options.variable ? sanitizeCSSVarName(options.variable) : undefined;
   // In Next.js, `variable` returns a CLASS NAME that sets the CSS variable.
@@ -364,11 +313,19 @@ function localFont(options: LocalFontOptions): FontResult {
   // Collect font URLs for preload <link> tags (SSR only)
   collectFontPreloads(sources);
 
-  // Inject @font-face declarations
-  const css = generateFontFaceCSS(family, options, sources);
-  // The exposed family can repeat across modules; the generated class stays
-  // unique for each localFont call and is the correct injection identity.
-  injectFontFaceCSS(css, className);
+  // The vinext:local-fonts transform extracts the @font-face rules and the
+  // adjusted fallback face into a stylesheet at build time, as Next.js does;
+  // link it. Otherwise (options it could not analyze) inject them here.
+  const stylesheet = options._vinext?.font?.stylesheet;
+  if (internalFamily && typeof stylesheet === "string" && stylesheet.length > 0) {
+    addFontStylesheet(stylesheet);
+  } else {
+    const fontFaceCSS = generateLocalFontFaceCSS(family, options, sources);
+    const css = adjustedFallbackCSS ? `${fontFaceCSS}\n${adjustedFallbackCSS}` : fontFaceCSS;
+    // The exposed family can repeat across modules; the generated class stays
+    // unique for each localFont call and is the correct injection identity.
+    injectFontFaceCSS(css, className);
+  }
 
   // Inject the className -> font-family CSS rule
   injectClassNameRule(className, style);

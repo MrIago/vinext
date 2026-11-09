@@ -12,6 +12,8 @@ packages:
   - examples/*
   - tests/fixtures/*
   - "!tests/fixtures/global-not-found-not-present"
+  # Builds against the repo's node_modules (symlinked by its test); no deps.
+  - "!tests/fixtures/font-google-subsets"
   # Declares the React pins vinext init upgrades; never installed.
   - "!tests/fixtures/init-react-upgrade"
   - tests/fixtures/ecosystem/*

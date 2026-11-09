@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import localFont from "next/font/local";
+import { declaredFont } from "./fonts";
 
 const localSans = localFont({
   src: [
@@ -34,7 +35,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} ${localSans.variable} ${localSans.className} h-full antialiased`}
+      className={`${geistSans.variable} ${geistMono.variable} ${localSans.variable} ${localSans.className} ${declaredFont.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">{children}</body>
     </html>
