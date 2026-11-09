@@ -65,6 +65,25 @@ export function getStaticShellPrefetchStage(
   }
 }
 
+/** The render mode a Cache Components shell prefetch to `stage` asks for. */
+export function getStaticShellPrefetchRenderMode(
+  stage: "shell" | "prefetch" | "navigation" | undefined,
+): AppRscRenderMode {
+  switch (stage) {
+    case "shell":
+      return APP_RSC_RENDER_MODE_PREFETCH_APP_SHELL;
+    case "prefetch":
+      return APP_RSC_RENDER_MODE_PREFETCH_PARTIAL;
+    case "navigation":
+      return APP_RSC_RENDER_MODE_PREFETCH_PARTIAL_NAVIGATION;
+    case undefined:
+      return APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL;
+    default:
+      stage satisfies never;
+      return APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL;
+  }
+}
+
 /** Whether the mode asks for a Cache Components shell: static, App Shell or partial. */
 export function isStaticShellPrefetchRenderMode(mode: AppRscRenderMode | undefined): boolean {
   return mode !== undefined && getStaticShellPrefetchStage(mode) !== undefined;

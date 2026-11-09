@@ -69,6 +69,12 @@ export type AppRoutePrefetchPolicy = {
    * shows it while the page renders.
    */
   staticShell?: true;
+  /**
+   * With `staticShell`, how far a Partial Prefetching route's prefetch goes:
+   * its App Shell, or its prefetch rendered for the request up to the
+   * prefetch or navigation stage. Unset for the static shell.
+   */
+  prefetchStage?: "shell" | "prefetch" | "navigation";
 };
 
 function toSameOriginRouteHref(href: string): string | null {
@@ -251,7 +257,59 @@ export function resolveAutoAppRoutePrefetch(
     ...(requiresRouteTreePrefetch ? { requiresRouteTreePrefetch: true } : {}),
     shouldPrefetch: true,
     ...(staticShell ? { staticShell: true } : {}),
+    // Like Next.js with Partial Prefetching, a link's automatic prefetch gets
+    // only the App Shell (vercel/next.js#94510).
+    ...(staticShell && route.partialPrefetching === true
+      ? { prefetchStage: "shell" as const }
+      : {}),
   };
+}
+
+/**
+ * A prefetch past the shell stage (`<Link prefetch={true}>`,
+ * `prefetch="navigation"`, `router.prefetch(href, { kind: "full" })`) of a
+ * route that opts into Partial Prefetching. Like Next.js's segment cache
+ * scheduler, it's never a legacy full prefetch with the page's dynamic data:
+ * the server renders the page for the request up to `stage`, leaving dynamic
+ * data at its Suspense fallbacks, and a navigation shows it while the rest
+ * renders. Null when the route doesn't opt in, or has no such prefetch here.
+ */
+export function resolvePartialAppRoutePrefetch(
+  href: string,
+  interceptionContext: string | null,
+  stage: "prefetch" | "navigation",
+): AppRoutePrefetchPolicy | null {
+  if (
+    typeof window === "undefined" ||
+    interceptionContext !== null ||
+    process.env.NODE_ENV !== "production" ||
+    String(process.env.__NEXT_CACHE_COMPONENTS) !== "true"
+  ) {
+    return null;
+  }
+  if (!isPartialPrefetchingAppRoute(href)) return null;
+  return {
+    cacheForNavigation: false,
+    dynamicStaleTime: "ignore",
+    fallbackTtl: "static",
+    prefetchShellFirst: true,
+    shouldPrefetch: true,
+    staticShell: true,
+    prefetchStage: stage,
+  };
+}
+
+/** Whether the href's route opts into Partial Prefetching. */
+export function isPartialPrefetchingAppRoute(href: string): boolean {
+  if (typeof window === "undefined") return false;
+  const routes = window.__VINEXT_LINK_PREFETCH_ROUTES__;
+  if (!routes) return false;
+  const routeHref = toSameOriginRouteHref(href);
+  if (routeHref === null) return false;
+  return (
+    matchRouteWithTrie(routeHref, routes, linkPrefetchRouteTrieCache)?.route.partialPrefetching ===
+    true
+  );
 }
 
 /**

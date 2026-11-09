@@ -81,7 +81,8 @@ import { BailoutToCSRError as NavigationBailoutToCSRError } from "./navigation-e
 import {
   APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
   APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
-  APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL,
+  getStaticShellPrefetchRenderMode,
+  isStaticShellPrefetchRenderMode,
   VINEXT_STATIC_SHELL_HEADER,
   VINEXT_VARY_PARAMS_HEADER,
   type AppRscRenderMode,
@@ -456,7 +457,7 @@ export function createAppPrefetchRequestHeaders(options: {
     includePrefetchHeader: options.prefetchKind !== "full",
     prefetchRouterState,
   });
-  if (options.renderMode === APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL) {
+  if (isStaticShellPrefetchRenderMode(options.renderMode)) {
     omitStaticShellRouterStateHeaders(headers);
   }
   return headers;
@@ -3518,7 +3519,12 @@ const _appRouter: AppRouterInstance = {
       // Dynamic import keeps the policy module and its route-trie
       // dependencies off the startup path of every next/navigation consumer.
       const [
-        { hasAppRouteInstantConfig, resolveAutoAppRoutePrefetch, resolveFullAppRoutePrefetch },
+        {
+          hasAppRouteInstantConfig,
+          resolveAutoAppRoutePrefetch,
+          resolveFullAppRoutePrefetch,
+          resolvePartialAppRoutePrefetch,
+        },
         { resolveAppPrefetchRscRequest },
         { createVaryingStaticShellResolver },
       ] = await Promise.all([
@@ -3534,15 +3540,26 @@ const _appRouter: AppRouterInstance = {
       // Prefetching. "shell" is an alias for "auto".
       const requestsFull =
         options?.kind === "full" || options?.kind === "prefetch" || options?.kind === "navigation";
+      // A route that opts into Partial Prefetching is never prefetched in
+      // full: it's prefetched like the shell, up to the stage asked for.
+      const partialPolicy = requestsFull
+        ? resolvePartialAppRoutePrefetch(
+            rewrittenPrefetchHref ?? fullHref,
+            interceptionContext,
+            options?.kind === "navigation" ? "navigation" : "prefetch",
+          )
+        : null;
       const kind =
+        partialPolicy === null &&
         requestsFull &&
         !hasAppRouteInstantConfig(rewrittenPrefetchHref ?? fullHref, interceptionContext)
           ? "full"
           : "auto";
       const policy =
-        kind === "full"
+        partialPolicy ??
+        (kind === "full"
           ? resolveFullAppRoutePrefetch()
-          : resolveAutoAppRoutePrefetch(rewrittenPrefetchHref ?? fullHref, interceptionContext);
+          : resolveAutoAppRoutePrefetch(rewrittenPrefetchHref ?? fullHref, interceptionContext));
       const reusable = policy.shouldPrefetch && policy.cacheForNavigation;
       const requiresRouteTreePrefetch = policy.requiresRouteTreePrefetch === true;
       // The call-time header snapshot defaults to AUTO/learning semantics.
@@ -3565,7 +3582,7 @@ const _appRouter: AppRouterInstance = {
         headers.set(
           VINEXT_RSC_RENDER_MODE_HEADER,
           policy.staticShell === true
-            ? APP_RSC_RENDER_MODE_PREFETCH_STATIC_SHELL
+            ? getStaticShellPrefetchRenderMode(policy.prefetchStage)
             : hasSearchParams && policy.rendersDynamically !== true
               ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
               : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
