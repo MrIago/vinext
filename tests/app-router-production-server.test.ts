@@ -1732,6 +1732,28 @@ describe("App Router Production server (startProdServer)", () => {
       expect(html).toContain('id="layout"');
     });
 
+    // An RSC miss stores the payload with the status too. Like Next.js, an RSC
+    // request for a redirect is a 200 whose payload carries it.
+    it.each([
+      ["rsc-not-found", 404, null],
+      ["rsc-forbidden", 403, null],
+      ["rsc-redirect", 200, "/"],
+    ])("%s: the cached RSC entry answers with %i", async (kind, status, location) => {
+      const pathname = `/nextjs-compat/isr-http-status-codes/${kind}`;
+      const first = await fetchRsc(baseUrl, pathname, { redirect: "manual" });
+      expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+      await first.arrayBuffer();
+
+      let cached!: Response;
+      await waitForCondition(async () => {
+        cached = await fetchRsc(baseUrl, pathname, { redirect: "manual" });
+        return cached.headers.get("x-vinext-cache") === "HIT";
+      });
+      expect(cached.status).toBe(status);
+      expect(cached.headers.get("location")).toBe(location);
+      await cached.arrayBuffer();
+    });
+
     it("a page without an error is still a 200", async () => {
       const pathname = "/nextjs-compat/isr-http-status-codes/none";
       await (await fetch(`${baseUrl}${pathname}`)).text();

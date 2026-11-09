@@ -13,7 +13,8 @@ export function generateStaticParams() {
 
 async function HTTPError({ kind }: { kind: string }) {
   await new Promise((resolve) => setTimeout(resolve, 10));
-  switch (kind) {
+  // An `rsc-` kind is first requested as RSC, so it gets its own entry.
+  switch (kind.replace(/^rsc-/, "")) {
     case "not-found":
       return notFound();
     case "forbidden":

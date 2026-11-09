@@ -1011,6 +1011,7 @@ async function renderAppPageLifecycleImpl(
             : {}),
           getCapturedSpecialError: rscErrorTracker.getCapturedSpecialError,
           getCapturedSpecialErrors: rscErrorTracker.getCapturedSpecialErrors,
+          getAllCapturedSpecialErrors: rscErrorTracker.getAllCapturedSpecialErrors,
           isForceStatic: options.isForceStatic,
           loadSsrHandler: options.loadSsrHandler,
           navigationContext: options.getNavigationContext(),
