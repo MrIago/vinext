@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -34113,6 +34113,42 @@ describe("vinext shim package-subpath resolution", () => {
     expect(
       hook.handler.call({}, "\0@vercel/og", path.join(FIXTURE_DIR, "app/opengraph-image.tsx")),
     ).toBe(expectedOgShim);
+  });
+
+  // Next.js warns once when a Server Component imports next/head, which
+  // renders nothing in the App Router.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/webpack/loaders/next-flight-loader/index.ts
+  it("warns once when a Server Component imports next/head", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "vinext-next-head-rsc-"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const plugins = vinext() as Plugin[];
+      const configPlugin = plugins.find((plugin) => plugin.name === "vinext:config");
+      const configHook = configPlugin?.config;
+      const configHandler = typeof configHook === "function" ? configHook : configHook?.handler;
+      await mkdir(path.join(root, "app"));
+      await configHandler?.call({} as never, { root }, { command: "serve", mode: "development" });
+      const headPlugin = plugins.find(
+        (plugin) => plugin.name === "vinext:next-head-in-server-component",
+      );
+      const transform = headPlugin?.transform as { handler: (code: string, id: string) => void };
+      const serverComponent = 'import Head from "next/head";\nexport default () => null;';
+      const clientComponent = `"use client";\n${serverComponent}`;
+
+      transform.handler.call({ environment: { name: "ssr" } }, serverComponent, "/app/a.tsx");
+      transform.handler.call({ environment: { name: "rsc" } }, clientComponent, "/app/b.tsx");
+      expect(warn).not.toHaveBeenCalled();
+
+      transform.handler.call({ environment: { name: "rsc" } }, serverComponent, "/app/c.tsx");
+      transform.handler.call({ environment: { name: "rsc" } }, serverComponent, "/app/d.tsx");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("You're using `next/head` inside the `app` directory"),
+      );
+    } finally {
+      warn.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

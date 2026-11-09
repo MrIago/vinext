@@ -1676,6 +1676,13 @@ for (const [specifier, definition] of Object.entries(_publicNextShimMap)) {
 }
 _reactServerShims.set("next/dist/client/components/navigation", "navigation");
 
+// Next.js warns once per process when a Server Component imports next/head.
+let _warnedNextHeadInServerComponent = false;
+const NEXT_HEAD_IN_SERVER_COMPONENT_WARNING =
+  "Warning: You're using `next/head` inside the `app` directory, please migrate to the Metadata API. See https://nextjs.org/docs/app/building-your-application/upgrading/app-router-migration#step-3-migrating-nexthead for more details.";
+const NEXT_HEAD_IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(?\s*)["']next\/head(?:\.js)?["']/;
+const USE_CLIENT_DIRECTIVE_RE = /^(?:\s|\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)*["']use client["']/;
+
 const clientManualChunks = createClientManualChunks(_shimsDir);
 const clientCodeSplittingConfig = createClientCodeSplittingConfig(clientManualChunks);
 const appClientManualChunks = createClientManualChunks(_shimsDir, true);
@@ -6019,6 +6026,25 @@ export const loadServerActionClient = ${
         // Respect any explicit user/plugin minify choice (including `false`).
         if (config.build?.minify !== undefined) return null;
         return { build: { minify: true } };
+      },
+    },
+    // Builds on #4610: next/head renders nothing in the App Router, and
+    // Next.js also warns once when a Server Component imports it
+    // (next-flight-loader/index.ts). Only the App Router compiles modules in
+    // the rsc environment; a Pages-only Workers build also names its server
+    // environment "rsc", so it is skipped there.
+    {
+      name: "vinext:next-head-in-server-component",
+      transform: {
+        filter: { id: { exclude: /\/node_modules\// }, code: /["']next\/head(?:\.js)?["']/ },
+        handler(code) {
+          if (_warnedNextHeadInServerComponent || !hasAppDir) return;
+          if (this.environment?.name !== "rsc") return;
+          if (USE_CLIENT_DIRECTIVE_RE.test(code)) return;
+          if (!NEXT_HEAD_IMPORT_RE.test(code)) return;
+          _warnedNextHeadInServerComponent = true;
+          console.warn(NEXT_HEAD_IN_SERVER_COMPONENT_WARNING);
+        },
       },
     },
     {
