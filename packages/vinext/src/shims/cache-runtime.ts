@@ -595,15 +595,32 @@ function isServableCacheState(cacheState: string | undefined): boolean {
 // Like Next.js, the background regeneration feeds neither its cache life nor its tags (its
 // own or its fetches') back into the request, or an enclosing cache, that served the stale
 // value.
-function regenerateInBackground(id: string, regenerate: () => Promise<unknown>): void {
-  const regeneration = runWithDetachedCacheObservations(() =>
+//
+// Like Next.js (`backgroundRevalidations` in use-cache-wrapper.ts), one regeneration runs per
+// lookup key at a time. It stays registered until its handler write settles, so a request that
+// reads the stale entry meanwhile serves it without regenerating again.
+const backgroundRegenerations = new Map<string, Promise<void>>();
+
+function regenerateInBackground(
+  id: string,
+  cacheKey: string,
+  regenerate: () => Promise<unknown>,
+): void {
+  const regeneration: Promise<void> = runWithDetachedCacheObservations(() =>
     runWithDetachedFetchObservations(() => cacheContextStorage.exit(regenerate)),
-  ).then(
-    () => undefined,
-    (error: unknown) => {
-      console.error(`[vinext] use cache: background regeneration failed for ${id}:`, error);
-    },
-  );
+  )
+    .then(
+      () => undefined,
+      (error: unknown) => {
+        console.error(`[vinext] use cache: background regeneration failed for ${id}:`, error);
+      },
+    )
+    .finally(() => {
+      if (backgroundRegenerations.get(cacheKey) === regeneration) {
+        backgroundRegenerations.delete(cacheKey);
+      }
+    });
+  backgroundRegenerations.set(cacheKey, regeneration);
   if (isInsideUnifiedScope()) getRequestContext().executionContext?.waitUntil(regeneration);
 }
 
@@ -869,6 +886,9 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
       // (`res.revalidate()`) ignores the existing entry but still executes and
       // stores the fresh result below.
       let existing: CacheHandlerValue | null = null;
+      // Recorded before the read: a regeneration observed here may finish and unregister
+      // while a slow read is still returning the entry it is replacing.
+      let observedRegeneration = backgroundRegenerations.get(cacheKey);
       if (!_hasPendingRevalidatedTag(softTags) && !_isOnDemandRevalidate()) {
         try {
           existing = await handler.get(cacheKey, { kind: "FETCH", softTags });
@@ -890,6 +910,7 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
         const combinedNames = addKnownRootParamNames(id, redirectNames);
         cacheKey = coarseCacheKey + computeRootParamsCacheKeySuffix(rootParams, combinedNames);
         if (existing?.cacheState) staleRedirect = existing;
+        observedRegeneration = backgroundRegenerations.get(cacheKey);
         try {
           existing = await handler.get(cacheKey, { kind: "FETCH", softTags });
         } catch (error) {
@@ -1068,9 +1089,13 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
             { preserveServerReferences: true },
           );
           recordRequestScopedCacheControl(existing.cacheControl);
-          if (existing.cacheState === "stale") {
+          if (
+            existing.cacheState === "stale" &&
+            observedRegeneration === undefined &&
+            !backgroundRegenerations.has(cacheKey)
+          ) {
             const staleEntry = existing;
-            regenerateInBackground(id, () => generate(false, staleEntry));
+            regenerateInBackground(id, cacheKey, () => generate(false, staleEntry));
           }
           return result;
         } catch {

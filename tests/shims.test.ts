@@ -8034,6 +8034,61 @@ describe('"use cache" runtime', () => {
     }
   });
 
+  // Ported from Next.js test/e2e/app-dir/use-cache-swr/use-cache-swr.test.ts:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache-swr/use-cache-swr.test.ts
+  // Requests that read a stale entry while its background regeneration (and its write)
+  // is in flight get the stale value without starting another regeneration.
+  it("deduplicates background regenerations of a stale cached value", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { cacheLife, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+    let releaseWrite: (() => void) | undefined;
+    class SlowWriteHandler extends MemoryCacheHandler {
+      override async set(...args: Parameters<InstanceType<typeof MemoryCacheHandler>["set"]>) {
+        if (callCount > 1) await new Promise<void>((resolve) => (releaseWrite = resolve));
+        return super.set(...args);
+      }
+    }
+    setCacheHandler(new SlowWriteHandler());
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let callCount = 0;
+    try {
+      const cached = registerCachedFunction(async () => {
+        cacheLife({ revalidate: 1, expire: 60 });
+        return ++callCount;
+      }, "test:stale-background-dedupe");
+      const waitUntil: Promise<unknown>[] = [];
+      const request = () =>
+        runWithRequestContext(
+          createRequestContext({
+            unstableCacheRevalidation: "background",
+            executionContext: { waitUntil: (promise) => waitUntil.push(promise) },
+          }),
+          () => cached(),
+        );
+
+      await expect(request()).resolves.toBe(1);
+      await Promise.all(waitUntil);
+      waitUntil.length = 0;
+      vi.advanceTimersByTime(1_500);
+      await expect(request()).resolves.toBe(1);
+      // The regeneration ran, and its write is still pending.
+      await vi.waitFor(() => expect(releaseWrite).toBeDefined());
+      await expect(request()).resolves.toBe(1);
+      await expect(request()).resolves.toBe(1);
+      expect(callCount).toBe(2);
+      releaseWrite!();
+      await Promise.all(waitUntil);
+      await expect(request()).resolves.toBe(2);
+      expect(callCount).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     // ISR regeneration runs with the foreground mode.
     ["an ISR regeneration", "foreground", undefined],
