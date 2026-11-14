@@ -105,6 +105,19 @@ function scheduleRevalidation(promise: Promise<void>): undefined {
 // Public API — what app code imports from 'next/cache'
 // ---------------------------------------------------------------------------
 
+// Next.js rejects revalidation inside `generateStaticParams`, also from a
+// cached function the generator calls.
+function throwIfGeneratingStaticParams(expression: string): void {
+  if (!isInsideUnifiedScope()) return;
+  const route = getRequestContext().headersContext?.staticParamsRoute;
+  if (route === undefined) return;
+  throw new Error(
+    `Route ${route} used "${expression}" inside \`generateStaticParams\` which is unsupported. ` +
+      "To ensure revalidation is performed consistently it must always happen outside of renders and cached functions. " +
+      "See more info here: https://nextjs.org/docs/app/building-your-application/rendering/static-and-dynamic#dynamic-rendering",
+  );
+}
+
 /**
  * Revalidate cached data associated with a specific cache tag.
  *
@@ -119,6 +132,7 @@ function scheduleRevalidation(promise: Promise<void>): undefined {
  * @param profile - cacheLife profile name (e.g. 'max', 'hours') or inline { expire: number }
  */
 export function revalidateTag(tag: string, profile?: string | { expire?: number }): undefined {
+  throwIfGeneratingStaticParams(`revalidateTag ${tag}`);
   if (isStagedCacheabilityProbeActive()) {
     _markDynamic();
     return undefined;
@@ -189,6 +203,7 @@ async function invalidateDataCacheTag(
  * layout/page hierarchy tags, so only no-type invalidation applies there.
  */
 export function revalidatePath(path: string, type?: "page" | "layout"): undefined {
+  throwIfGeneratingStaticParams(`revalidatePath ${path}`);
   if (isStagedCacheabilityProbeActive()) {
     _markDynamic();
     return undefined;
@@ -746,6 +761,7 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
   tags: string[],
   revalidateSeconds: number | false | undefined,
   staleEntry: CacheHandlerValue | undefined,
+  cacheRead: object,
   deferWrite: boolean,
   // A background revalidation writes only to the cache handler: the render's
   // resume data cache keeps the stale value it served.
@@ -785,7 +801,9 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
         fetchCache: true,
         tags,
         revalidate: revalidateSeconds,
-        // The stale entry this write refreshes, so a handler can tell a refresh from a write.
+        // The token its read was passed, and the stale entry it found, so a handler can
+        // tell a fill of what that read missed, or a refresh, from a write.
+        cacheRead,
         ...(staleEntry ? { staleEntry } : {}),
       }),
     );
@@ -871,6 +889,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
         return resumed.value;
       }
     }
+    const cacheRead = {};
     // Like Next.js, an unstable_cache nested in another's callback skips the
     // read and reruns, so regenerating the outer entry also refreshes what it
     // calls, and so does an on-demand revalidation (`res.revalidate()`). The
@@ -886,6 +905,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
             kind: "FETCH",
             tags,
             softTags,
+            cacheRead,
           });
       if (existing?.value && existing.value.kind === "FETCH") {
         const cached = tryDeserializeUnstableCacheResult(existing.value.data.body);
@@ -903,6 +923,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
                   tags,
                   revalidateSeconds,
                   staleEntry,
+                  cacheRead,
                   false,
                   false,
                 ),
@@ -936,6 +957,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
       tags,
       revalidateSeconds,
       staleEntry,
+      cacheRead,
       !staleEntry && isInsideWorkStoreScope(),
     );
   };

@@ -736,6 +736,9 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
       if (unstableCacheContextStorage.getStore() === true) {
         throwPrivateUseCacheInsideUnstableCacheError();
       }
+      if (workUnitAsyncStorage.getStore()?.type === "generate-static-params") {
+        throwPrivateUseCacheOutsideRequestError();
+      }
       // Next.js decides that a private cache requires request-time execution at
       // the cache boundary, before key serialization or any private user code.
       const expression = '"use cache: private"';
@@ -1015,9 +1018,12 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
       // Recorded before the read: a regeneration observed here may finish and unregister
       // while a slow read is still returning the entry it is replacing.
       let observedRegeneration = backgroundRegenerations.get(cacheKey);
+      // Passed to these reads and the writes below, so a handler can tell a write
+      // filling what a read missed.
+      const cacheRead = {};
       if (!_hasPendingRevalidatedTag(softTags) && !_isOnDemandRevalidate()) {
         try {
-          existing = await handler.get(cacheKey, { kind: "FETCH", softTags });
+          existing = await handler.get(cacheKey, { kind: "FETCH", softTags, cacheRead });
         } catch (error) {
           console.error("[vinext] use cache: handler.get failed; treating as a cache miss:", error);
         }
@@ -1038,7 +1044,7 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
         if (existing?.cacheState) staleRedirect = existing;
         observedRegeneration = backgroundRegenerations.get(cacheKey);
         try {
-          existing = await handler.get(cacheKey, { kind: "FETCH", softTags });
+          existing = await handler.get(cacheKey, { kind: "FETCH", softTags, cacheRead });
         } catch (error) {
           console.error("[vinext] use cache: handler.get failed; treating as a cache miss:", error);
           existing = null;
@@ -1127,6 +1133,7 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
               fetchCache: true,
               tags: ctx.tags,
               timestamp,
+              cacheRead,
               ...(cacheFunctionInvocation ? { cacheFunctionInvocation } : {}),
               cacheControl: {
                 revalidate: revalidateSeconds,
@@ -1333,6 +1340,13 @@ function throwPrivateUseCacheInsidePublicUseCacheError(): never {
 
 function throwPrivateUseCacheInsideUnstableCacheError(): never {
   const error = createUseCachePrivateInsideUnstableCacheError();
+  const ctx = getRequestContext();
+  if (ctx) ctx.invalidDynamicUsageError = error;
+  throw error;
+}
+
+function throwPrivateUseCacheOutsideRequestError(): never {
+  const error = new Error('"use cache: private" cannot be used outside of a request context.');
   const ctx = getRequestContext();
   if (ctx) ctx.invalidDynamicUsageError = error;
   throw error;

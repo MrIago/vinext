@@ -582,16 +582,22 @@ function prefetchUrl(
           isOptimisticRouteShellPrefetch &&
           hasSearchParams &&
           autoPrefetch.staticShell !== true;
-        // A prefetch never renders the page of a route that renders
-        // dynamically, so its search-param href fetches the loading shell.
-        const hasSearchAgnosticShell =
+        // Only the Cache Components dynamic shell renders the page, with empty
+        // search params. Without Cache Components, Next.js's automatic
+        // prefetch never renders a page that may read searchParams
+        // (walkTreeWithFlightRouterState()), and no prefetch renders the page
+        // of a route that renders dynamically. Those hrefs, and one whose
+        // route a search-agnostic shell already covers, fetch the loading
+        // shell.
+        const fetchesDynamicShell =
           isAutomaticSearchParamShell &&
-          (autoPrefetch.rendersDynamically === true ||
-            hasSearchAgnosticPrefetchShellForRoute(
-              await createRscRequestUrl(fullHref, new Headers()),
-              interceptionContext,
-              mountedSlotsHeader,
-            ));
+          String(process.env.__NEXT_CACHE_COMPONENTS) === "true" &&
+          autoPrefetch.rendersDynamically !== true &&
+          !hasSearchAgnosticPrefetchShellForRoute(
+            await createRscRequestUrl(fullHref, new Headers()),
+            interceptionContext,
+            mountedSlotsHeader,
+          );
         const headers = createAppPrefetchRequestHeaders({
           interceptionContext,
           fetchPriority: priority,
@@ -601,11 +607,9 @@ function prefetchUrl(
           renderMode: isOptimisticRouteShellPrefetch
             ? autoPrefetch.staticShell === true
               ? getStaticShellPrefetchRenderMode(autoPrefetch.prefetchStage)
-              : hasSearchAgnosticShell
-                ? APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
-                : isAutomaticSearchParamShell
-                  ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
-                  : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
+              : fetchesDynamicShell
+                ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
+                : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
             : undefined,
         });
         if (mountedSlotsHeader) {
@@ -896,7 +900,7 @@ function prefetchUrl(
               autoPrefetch.cacheForNavigation || autoPrefetch.staticShell === true
                 ? prepareNavigationPrefetchSnapshot
                 : undefined,
-            searchAgnosticShell: isAutomaticSearchParamShell && !hasSearchAgnosticShell,
+            searchAgnosticShell: fetchesDynamicShell,
             ...(autoPrefetch.prefetchStage === undefined
               ? {}
               : { stage: autoPrefetch.prefetchStage }),
@@ -1751,6 +1755,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
         const navEvent: NavigateEvent = {
           url: navUrl,
           preventDefault() {
+            // False positive: https://github.com/oxc-project/oxc/issues/28401
+            // oxlint-disable-next-line react/immutability -- This flag is local to each click.
             prevented = true;
           },
           get defaultPrevented() {

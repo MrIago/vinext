@@ -1,10 +1,10 @@
 import fs from "node:fs";
-import MagicString from "magic-string";
 import type { RscPluginManager } from "@vitejs/plugin-rsc";
 import path from "pathslash";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import type { AppRoute } from "../routing/app-route-graph.js";
 import { safeJsonStringify } from "../server/html.js";
+import { rewriteOutputRootExternals } from "../build/output-root-externals.js";
 import {
   addClientActionReachability,
   buildActionOwnerManifest,
@@ -12,12 +12,14 @@ import {
   resolveClientReferenceImportIds,
   type ActionOwnerRouteReachability,
 } from "../build/action-owner-manifest.js";
-import { magicStringTransformResult } from "./transform-result.js";
 
 export const ACTION_OWNER_MANIFEST_ID = "virtual:vinext-action-owner-manifest";
 
 const RESOLVED_ACTION_OWNER_MANIFEST_ID = `\0${ACTION_OWNER_MANIFEST_ID}`;
 const ACTION_OWNER_MANIFEST_FILE = "__vinext_action_owner_manifest.js";
+const ACTION_OWNER_MANIFEST_EXTERNALS: ReadonlyMap<string, string> = new Map([
+  [ACTION_OWNER_MANIFEST_ID, ACTION_OWNER_MANIFEST_FILE],
+]);
 
 function getModuleInfo(context: Rollup.PluginContext, id: string) {
   const info = context.getModuleInfo(id);
@@ -92,17 +94,7 @@ export function createActionOwnerManifestPlugin(options: {
       }
     },
     renderChunk(code, chunk) {
-      if (!code.includes(ACTION_OWNER_MANIFEST_ID)) return;
-      let relativePath = path.posix.relative(
-        path.posix.dirname(chunk.fileName),
-        ACTION_OWNER_MANIFEST_FILE,
-      );
-      if (!relativePath.startsWith(".")) relativePath = `./${relativePath}`;
-      // Edit through MagicString so the chunk keeps a sourcemap; returning
-      // bare code from renderChunk makes Rolldown warn SOURCEMAP_BROKEN.
-      const output = new MagicString(code);
-      output.replaceAll(ACTION_OWNER_MANIFEST_ID, relativePath);
-      return magicStringTransformResult(output);
+      return rewriteOutputRootExternals(code, chunk.fileName, ACTION_OWNER_MANIFEST_EXTERNALS);
     },
     buildApp: {
       order: "post",

@@ -2915,11 +2915,18 @@ const _appRouter: AppRouterInstance = {
         headers.set(NEXT_ROUTER_PREFETCH_HEADER, "1");
         headers.set(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER, "1");
         if (policy.staticShell === true) omitStaticShellRouterStateHeaders(headers);
+        // Only the Cache Components dynamic shell renders the page, with empty
+        // search params. Without them, Next.js's automatic prefetch never
+        // renders a page that may read searchParams
+        // (walkTreeWithFlightRouterState()), as for a route that renders
+        // dynamically, so the href fetches the loading shell.
         headers.set(
           VINEXT_RSC_RENDER_MODE_HEADER,
           policy.staticShell === true
             ? getStaticShellPrefetchRenderMode(policy.prefetchStage)
-            : hasSearchParams && policy.rendersDynamically !== true
+            : hasSearchParams &&
+                String(process.env.__NEXT_CACHE_COMPONENTS) === "true" &&
+                policy.rendersDynamically !== true
               ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
               : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
         );

@@ -10,7 +10,7 @@ import {
   _setResumeDataCacheSeed,
 } from "vinext/shims/cache-request-state";
 import { createResumeDataCache } from "vinext/shims/resume-data-cache";
-import type { RootParams } from "vinext/shims/root-params";
+import { setRootParams, type RootParams } from "vinext/shims/root-params";
 import type {
   PprFallbackShellPrefetchStage,
   PprFallbackShellState,
@@ -18,6 +18,7 @@ import type {
 import {
   consumeDynamicUsage,
   consumeInvalidDynamicUsageError,
+  getActiveDraftModeState,
   getAndClearPendingCookies,
   getDraftModeCookieHeader,
   getHeadersContext,
@@ -26,6 +27,7 @@ import {
   peekDynamicUsage,
   peekRenderRequestApiUsage,
   runWithConnectionProbe,
+  runStaticParamsCheckDetached,
   runWithDetachedDynamicUsage,
   setHeadersContext,
 } from "vinext/shims/headers";
@@ -81,7 +83,7 @@ import {
   resolveAppPageGeneratedStaticParams,
   resolveAppPageIntercept,
   resolveAppPageInterceptState,
-  validateAppPageDynamicParams,
+  validateAppPageRouteDynamicParams,
   type ValidateAppPageDynamicParamsOptions,
 } from "./app-page-request.js";
 import { applyIneligibleRouteCachePolicy, renderAppPageLifecycle } from "./app-page-render.js";
@@ -122,6 +124,7 @@ import {
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
 } from "./headers.js";
 import { parseMountedLayoutsHeader } from "./app-mounted-layouts.js";
+import { markRouteMissResponse } from "./route-miss-response.js";
 import { buildAppPageTags } from "./implicit-tags.js";
 import { resolveAppPageTraceOperation } from "./app-page-tracing.js";
 import {
@@ -517,6 +520,11 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
    * has a transient gap. Falls through to a fresh render instead.
    */
   renderedConcreteUrlPaths?: ReadonlySet<string>;
+  /**
+   * Called on a dynamicParams = false miss. When it returns true, routing
+   * resumes with the fallback rewrites, so the miss renders no 404.
+   */
+  resumeRoutingAfterMiss?: () => boolean;
   skipStaticParamsValidation?: boolean;
   staticParamsValidationParams?: AppPageParams;
   rootParams?: RootParams;
@@ -542,6 +550,8 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
       matchedParams: AppPageParams;
       /** The route's render threw the signal, so the document keeps the route's head. */
       routeHead?: AppPageFallbackRouteHead;
+      /** Render the root not-found as if no route matched, as Next.js routing does. */
+      routeMiss?: boolean;
     },
     middlewareContext: AppPageMiddlewareContext | null,
   ) => Promise<Response | null>;
@@ -1375,7 +1385,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   const placeGeneratedMetadataInBody =
     (!isPrerender || options.pprFallbackShell !== undefined) && serveStreamingMetadata;
   const isPrefetchDynamicShell = options.renderMode === APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL;
-  const isDraftMode = isDraftModeRequest(options.request, options.draftModeSecret);
+  // Middleware can enable or disable draft mode for this request.
+  const isDraftMode =
+    getActiveDraftModeState() ?? isDraftModeRequest(options.request, options.draftModeSecret);
   const requestHeadersContext = getHeadersContext();
   const shouldUseEmptySearchParams = isForceStatic || isPrefetchDynamicShell;
   const hasRequestSearchParams =
@@ -1877,32 +1889,80 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     }
   }
 
-  // Next.js' production force-dynamic routes are absent from the prerender
-  // manifest, so they never enter its generated-path fallback gate. Dev still
-  // resolves and exact-matches generateStaticParams for the same route.
+  // Next.js renders an unlisted param on demand in draft mode.
+  // https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/templates/app-page.ts
+  // A parameter matching admission already decided this request's params.
   if (
     paramMatchingAdmission === null &&
     options.skipStaticParamsValidation !== true &&
-    !(options.isProduction && isForceDynamic) &&
-    // Draft Mode renders a path the build didn't generate even under
-    // `dynamicParams = false`, as the Pages fallback gate already does
-    // (vercel/next.js#99370). Its render never reaches the public cache.
     !isDraftMode
   ) {
-    const dynamicParamsResponse = await validateAppPageDynamicParams({
-      enforceStaticParamsOnly: options.dynamicParamsConfig === false,
-      generateStaticParams: options.generateStaticParams,
-      isDynamicRoute: route.isDynamic,
-      params: options.staticParamsValidationParams ?? options.params,
-    });
+    const dynamicParamsResponse = await runStaticParamsCheckDetached(() =>
+      validateAppPageRouteDynamicParams({
+        dynamicConfig,
+        dynamicParamsConfig: options.dynamicParamsConfig,
+        fetchCache: options.fetchCache,
+        routeSegments: route.routeSegments,
+        generateStaticParams: options.generateStaticParams,
+        isDynamicRoute: route.isDynamic,
+        isProduction: options.isProduction,
+        params: options.staticParamsValidationParams ?? options.params,
+      }),
+    );
     if (dynamicParamsResponse) {
-      // A generated-param miss belongs to a matched App route, so render the
-      // route's not-found boundary just like a page-level notFound() signal.
-      // The route's own not-found is the nearest one in its tree; the
-      // manifest's root not-found can belong to another root layout's (issue #4304).
-      return renderGeneratedParamMiss(dynamicParamsResponse, {
-        boundaryModule: route.notFound ?? getDefaultHttpAccessFallbackModule(404),
-      });
+      // Next.js rejects a generated-param miss while routing, so it renders
+      // the root not-found as if no route matched. None of this route's
+      // layouts or generateMetadata may run with the rejected params. The
+      // plain response remains a defensive fallback if boundary rendering is
+      // unavailable.
+      // Undo this route's config too: its fetch defaults, and the static
+      // headers context and search params of force-static / dynamic = "error".
+      const navigationContext = options.getNavigationContext();
+      if (navigationContext) {
+        options.setNavigationContext({
+          ...navigationContext,
+          params: {},
+          searchParams: options.searchParams,
+        });
+      }
+      setRootParams(null);
+      setHeadersContext(requestHeadersContext);
+      setCurrentFetchSoftTags([]);
+      setCurrentFetchCacheMode(null);
+      setCurrentFetchRevalidate(null);
+      setCurrentForceDynamicFetchDefault(false);
+      // Routing discards this response, so it marks nothing for the request.
+      if (options.resumeRoutingAfterMiss?.()) return new Response(null, { status: 404 });
+      const renderedNotFound = await options.renderHttpAccessFallbackPage(
+        404,
+        { matchedParams: {}, routeMiss: true },
+        options.middlewareContext,
+      );
+      const cachePolicy = {
+        dynamicStaleTimeSeconds: options.dynamicStaleTimeSeconds,
+        isDraftMode,
+        isDynamicError,
+        isForceDynamic,
+        isForceStatic,
+        isPrerender,
+        isProduction: options.isProduction,
+        isProgressiveActionRender: options.isProgressiveActionRender === true,
+        isRscRequest: options.isRscRequest,
+        isStaticEligible,
+        middlewareContext: options.middlewareContext,
+        peekDynamicUsage,
+        revalidateSeconds: currentRevalidateSeconds,
+        scriptNonce: options.scriptNonce,
+      };
+      if (renderedNotFound) {
+        return markRouteMissResponse(
+          applyIneligibleRouteCachePolicy(renderedNotFound, cachePolicy),
+        );
+      }
+      options.clearRequestContext();
+      return markRouteMissResponse(
+        applyIneligibleRouteCachePolicy(dynamicParamsResponse, cachePolicy),
+      );
     }
   }
 

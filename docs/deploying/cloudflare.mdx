@@ -102,6 +102,8 @@ The deploy command validates the initialized setup, builds all Vite environments
 
 Projects that still use a Wrangler config (`wrangler.jsonc`, `wrangler.json` or `wrangler.toml`) keep the two choices separate: `--env staging` picks the Wrangler environment `env.staging`, and `--mode staging` picks the Vite mode and the `.env.staging*` files. Without `--mode` the build uses `production`, so `vinext-cloudflare deploy --env staging --mode staging` deploys the staging Worker with staging build-time values.
 
+In CI (`CI=true`), each uploaded Worker version records the latest commit message as its message and the short commit SHA as its tag, matching `cf previews deploy`, so the Cloudflare dashboard identifies the deployment instead of showing "Manually deployed". Override either with `--message <text>` or `--tag <text>`, which also work outside CI, or pass an empty value (`--tag ""`) to omit it. On Wrangler config projects, `wrangler deploy` accepts these annotations from Wrangler 4.66.0. Older versions deploy without the defaults and reject explicit values, except when `--no-promote`, `--warm-cache`, or a staged `--traffic-aware-warm-cache` run uploads through `wrangler versions upload`.
+
 For Response Store service-binding mode, build and deploy the cache Worker explicitly before the first application deployment:
 
 ```sh
@@ -120,15 +122,15 @@ Use `previews deploy` with a project that has `cloudflare.config.ts` and the `cf
 
 <PackageManagerCommand
   commands={{
-    pnpm: "pnpm dlx @vinext/cloudflare previews deploy\npnpm dlx @vinext/cloudflare previews deploy pr-123\npnpm dlx @vinext/cloudflare previews deploy pr-123 --mode staging\npnpm dlx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    npm: "npx @vinext/cloudflare previews deploy\nnpx @vinext/cloudflare previews deploy pr-123\nnpx @vinext/cloudflare previews deploy pr-123 --mode staging\nnpx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    yarn: "yarn dlx @vinext/cloudflare previews deploy\nyarn dlx @vinext/cloudflare previews deploy pr-123\nyarn dlx @vinext/cloudflare previews deploy pr-123 --mode staging\nyarn dlx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    bun: "bunx @vinext/cloudflare previews deploy\nbunx @vinext/cloudflare previews deploy pr-123\nbunx @vinext/cloudflare previews deploy pr-123 --mode staging\nbunx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    vp: "vpx @vinext/cloudflare previews deploy\nvpx @vinext/cloudflare previews deploy pr-123\nvpx @vinext/cloudflare previews deploy pr-123 --mode staging\nvpx @vinext/cloudflare previews deploy pr-123 --skip-build",
+    pnpm: "pnpm dlx @vinext/cloudflare previews deploy\npnpm dlx @vinext/cloudflare previews deploy --preview-name pr-123\npnpm dlx @vinext/cloudflare previews deploy --preview-name pr-123 --mode staging\npnpm dlx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    npm: "npx @vinext/cloudflare previews deploy\nnpx @vinext/cloudflare previews deploy --preview-name pr-123\nnpx @vinext/cloudflare previews deploy --preview-name pr-123 --mode staging\nnpx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    yarn: "yarn dlx @vinext/cloudflare previews deploy\nyarn dlx @vinext/cloudflare previews deploy --preview-name pr-123\nyarn dlx @vinext/cloudflare previews deploy --preview-name pr-123 --mode staging\nyarn dlx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    bun: "bunx @vinext/cloudflare previews deploy\nbunx @vinext/cloudflare previews deploy --preview-name pr-123\nbunx @vinext/cloudflare previews deploy --preview-name pr-123 --mode staging\nbunx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    vp: "vpx @vinext/cloudflare previews deploy\nvpx @vinext/cloudflare previews deploy --preview-name pr-123\nvpx @vinext/cloudflare previews deploy --preview-name pr-123 --mode staging\nvpx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
   }}
 />
 
-The optional name identifies the Preview, not the Worker or the build mode. If you omit it, CF uses the current CI or Git branch. If no branch is available, provide a name.
+The optional `--preview-name` identifies the Preview, not the Worker or the build mode. If you omit it, CF uses the current CI or Git branch. If no branch is available, pass `--preview-name`.
 
 As with `cf previews deploy`, the Preview name and the Vite mode are independent. The build uses the default `production` mode unless you pass `--mode`, and loads the matching `.env*` files. Functions in `cloudflare.config.ts` receive the selected `mode` and `isPreview: true`. The command deploys the Preview Build Output with `cf previews deploy` and prints the Preview URL. Preview deployments do not use cache warming or version promotion.
 
@@ -136,15 +138,15 @@ As with `cf previews deploy`, the Preview name and the Vite mode are independent
 
 <PackageManagerCommand
   commands={{
-    pnpm: "CLOUDFLARE_PREVIEW_BUILD=true pnpm exec vite build\npnpm dlx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    npm: "CLOUDFLARE_PREVIEW_BUILD=true npx vite build\nnpx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    yarn: "CLOUDFLARE_PREVIEW_BUILD=true yarn vite build\nyarn dlx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    bun: "CLOUDFLARE_PREVIEW_BUILD=true bunx vite build\nbunx @vinext/cloudflare previews deploy pr-123 --skip-build",
-    vp: "CLOUDFLARE_PREVIEW_BUILD=true vp build\nvpx @vinext/cloudflare previews deploy pr-123 --skip-build",
+    pnpm: "CLOUDFLARE_PREVIEW_BUILD=true pnpm exec vite build\npnpm dlx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    npm: "CLOUDFLARE_PREVIEW_BUILD=true npx vite build\nnpx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    yarn: "CLOUDFLARE_PREVIEW_BUILD=true yarn vite build\nyarn dlx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    bun: "CLOUDFLARE_PREVIEW_BUILD=true bunx vite build\nbunx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
+    vp: "CLOUDFLARE_PREVIEW_BUILD=true vp build\nvpx @vinext/cloudflare previews deploy --preview-name pr-123 --skip-build",
   }}
 />
 
-The subcommand accepts the optional name, `--mode`, `--skip-build`, `--vite-config`, and `--help`. Configure Preview-specific settings in `cloudflare.config.ts` using `isPreview`.
+The subcommand accepts `--preview-name`, `--mode`, `--skip-build`, `--vite-config`, and `--help`. Configure Preview-specific settings in `cloudflare.config.ts` using `isPreview`.
 
 ### Deploy with Workers Builds
 
