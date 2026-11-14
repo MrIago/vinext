@@ -2463,6 +2463,23 @@ describe("resolveNextConfig cachedNavigations", () => {
   });
 });
 
+describe("resolveNextConfig partialPrefetching", () => {
+  it("defaults partialPrefetching to false", async () => {
+    const resolved = await resolveNextConfig({ cacheComponents: true });
+    expect(resolved.partialPrefetching).toBe(false);
+  });
+
+  it("reads partialPrefetching alongside cacheComponents", async () => {
+    const resolved = await resolveNextConfig({ cacheComponents: true, partialPrefetching: true });
+    expect(resolved.partialPrefetching).toBe(true);
+  });
+
+  it("keeps partialPrefetching off without cacheComponents", async () => {
+    const resolved = await resolveNextConfig({ partialPrefetching: true });
+    expect(resolved.partialPrefetching).toBe(false);
+  });
+});
+
 describe("resolveNextConfig appNavFailHandling", () => {
   it("defaults experimental.appNavFailHandling to false", async () => {
     const resolved = await resolveNextConfig({});
@@ -2836,10 +2853,12 @@ describe("detectNextIntlConfig", () => {
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",
+      distDir: ".next",
       pageExtensions: ["tsx", "ts", "jsx", "js"],
       resolveExtensions: null,
       serverResolveExtensions: null,
       cacheComponents: false,
+      partialPrefetching: false,
       cachedNavigations: false,
       appNavFailHandling: false,
       gestureTransition: false,
@@ -2884,6 +2903,11 @@ describe("detectNextIntlConfig", () => {
       instrumentationClientInject: [],
       instrumentationClientRouteManifest: undefined,
       instrumentationServerValueInjections: {},
+      instrumentationInject: [],
+      strictRouteMatching: true,
+      explicitParallelRouteChildren: true,
+      typedRoutes: false,
+      prepareNavigation: false,
       clientTraceMetadata: undefined,
       staleTimes: { dynamic: 0, static: 300 },
       cacheLife: parseCacheLifeProfiles(undefined),
@@ -3714,7 +3738,7 @@ describe("resolveNextConfig staleTimes (#1490)", () => {
   it("falls back to defaults when staleTimes contains negative values", async () => {
     // Negative values are rejected at resolution time so we don't pass them
     // downstream to `resolvePrefetchCacheTtl`, where they'd be re-validated.
-    // Matches the `seconds < 0` guard in `shims/navigation.ts`.
+    // Matches the `seconds < 0` guard in `shims/app-router-navigation.ts`.
     const resolved = await resolveNextConfig({
       experimental: { staleTimes: { dynamic: -5, static: -1 } },
     });

@@ -15,8 +15,8 @@ All of these resolve automatically to vinext shims. Do not rewrite imports in ap
 | `next/headers`      | Full    |                                                                  |
 | `next/dynamic`      | Full    |                                                                  |
 | `next/script`       | Full    |                                                                  |
-| `next/font/google`  | Partial | CDN-loaded, not self-hosted                                      |
-| `next/font/local`   | Partial | Runtime injection                                                |
+| `next/font/google`  | Full    | Self-hosted at build time                                        |
+| `next/font/local`   | Partial | Extracted at build time for relative `src` paths                 |
 | `next/og`           | Full    | Via @vercel/og                                                   |
 | `next/cache`        | Full    | Pluggable CacheHandler                                           |
 | `next/form`         | Full    |                                                                  |

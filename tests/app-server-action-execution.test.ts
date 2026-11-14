@@ -618,7 +618,7 @@ describe("app server action execution helpers", () => {
         ),
       );
 
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(409);
       expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
       expect(decodeAction).not.toHaveBeenCalled();
       expect(forwardAction).not.toHaveBeenCalled();
@@ -1273,9 +1273,9 @@ describe("app server action execution helpers", () => {
       ),
     );
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(409);
     expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await response.text()).toBe("Server action not found.");
+    expect(await response.text()).toBe("Server Action unavailable.");
     expect(reportedErrors).toEqual([]);
     expect(clearContext).toHaveBeenCalledTimes(1);
   });
@@ -1295,9 +1295,9 @@ describe("app server action execution helpers", () => {
       ),
     );
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(409);
     expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await response.text()).toBe("Server action not found.");
+    expect(await response.text()).toBe("Server Action unavailable.");
   });
 
   it("returns action-not-found for progressive decode misses that include an action id", async () => {
@@ -1313,7 +1313,7 @@ describe("app server action execution helpers", () => {
       ),
     );
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(409);
     expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
   });
 
@@ -1347,9 +1347,9 @@ describe("app server action execution helpers", () => {
         ),
       );
 
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(409);
       expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
-      expect(await response.text()).toBe("Server action not found.");
+      expect(await response.text()).toBe("Server Action unavailable.");
       expect(reportedErrors).toEqual([]);
       expect(clearContext).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledWith(
@@ -3047,9 +3047,9 @@ describe("app server action execution helpers", () => {
       }),
     );
 
-    expect(response?.status).toBe(404);
+    expect(response?.status).toBe(409);
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await response?.text()).toBe("Server action not found.");
+    expect(await response?.text()).toBe("Server Action unavailable.");
     expect(renderToReadableStream).not.toHaveBeenCalled();
     expect(reportRequestError).not.toHaveBeenCalled();
     expect(clearRequestContext).toHaveBeenCalledTimes(1);
@@ -3066,7 +3066,7 @@ describe("app server action execution helpers", () => {
 
     const response = await handleServerActionRscRequest(
       createRscOptions({
-        actionId: "stale-action-id",
+        actionId: "stale-action-id#missing",
         clearRequestContext,
         contentType: "multipart/form-data; boundary=VINEXTDOS",
         decodeReply,
@@ -3079,10 +3079,10 @@ describe("app server action execution helpers", () => {
       }),
     );
 
-    expect(response?.status).toBe(404);
+    expect(response?.status).toBe(409);
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(response?.headers.get("content-type")).toBe("text/plain");
-    expect(await response?.text()).toBe("Server action not found.");
+    expect(await response?.text()).toBe("Server Action unavailable.");
     expect(readFormDataWithLimit).not.toHaveBeenCalled();
     expect(decodeReply).not.toHaveBeenCalled();
     expect(renderToReadableStream).not.toHaveBeenCalled();
@@ -3102,9 +3102,9 @@ describe("app server action execution helpers", () => {
       }),
     );
 
-    expect(response?.status).toBe(404);
+    expect(response?.status).toBe(409);
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await response?.text()).toBe("Server action not found.");
+    expect(await response?.text()).toBe("Server Action unavailable.");
     expect(decodeReply).not.toHaveBeenCalled();
   });
 
@@ -3199,7 +3199,7 @@ describe("app server action execution helpers", () => {
       }),
     );
 
-    expect(response?.status).toBe(404);
+    expect(response?.status).toBe(409);
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(hidden).not.toHaveBeenCalled();
   });
@@ -3272,7 +3272,7 @@ describe("app server action execution helpers", () => {
 
     const response = await handleServerActionRscRequest(
       createRscOptions({
-        actionId: "abc123",
+        actionId: "abc123#missing",
         loadServerAction() {
           return Promise.reject(new Error("server reference not found 'abc123'"));
         },
@@ -3283,10 +3283,10 @@ describe("app server action execution helpers", () => {
       }),
     );
 
-    expect(response?.status).toBe(404);
+    expect(response?.status).toBe(409);
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(response?.headers.get("content-type")).toBe("text/plain");
-    expect(await response?.text()).toBe("Server action not found.");
+    expect(await response?.text()).toBe("Server Action unavailable.");
     expect(reportedErrors).toEqual([]);
     expect(renderToReadableStream).not.toHaveBeenCalled();
   });

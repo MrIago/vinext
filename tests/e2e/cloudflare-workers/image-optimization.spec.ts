@@ -25,7 +25,7 @@ test.describe("Cloudflare Workers /_next/image cache-state headers", () => {
   test("sends no x-nextjs-cache or x-vinext-cache on an error", async ({ request }) => {
     for (const [path, status] of [
       ["/_next/image?url=%2Fvinext-image.png&w=65&q=75", 400],
-      ["/_next/image?url=%2Fmissing.png&w=64&q=75", 400],
+      ["/_next/image?url=%2Fmissing.png&w=64&q=75", 404],
     ] as const) {
       const response = await request.get(path, { maxRedirects: 0 });
       expect(response.status(), path).toBe(status);
@@ -72,11 +72,19 @@ test.describe("Cloudflare Workers /_next/image formats it does not optimize", ()
     });
   }
 
-  test("rejects an SVG source without dangerouslyAllowSVG", async ({ request }) => {
-    const response = await request.get(imagePath("/vinext-logo.svg"), { maxRedirects: 0 });
-    expect(response.status()).toBe(400);
-    expect(await response.text()).toBe('"url" parameter is valid but image type is not allowed');
-    expect(response.headers()["content-type"] ?? "").not.toContain("image/");
-    expect(response.headers()["x-nextjs-cache"]).toBeUndefined();
-  });
+  // Next.js types a source by its bytes, not its name, so an SVG saved under
+  // an image extension or behind a comment is an SVG too. Observed with
+  // `next start` on next@16.4.5.
+  for (const source of ["/vinext-logo.svg", "/vinext-logo-svg.png", "/vinext-logo-svg.avif"]) {
+    test(`rejects the SVG source ${source} without dangerouslyAllowSVG`, async ({ request }) => {
+      const response = await request.get(imagePath(source), {
+        headers: { Accept: "image/avif,image/webp,*/*" },
+        maxRedirects: 0,
+      });
+      expect(response.status()).toBe(400);
+      expect(await response.text()).toBe('"url" parameter is valid but image type is not allowed');
+      expect(response.headers()["content-type"] ?? "").not.toContain("image/");
+      expect(response.headers()["x-nextjs-cache"]).toBeUndefined();
+    });
+  }
 });

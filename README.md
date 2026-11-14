@@ -28,8 +28,7 @@ vinext reimplements the Next.js API surface on Vite rather than consuming `next 
 These are active compatibility areas, not permanent exclusions:
 
 - **Cache Components and Partial Prerendering:** `"use cache"` is partially implemented, but full `cacheComponents` behavior is still incomplete. Cache profiles, tags, partial shells, resume behavior, prefetching, and some dev/build cache semantics do not yet match Next.js in every case.
-- **Build-time image and font optimization:** images can be optimized at request time on Cloudflare, but vinext does not yet reproduce Next.js's complete build-time image pipeline. Google Fonts are loaded from the CDN, and local font CSS is injected at runtime rather than extracted during the build.
-- **Native modules in App Router development:** packages such as `sharp`, `resvg`, `satori`, `lightningcss`, and `@napi-rs/canvas` can fail in Vite's RSC development environment. Production builds support more of these cases than development mode.
+- **Image optimization outside the Node.js server:** with `sharp` installed in the app, static imports get Next.js' blur placeholder and the Node.js server resizes, converts, caches and fetches allowed remote images like `next start`. Cloudflare Workers optimize local images through Cloudflare Images but render remote images as-is, and the dev server serves sources unresized.
 - **Platform-specific and advanced Next.js behavior:** `preferredRegion` route config is ignored, and `runtime` doesn't choose where a route runs (outside `cacheComponents`, a `runtime = "edge"` App Router page is never ISR-cached, as in Next.js), and some recently introduced or undocumented Next.js behavior may not yet be reproduced.
 
 Run `vinext check` against an existing application before migrating. If a gap is not listed here, check the [open issues](https://github.com/cloudflare/vinext/issues) or file a focused reproduction.
@@ -137,7 +136,7 @@ files to `.cjs`) when an unambiguous default Vite config requires the ESM migrat
 `"type": "commonjs"` is never changed. Direct `vite dev` and `vite build` do not perform these
 wrapper compatibility steps.
 
-`@vinext/cloudflare deploy` options: `--preview`, `--env <name>`, `--name <name>` (Wrangler config projects only), `--vite-config <path>`, `--skip-build`, `--dry-run`, `--warm-cache`, `--traffic-aware-warm-cache`.
+`@vinext/cloudflare deploy` options: `--preview`, `--env <name>`, `--name <name>` (Wrangler config projects only), `--vite-config <path>`, `--message <text>`, `--tag <text>`, `--skip-build`, `--dry-run`, `--warm-cache`, `--traffic-aware-warm-cache`.
 
 `vinext init` prompts for a deployment target, defaulting to Cloudflare. Agents must ask the
 user which target they want, then pass `--platform=cloudflare` or `--platform=node`.
@@ -283,7 +282,7 @@ No. vinext is an alternative implementation of the Next.js API surface built on 
 No. vinext ships fallback declarations for the supported `next` and `next/*` APIs, so applications can run and type-check without the `next` package. If both packages are installed, vinext keeps using Next.js's authoritative types and adds only its own extensions. Compatibility features that consume Next.js internals, such as `styled-jsx`, may still require a matching Next.js installation when used.
 
 **How is this different from OpenNext?**
-[OpenNext](https://opennext.js.org/) adapts the _output_ of a standard `next build` to run on various platforms. Because it builds on Next.js's own output, it inherits broad API coverage and has been well-tested for much longer. vinext takes a different approach: it reimplements the Next.js APIs on Vite from scratch, which means faster builds and smaller bundles, but less coverage of the long tail of Next.js features. If you need a mature, well-tested way to run Next.js outside Vercel, OpenNext is the safer choice. If you want a lighter Vite-based toolchain and do not need every Next.js API, vinext may be a good fit.
+[OpenNext](https://opennext.js.org/) adapts the _output_ of a standard `next build` to run on various platforms. Because it builds on Next.js's own output, it inherits broad API coverage and has been well-tested for much longer. vinext takes a different approach: it reimplements the Next.js APIs on Vite from scratch, which means faster builds and smaller bundles, but less coverage of the long tail of Next.js features. If you need a mature, well-tested way to run Next.js outside Vercel, OpenNext is the safer choice. If you want a lighter Vite-based toolchain and do not need every Next.js API, vinext may be a good fit. To move an OpenNext app on Cloudflare Workers to vinext, see [Migrate from OpenNext](docs/getting-started/migrating-from-opennext.mdx).
 
 **Can I use this in production?**
 You can, with caution. vinext has known compatibility gaps and has not yet been battle-tested across the full range of production Next.js workloads. Evaluate the features and deployment target your application relies on before adopting it.
@@ -359,12 +358,16 @@ pnpm run deploy:vinext
 
 For `create-vinext-app` projects, use `build` and `deploy` instead of `build:vinext` and `deploy:vinext`. Redeploy the Response Store only when its package or config changes; normal application deployments do not deploy auxiliary Workers.
 
+To deploy from a connected Git repository, replace the default Wrangler commands in Workers Builds; see [Deploy with Workers Builds](https://vinext.dev/docs/deploying/cloudflare#deploy-with-workers-builds).
+
 The init command also auto-detects and fixes common migration issues:
 
 - Adds `"type": "module"` to package.json if missing
 - Resolves tsconfig.json path aliases automatically with Vite's native resolver
 - Detects MDX usage and configures `@mdx-js/rollup`
 - Renames CJS config files (postcss.config.js, etc.) to `.cjs` when needed
+
+On the Node.js server, `vinext dev` and `vinext build` externalize the same packages: Next.js's default `serverExternalPackages` list (which includes `sharp` and `canvas`), `satori` and `@resvg/resvg-js`, plus anything in your own `serverExternalPackages`. As in Next.js, a package that loads a Node-API addon and is not on that list, such as `lightningcss` or `@napi-rs/canvas`, has to be added to `serverExternalPackages` in `next.config` before App Router server code can import it.
 
 vinext does not stub native Node.js modules such as `sharp`, `@resvg/resvg-js` or `@napi-rs/canvas`. Workers cannot load Node-API addons, so importing one into Worker code fails the build or the request. If a dependency imports one on a code path that never runs on Workers, alias it to a module of your own with `resolve.alias` in `vite.config.ts`. Configs generated by earlier versions of `vinext init` may contain `resolve.alias` entries pointing at `empty-stub.js`, a file init never created; delete them.
 
@@ -618,29 +621,29 @@ These are deployed to Cloudflare Workers and updated on every push to `main`:
 
 Every `next/*` import is shimmed to a Vite-compatible implementation.
 
-| Module              |     | Notes                                                                                                                                  |
-| ------------------- | --- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `next/link`         | ✅  | All props including `prefetch` (IntersectionObserver), `onNavigate`, scroll restoration, `basePath`, `locale`                          |
-| `next/image`        | 🟡  | Remote images via [@unpic/react](https://unpic.pics) (28 CDNs). Local images via `<img>` + srcSet. No build-time optimization/resizing |
-| `next/head`         | ✅  | SSR collection + client-side DOM manipulation                                                                                          |
-| `next/router`       | ✅  | `useRouter`, `Router` singleton, events, client-side navigation, SSR context, i18n                                                     |
-| `next/navigation`   | ✅  | `usePathname`, `useSearchParams`, `useParams`, `useRouter`, `redirect`, `notFound`, `forbidden`, `unauthorized`                        |
-| `next/server`       | ✅  | `NextRequest`, `NextResponse`, `NextURL`, cookies, `userAgent`, `after`, `connection`, `URLPattern`                                    |
-| `next/headers`      | ✅  | Async `headers()`, `cookies()`, `draftMode()`                                                                                          |
-| `next/dynamic`      | ✅  | `ssr: true`, `ssr: false`, `loading` component                                                                                         |
-| `next/script`       | ✅  | All 4 strategies (`beforeInteractive`, `afterInteractive`, `lazyOnload`, `worker`)                                                     |
-| `next/font/google`  | 🟡  | Runtime CDN loading. No self-hosting, font subsetting, or fallback metrics                                                             |
-| `next/font/local`   | 🟡  | Runtime `@font-face` injection. Not extracted at build time                                                                            |
-| `next/og`           | ✅  | OG image generation via `@vercel/og` (Satori + resvg)                                                                                  |
-| `next/cache`        | ✅  | `revalidateTag`, `revalidatePath`, `unstable_cache`, pluggable `CacheHandler`, `"use cache"` with `cacheLife()` and `cacheTag()`       |
-| `next/form`         | ✅  | GET form interception + POST server action delegation                                                                                  |
-| `next/legacy/image` | ✅  | Translates legacy props to modern Image                                                                                                |
-| `next/error`        | ✅  | Default error page component                                                                                                           |
-| `next/config`       | ✅  | `getConfig` / `setConfig`                                                                                                              |
-| `next/document`     | ✅  | `Html`, `Head`, `Main`, `NextScript`                                                                                                   |
-| `next/constants`    | ✅  | All phase constants                                                                                                                    |
-| `next/amp`          | ⬜  | No-op (AMP is deprecated)                                                                                                              |
-| `next/web-vitals`   | ⬜  | No-op (use the `web-vitals` library directly)                                                                                          |
+| Module              |     | Notes                                                                                                                                                                                                                                            |
+| ------------------- | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `next/link`         | ✅  | All props including `prefetch` (IntersectionObserver), `onNavigate`, scroll restoration, `basePath`, `locale`                                                                                                                                    |
+| `next/image`        | ✅  | Static imports carry width, height and the blur placeholder (with `sharp`). Node.js server optimizes local and allowed remote images with `sharp`; Workers use Cloudflare Images and render remote images via [@unpic/react](https://unpic.pics) |
+| `next/head`         | ✅  | SSR collection + client-side DOM manipulation                                                                                                                                                                                                    |
+| `next/router`       | ✅  | `useRouter`, `Router` singleton, events, client-side navigation, SSR context, i18n                                                                                                                                                               |
+| `next/navigation`   | ✅  | `usePathname`, `useSearchParams`, `useParams`, `useRouter`, `redirect`, `notFound`, `forbidden`, `unauthorized`                                                                                                                                  |
+| `next/server`       | ✅  | `NextRequest`, `NextResponse`, `NextURL`, cookies, `userAgent`, `after`, `connection`, `URLPattern`                                                                                                                                              |
+| `next/headers`      | ✅  | Async `headers()`, `cookies()`, `draftMode()`                                                                                                                                                                                                    |
+| `next/dynamic`      | ✅  | `ssr: true`, `ssr: false`, `loading` component                                                                                                                                                                                                   |
+| `next/script`       | ✅  | All 4 strategies (`beforeInteractive`, `afterInteractive`, `lazyOnload`, `worker`)                                                                                                                                                               |
+| `next/font/google`  | ✅  | Self-hosted at build time with subset-filtered preloads and fallback metrics. Options the build can't read fall back to the CDN                                                                                                                  |
+| `next/font/local`   | 🟡  | `@font-face` and fallback metrics extracted at build time. Alias, absolute, or dynamic `src` falls back to runtime injection                                                                                                                     |
+| `next/og`           | ✅  | OG image generation via `@vercel/og` (Satori + resvg)                                                                                                                                                                                            |
+| `next/cache`        | ✅  | `revalidateTag`, `revalidatePath`, `unstable_cache`, pluggable `CacheHandler`, `"use cache"` with `cacheLife()` and `cacheTag()`                                                                                                                 |
+| `next/form`         | ✅  | GET form interception + POST server action delegation                                                                                                                                                                                            |
+| `next/legacy/image` | ✅  | Translates legacy props to modern Image                                                                                                                                                                                                          |
+| `next/error`        | ✅  | Default error page component                                                                                                                                                                                                                     |
+| `next/config`       | ✅  | `getConfig` / `setConfig`                                                                                                                                                                                                                        |
+| `next/document`     | ✅  | `Html`, `Head`, `Main`, `NextScript`                                                                                                                                                                                                             |
+| `next/constants`    | ✅  | All phase constants                                                                                                                                                                                                                              |
+| `next/amp`          | ⬜  | No-op (AMP is deprecated)                                                                                                                                                                                                                        |
+| `next/web-vitals`   | ⬜  | No-op (use the `web-vitals` library directly)                                                                                                                                                                                                    |
 
 ### Routing
 
@@ -690,7 +693,7 @@ Every `next/*` import is shimmed to a Vite-compatible implementation.
 | `next.config.js` / `.ts` / `.mjs`                | ✅  | Function configs, phase argument                                                                                                                                                                                                                         |
 | `rewrites` / `redirects` / `headers`             | ✅  | All phases, param interpolation. A source Next.js rejects fails config loading, as it fails the Next.js build: missing, not starting with `/`, over the 4,096-character built-regex limit, or rejected by path-to-regexp, such as a header glob `/api/*` |
 | Environment variables (`.env*`, `NEXT_PUBLIC_*`) | ✅  | Auto-loads Next.js-style dotenv files; only public vars are inlined                                                                                                                                                                                      |
-| `images` config                                  | 🟡  | Parsed but not used for optimization; the production image endpoint enforces `localPatterns` (dev serves any local source)                                                                                                                               |
+| `images` config                                  | 🟡  | `formats`, `minimumCacheTTL`, `remotePatterns`, `localPatterns`, `maximumDiskCacheSize`, `maximumRedirects` and `loaderFile` honored; remote sources only on the Node.js server (dev serves any local source unresized)                                  |
 | `experimental.optimizePackageImports`            | ✅  | Rewrites barrel imports to direct sub-module imports in RSC/SSR environments. A default set (lucide-react, date-fns, radix-ui, antd, MUI, and others) are always optimized. Add package names here to extend the list.                                   |
 | `vinext({ nextConfig })`                         | ✅  | Inline Next-style config from `vite.config.*`. Supports object-form and function-form config. When provided, this overrides root `next.config.*`.                                                                                                        |
 | `vinext({ react: { compiler: true } })`          | ✅  | React Compiler auto memoization. Needs `@vitejs/plugin-react` 6.1+ and the optional `oxc-transform-react` package.                                                                                                                                       |

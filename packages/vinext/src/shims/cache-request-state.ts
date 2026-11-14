@@ -1,7 +1,10 @@
 import { getCdnCacheAdapter } from "./cdn-cache.js";
 import { type CacheLifeConfig, parseCacheLifeProfiles } from "../utils/cache-life-profiles.js";
-import { getHeadersAccessPhase } from "./internal/headers-state.js";
+import { getHeadersAccessPhase, isInsideAnyCacheScope } from "./internal/headers-state.js";
+import { isRouteCacheabilityProbe } from "./cacheability-classification.js";
+import { getPprFallbackShellState } from "./ppr-fallback-shell.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
+import type { ResumeDataCache } from "./resume-data-cache.js";
 import {
   getRequestContext,
   isInsideUnifiedScope,
@@ -49,6 +52,10 @@ export type CacheState = {
   pendingRevalidatedTags: Set<string>;
   pendingRevalidations: Set<Promise<void>>;
   requestScopedCacheLife: CacheLifeConfig | null;
+  /** Records the cache entries a fallback shell render reads or writes. */
+  resumeDataCacheCollector: ResumeDataCache | null;
+  /** The resumed shell's entries, read before the cache handler. */
+  resumeDataCacheSeed: ResumeDataCache | null;
   unstableCacheRevalidation: UnstableCacheRevalidationMode;
 };
 
@@ -67,6 +74,8 @@ const fallbackState = (globalState[FALLBACK_KEY] ??= {
   pendingRevalidatedTags: new Set<string>(),
   pendingRevalidations: new Set<Promise<void>>(),
   requestScopedCacheLife: null,
+  resumeDataCacheCollector: null,
+  resumeDataCacheSeed: null,
   unstableCacheRevalidation: "foreground",
 } satisfies CacheState) as CacheState;
 
@@ -94,6 +103,8 @@ export function _runWithCacheState<T>(fn: () => T | Promise<T>): T | Promise<T> 
     pendingRevalidatedTags: new Set<string>(),
     pendingRevalidations: new Set<Promise<void>>(),
     requestScopedCacheLife: null,
+    resumeDataCacheCollector: null,
+    resumeDataCacheSeed: null,
     unstableCacheRevalidation: "foreground",
   };
   return cacheAls.run(state, fn);
@@ -138,6 +149,35 @@ function hasRequestScopedCacheState(): boolean {
   if (isInsideUnifiedScope() || cacheAls.getStore() !== undefined) return true;
   const phase = getHeadersAccessPhase();
   return phase === "action" || phase === "route-handler";
+}
+
+/**
+ * Install the resume data cache this request's cache reads use. Outside a
+ * request scope there is nothing to resume, so the process state stays clean.
+ *
+ * @internal
+ */
+export function _setResumeDataCacheSeed(seed: ResumeDataCache | null): void {
+  if (!hasRequestScopedCacheState()) return;
+  getCacheState().resumeDataCacheSeed = seed;
+}
+
+/** @internal */
+export function _getResumeDataCacheSeed(): ResumeDataCache | null {
+  if (!hasRequestScopedCacheState()) return null;
+  return getCacheState().resumeDataCacheSeed;
+}
+
+/** @internal */
+export function _setResumeDataCacheCollector(collector: ResumeDataCache | null): void {
+  if (!hasRequestScopedCacheState()) return;
+  getCacheState().resumeDataCacheCollector = collector;
+}
+
+/** @internal */
+export function _getResumeDataCacheCollector(): ResumeDataCache | null {
+  if (!hasRequestScopedCacheState()) return null;
+  return getCacheState().resumeDataCacheCollector;
 }
 
 /** @internal */
@@ -361,6 +401,32 @@ export function runWithDetachedCacheObservations<T>(fn: () => Promise<T>): Promi
   );
 }
 
-export function shouldServeStaleUnstableCacheEntry(): boolean {
-  return getCacheState().unstableCacheRevalidation === "background";
+/**
+ * Whether a stale `fetch()`, `"use cache"` or `unstable_cache` entry must be
+ * regenerated before the read returns, instead of being served while it
+ * refreshes in the background. This is the one freshness policy for every
+ * persistent data cache.
+ *
+ * Like Next.js's `willConsumerServerCache`, the answer is yes whenever whoever
+ * consumes the value will persist it in a server cache: static generation (a
+ * prerender, a cacheability probe, an ISR or route handler regeneration, which
+ * run in the foreground mode) and an enclosing `"use cache"` or
+ * `unstable_cache` scope, even inside a dynamic request, and the production
+ * and warmup of a fallback shell, a prerender even when a request asks for it,
+ * whose resume data cache replays its entries at any age. Collecting a resume
+ * data cache alone doesn't qualify: an ordinary render keeps the stale value
+ * it served there, as Next.js's background revalidation does.
+ * Serving the stale
+ * value there would store it again and extend its lifetime. Only an ordinary
+ * dynamic request, whose output nothing stores, opts into the background mode.
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/work-unit-async-storage.external.ts
+ */
+export function shouldRevalidateStaleCacheEntryInForeground(): boolean {
+  return (
+    getCacheState().unstableCacheRevalidation !== "background" ||
+    getPprFallbackShellState() !== null ||
+    process.env.VINEXT_PRERENDER === "1" ||
+    isRouteCacheabilityProbe() ||
+    isInsideAnyCacheScope()
+  );
 }

@@ -119,6 +119,20 @@ vinext({ cache: responseStoreAdapter({ shards: 16 }) });
 
 Each cache key remains strongly coordinated by one SQLite Durable Object. Tag/path refreshes and purges fan out across all shards. The option is disabled by default, and changing the count starts a new cache layout for the deployed Worker version.
 
+### Batched edge purges
+
+Every `revalidateTag()` and `revalidatePath()` purges or invalidates the edge copies of the responses and data it affects, and so do the data cache refills that follow it. Workers Cache always applies Cloudflare's Free-tier [purge rate limits](https://developers.cloudflare.com/workers/cache/purge/#rate-limits) to these: 5 requests a minute, with a burst of 25 and up to 100 tags per request, shared by every Worker in the account. An app that revalidates often can run out, and a refused purge leaves the edge serving the old response.
+
+If your app can accept a delay before revalidations reach the edge, queue the edge updates and send each window's updates together:
+
+```ts
+vinext({ cache: responseStoreAdapter({ purgeBatchWindow: 60 }) });
+```
+
+`purgeBatchWindow` is a number of seconds. The Response Store applies each revalidation to its own copy at once, but queues the edge updates in its metadata Durable Object. When the window ends, it sends them together in as few requests as it can: purges and invalidations are separate requests of up to 100 tags each. It retries the refused requests about once a minute until they go through, without resending the ones that already went through. So a revalidation reaches the edge up to the window later, or longer while the rate limit is reached. Each metadata shard sends its own batch.
+
+Revalidate through `revalidateTag()` and `revalidatePath()` rather than calling the Response Store's `invalidate()` or `purge()` yourself: they use the tags vinext stores entries under, and also apply to the rest of the current request. The option is disabled by default.
+
 Next.js keeps an App Router page's HTML and RSC payload in one cache entry. Response Store stores them under separate keys, so whenever it stores or regenerates one of the two, it stores the other from the same render. Replacing the other one doesn't purge its edge copy, which would spend the [shared purge budget](#workers-cache-and-kv) on every regeneration. Until that copy's own cache policy ends, the edge can serve it from an earlier render beside the new one. Concurrent misses can also leave the two from different renders.
 
 ### Service-binding mode
@@ -482,6 +496,45 @@ A static page defaults to `revalidate = false`, as in Next.js, unless a `revalid
 Dynamic APIs include `cookies()`, `headers()`, `connection()`, a `fetch` with `cache: "no-store"` outside a cache scope, and reading `searchParams`. Under `dynamic = "force-static"` they return empty values or don't count, so the page is still stored.
 
 `useSearchParams()` in a client component doesn't make a page dynamic. Under `dynamic = "force-static"` it returns empty search params in the HTML and the browser URL's after hydration, as in Next.js. Otherwise, in production, a cacheable page's HTML gets the nearest `<Suspense>` fallback and the browser renders the real value after hydration, as in Next.js. With no `<Suspense>` boundary above the call, the HTML request fails with Next.js's `useSearchParams() should be wrapped in a suspense boundary` error, where Next.js fails the build.
+
+## Prefetched static shells
+
+With `cacheComponents`, a production `<Link>` prefetch of a page gets the page's static shell, as in Next.js. That's the page rendered with `cookies()`, `headers()`, `connection()` and short-lived `"use cache"` functions left at their `<Suspense>` fallbacks. vinext renders a page's shell on its first prefetch and stores it in the data cache with the page's `cacheLife` and tags, so `revalidatePath()` and `revalidateTag()` refresh it. A navigation shows a shell that has holes at once while the page renders, and uses a shell with none without another request.
+
+As with Next.js's `varyParams`, a shell records which params its render read, `?` standing for the query string. A prefetch of another URL of the same route reuses a shell that has holes, without a request, when the URL has the same values for those params, and so does a navigation to a URL with no prefetch of its own. A shell with no holes is the whole page, so it's reused only for the same path with another query string, when its render didn't read the query string, and that navigation needs no request at all. For example, a page that reads only `category` shares one shell between `/shop/shoes/a` and `/shop/shoes/b`. vinext tracks the params for the whole shell, where Next.js tracks them per segment.
+
+A page under a `loading.tsx` boundary, an href with a query string, an intercepted route and the dev server keep the loading-shell prefetch.
+
+A static shell, like a runtime prefetch, leaves out a `"use cache"` function whose `stale` time is under 30 seconds: data that goes stale that fast isn't worth prefetching.
+
+### Partial Prefetching
+
+Set `partialPrefetching: true` next to `cacheComponents`, or export `const prefetch = "partial"` from a page or layout, and a route prefetches in stages, as in Next.js:
+
+- A `<Link>` with no `prefetch` prop gets the page's **App Shell**: the static shell without what follows `await prefetch()` or `await navigation()` from `next/cache`, and without `"use cache"` functions whose `stale` time is under five minutes. It's stored beside the static shell, with the same lifetime and tags. A fully static page is no longer prefetched whole by default; set `prefetch={true}` on links that should keep that.
+- `<Link prefetch={true}>` and `router.prefetch(href, { kind: "full" })` get the page rendered for the request: its cookies, headers and private caches render, `connection()` and uncached data stay at their `<Suspense>` fallbacks, and so does what follows `await navigation()`. It's never a full prefetch with the page's dynamic data, and it's never stored.
+- `<Link prefetch="navigation">` and `{ kind: "navigation" }` render what follows `await navigation()` too.
+
+The App Shell leaves every param but the route's root params (those at or above its root layout) to holes, so one shell serves every path that shares them, and it varies only on the root params it reads: a `/[locale]` app gets one shell per locale, as in Next.js.
+
+A route that doesn't opt in keeps the static shell for automatic prefetches and the full prefetch for `prefetch={true}`. In development, a navigation from a `prefetch={true}` link to such a route logs Next.js's error about dynamic data in the prefetch, since dev doesn't prefetch. `prefetch()` and `navigation()` throw without Cache Components and inside `"use cache"` or `unstable_cache()`; on a request, and in the static shell and the document's partial prerender, both resolve.
+
+## Partial prerendering
+
+With `cacheComponents`, vinext serves a production App Router page's document from a stored shell, as Next.js serves its partial prerender. The shell is the page rendered with `cookies()`, `headers()`, `connection()`, `searchParams`, `useSearchParams()`, uncached `fetch` calls, `"use cache: private"` functions and short-lived `"use cache"` functions left at their `<Suspense>` fallbacks. A request sends the stored shell at once, then renders only those holes and streams them into it. The rest of the page doesn't render again, and the browser hydrates the shell as it arrives.
+
+A request resumes the most specific shell its path has:
+
+- **The path's own shell**, which keeps every param. A path's first request renders the page in full. When that render is dynamic and returns a 200, the path's shell is produced in the background after it, for later requests to resume. A navigation's RSC request reads the cached values the shell was built with, so its payload matches the document. A stale shell is still sent while a fresh one renders in the background.
+- **A fallback shell**, which leaves out params `generateStaticParams` didn't produce for the path: `/blog/[slug]` for a slug that wasn't generated, or `/en/blog/[slug]` under a generated `en` locale. The first request that needs one renders it, blocking, and stores it. A path whose root param wasn't generated has no fallback shell, so it renders in full, as in Next.js.
+
+Like Next.js's prerender manifest, a fallback shell records the params generated under it, so a request decides from the stored shell whether its own path was generated, without calling `generateStaticParams`. A shell produced at runtime calls it once, when it renders. A route with parallel route slots records nothing, so its requests that need a fallback shell call it, as the build doesn't run a slot's `generateStaticParams`.
+
+Every query string shares a path's shell, as in Next.js: `/search?q=a` and `/search?q=b` resume the same shell, and only the holes that read the query render with it.
+
+### `ensureStatic = "navigation"`
+
+A page or layout that exports `ensureStatic = "navigation"` (or `unstable_ensureStatic`) must be fully static, as in Next.js. The build fails when its prerender leaves anything for request time, even behind `<Suspense>`, when a dynamic route has no `generateStaticParams`, or when it returns no params or leaves one of them out. Such a page has no fallback shells: a param the build didn't generate is rendered in full on its first request and stored, and its RSC requests read the stored payload too. Client-only IO stays allowed. vinext reports one error for any partial prerender, without pointing at the data that caused it, and dev checks only `generateStaticParams`.
 
 ## Query strings
 

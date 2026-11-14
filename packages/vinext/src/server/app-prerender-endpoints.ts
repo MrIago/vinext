@@ -2,6 +2,7 @@ import { callAppPrerenderStaticParams } from "./app-prerender-static-params.js";
 import {
   VINEXT_PRERENDER_METADATA_ROUTES_PATH,
   VINEXT_PRERENDER_PAGES_STATIC_PATHS_PATH,
+  VINEXT_PRERENDER_PARAM_MATCHING_PATH,
   VINEXT_PRERENDER_STATIC_PARAMS_PATH,
 } from "./headers.js";
 import { notFoundResponse } from "./http-error-responses.js";
@@ -28,6 +29,8 @@ type HandleAppPrerenderEndpointOptions = {
   getMetadataRoutePaths?: () => Promise<unknown>;
   loadPagesRoutes?: () => Promise<unknown>;
   pathname: string;
+  /** Every page route's parameter matching policy, keyed by pattern. */
+  resolveParamMatchingPolicies?: () => Promise<unknown>;
   rootParamNamesByPattern?: AppPrerenderRootParamNamesMap;
   staticParamsMap: AppPrerenderStaticParamsMap;
 };
@@ -44,6 +47,11 @@ export async function handleAppPrerenderEndpoint(
 ): Promise<Response | null> {
   if (options.pathname === VINEXT_PRERENDER_STATIC_PARAMS_PATH) {
     return handleStaticParamsEndpoint(request, options);
+  }
+
+  if (options.pathname === VINEXT_PRERENDER_PARAM_MATCHING_PATH) {
+    if (!options.resolveParamMatchingPolicies) return null;
+    return handleParamMatchingEndpoint(options);
   }
 
   if (options.pathname === VINEXT_PRERENDER_PAGES_STATIC_PATHS_PATH) {
@@ -68,6 +76,21 @@ async function handleMetadataRoutesEndpoint(
 
   try {
     return jsonResponse(await options.getMetadataRoutePaths?.());
+  } catch (error) {
+    return jsonResponse({ error: String(error) }, 500);
+  }
+}
+
+async function handleParamMatchingEndpoint(
+  options: HandleAppPrerenderEndpointOptions,
+): Promise<Response> {
+  if (!isEnabled(options)) {
+    return notFoundResponse({ headers: NO_STORE_HEADERS });
+  }
+
+  try {
+    // unstable_generateParamMatching runs where generateStaticParams does.
+    return jsonResponse(await runInWorkStoreScope(() => options.resolveParamMatchingPolicies!()));
   } catch (error) {
     return jsonResponse({ error: String(error) }, 500);
   }
@@ -103,10 +126,19 @@ async function handleStaticParamsEndpoint(
       }),
     );
     if (result === null) return jsonNullResponse();
-    return jsonResponse(result);
+    return jsonResponse(result, 200, keepUndefinedParams);
   } catch (error) {
     return jsonResponse({ error: String(error) }, 500);
   }
+}
+
+// JSON drops a property whose value is undefined, but a param set that names a
+// param, even as undefined, still provides it: an optional catch-all left out
+// as `{ path: undefined }` is generated, as Next.js reads it
+// (build/static-paths/app.ts hadAllParamsGenerated). The build validates a null
+// param as Next.js does an undefined one.
+function keepUndefinedParams(key: string, value: unknown): unknown {
+  return key !== "" && value === undefined ? null : value;
 }
 
 async function handlePagesStaticPathsEndpoint(
@@ -142,8 +174,12 @@ function isEnabled(options: HandleAppPrerenderEndpointOptions): boolean {
   return options.isPrerenderEnabled?.() ?? false;
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  replacer?: (key: string, value: unknown) => unknown,
+): Response {
+  return new Response(JSON.stringify(body, replacer), {
     headers: JSON_HEADERS,
     status,
   });

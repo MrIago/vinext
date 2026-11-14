@@ -4,6 +4,8 @@ import type { NavigationContext } from "vinext/shims/navigation";
 import type { AppPageCacheSetter } from "./isr-cache.js";
 import type { RootParams } from "vinext/shims/root-params";
 import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
+import { _getResumeDataCacheCollector } from "vinext/shims/cache-request-state";
+import { isResumeDataCacheEmpty, stringifyResumeDataCache } from "vinext/shims/resume-data-cache";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { getCdnCacheAdapter } from "vinext/shims/cdn-cache";
 import { resolveClientStaleTimeSeconds } from "../utils/cache-control-metadata.js";
@@ -14,6 +16,7 @@ import { internalServerErrorResponse } from "./http-error-responses.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
 import { isBailoutToCSRError } from "vinext/shims/navigation-errors";
 import {
+  type AppPageCaughtHttpError,
   finalizeAppPageCacheabilityEvaluationResponse,
   finalizeAppPageHtmlCacheResponse,
   finalizeAppPageRscCacheResponse,
@@ -23,6 +26,7 @@ import {
   readAppPageBinaryStream,
   resolveAppPageCaughtNotFoundBoundaries,
   resolveAppPageShellSpecialError,
+  preferAppPageHttpError,
   resolveAppPageSpecialError,
   resolveAppPageSpecialErrorStoredHeaders,
   teeAppPageRscStreamForCapture,
@@ -50,6 +54,7 @@ import {
   deferUntilStreamConsumed,
   renderAppPageHtmlStream,
   renderAppPageHtmlStreamWithRecovery,
+  type AppPagePprShellResume,
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
 import { APP_RSC_RENDER_MODE_NAVIGATION, type AppRscRenderMode } from "./app-rsc-render-mode.js";
@@ -217,6 +222,10 @@ type RenderAppPageLifecycleOptionsBase = {
   pprFallbackShellSignal?: AbortSignal;
   pprFallbackShellReactSignal?: AbortSignal;
   abortPprFallbackShell?: () => void;
+  /** Whether the fallback shell's payload left holes. */
+  isPprFallbackShellPartial?: () => boolean;
+  /** A stored shell this render resumes. */
+  pprShellResume?: AppPagePprShellResume;
   rootParams?: RootParams;
   peekRenderObservationState?: () => AppPageRenderObservationState;
   expireSeconds?: number;
@@ -243,6 +252,11 @@ type RenderAppPageLifecycleOptionsBase = {
   mountedSlotsHeader?: string | null;
   renderedPathAndSearch?: string | null;
   renderMode?: AppRscRenderMode;
+  /**
+   * Called when the page's render is dynamic: from its start, or, for a
+   * document that might have been stored, once it has rendered whole.
+   */
+  onDynamicRender?: () => void;
   waitUntil?: (promise: Promise<void>) => void;
 };
 
@@ -405,6 +419,39 @@ export function applyIneligibleRouteCachePolicy(
     stamped.headers.set(VINEXT_DYNAMIC_STALE_TIME_HEADER, String(dynamicStaleTimeSeconds));
   }
   return stamped;
+}
+
+function withPrerenderHttpErrorCapture(
+  onError: (error: unknown) => unknown,
+  capture: (error: unknown) => void,
+): (error: unknown) => unknown {
+  return (error) => {
+    capture(error);
+    return onError(error);
+  };
+}
+
+/**
+ * A prerendered document a Suspense boundary caught an HTTP error in answers
+ * with that error's status, and a redirect's `location`. The prerender server
+ * marks it so the build writes it like a special error that escaped the shell.
+ */
+function applyPrerenderHttpErrorStatus(
+  response: Response,
+  httpError: AppPageSpecialError | null,
+  basePath: string | undefined,
+): Response {
+  if (httpError === null || response.status !== 200) return response;
+  const storedHeaders = resolveAppPageSpecialErrorStoredHeaders(httpError, basePath);
+  const headers = new Headers(response.headers);
+  if (storedHeaders?.location !== undefined) headers.set("location", storedHeaders.location);
+  getRequestExecutionContext()?.recordPrerenderSpecialError?.({
+    headers: storedHeaders ?? {},
+    status: httpError.statusCode,
+  });
+  const prerenderResponse = new Response(response.body, { headers, status: httpError.statusCode });
+  copyLinkHeaderProvenance(response.headers, prerenderResponse.headers);
+  return prerenderResponse;
 }
 
 /** Some early responses have immutable headers, so stamp a copy. */
@@ -840,7 +887,9 @@ async function renderAppPageLifecycleImpl(
     });
   const rscCapture = pprFallbackShellRsc
     ? {
-        ssrStream: createBufferedRscStream(false),
+        // A static shell's RSC response ends with its prelude. Its unfinished
+        // parts stay pending for the client, as in a Next.js prefetch.
+        ssrStream: createBufferedRscStream(options.isRscRequest),
         ...(shouldCaptureRscForCacheMetadata ? { sideStream: createBufferedRscStream(true) } : {}),
       }
     : teeAppPageRscStreamForCapture(rscStream, shouldCaptureRscForCacheMetadata);
@@ -962,6 +1011,7 @@ async function renderAppPageLifecycleImpl(
             : {}),
           getCapturedSpecialError: rscErrorTracker.getCapturedSpecialError,
           getCapturedSpecialErrors: rscErrorTracker.getCapturedSpecialErrors,
+          getAllCapturedSpecialErrors: rscErrorTracker.getAllCapturedSpecialErrors,
           isForceStatic: options.isForceStatic,
           loadSsrHandler: options.loadSsrHandler,
           navigationContext: options.getNavigationContext(),
@@ -998,11 +1048,14 @@ async function renderAppPageLifecycleImpl(
             isDynamicError: options.isDynamicError,
             isForceDynamic: options.isForceDynamic,
             isForceStatic: options.isForceStatic,
+            isPrerender: options.isPrerender === true,
             isProduction: options.isProduction,
             isStaticEligible: options.isStaticEligible,
             expireSeconds,
             revalidateSeconds,
           });
+    // The page's own policy, as middleware may replace the response's header.
+    if (rscResponsePolicy.cacheControl === NEVER_CACHE_CONTROL) options.onDynamicRender?.();
     if (shouldBypassRscCache) {
       options.isrDebug?.(
         isPartialPayload
@@ -1186,6 +1239,31 @@ async function renderAppPageLifecycleImpl(
   let dynamicUsedDuringHtmlRender = false;
   let renderEnd: number | undefined;
   let shellSpecialError: AppPageSpecialError | null = null;
+  // Like Next.js's prerender, a notFound(), forbidden(), unauthorized() or
+  // redirect() a Suspense boundary caught still sets the prerendered
+  // document's status, and a redirect its `location`, while the document keeps
+  // the layout and the boundary's fallback for the browser to recover from. A
+  // redirect wins over an access fallback; otherwise the first one seen does.
+  // A request-time render streams a 200 before the error, so it keeps it, but
+  // the ISR entry it writes stores the error's status as Next.js's does, for
+  // the requests the entry serves.
+  // Ported from Next.js: packages/next/src/server/app-render/app-render.tsx
+  // (setHTTPAccessFallbackOrRedirectStatus in prerenderToStream)
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
+  let prerenderHttpError: AppPageSpecialError | null = null;
+  const capturePrerenderHttpError = (error: unknown): void => {
+    if (options.pprFallbackShellSignal !== undefined) return;
+    prerenderHttpError = preferAppPageHttpError(
+      prerenderHttpError,
+      resolveAppPageSpecialError(error),
+    );
+  };
+
+  const getCaughtHttpError = (): AppPageCaughtHttpError | undefined => {
+    if (prerenderHttpError === null) return undefined;
+    const headers = resolveAppPageSpecialErrorStoredHeaders(prerenderHttpError, options.basePath);
+    return { status: prerenderHttpError.statusCode, ...(headers ? { headers } : {}) };
+  };
 
   const resolveHtmlCacheWrite = (dynamicUsedDuringRender: boolean) => {
     const htmlResponsePolicy = resolveAppPageHtmlResponsePolicy({
@@ -1196,6 +1274,7 @@ async function renderAppPageLifecycleImpl(
       isDynamicError: options.isDynamicError,
       isForceDynamic: options.isForceDynamic,
       isForceStatic: options.isForceStatic,
+      isPrerender: options.isPrerender === true,
       isProduction: options.isProduction,
       isStaticEligible: options.isStaticEligible,
       expireSeconds,
@@ -1221,6 +1300,7 @@ async function renderAppPageLifecycleImpl(
     response: Response,
     write: {
       capturedDynamicUsageBeforeContextCleanup: () => boolean;
+      getCaughtHttpError?: () => AppPageCaughtHttpError | undefined;
       headers?: Record<string, string>;
       htmlResponsePolicy: ReturnType<typeof resolveAppPageHtmlResponsePolicy>;
       linkHeader: string | null;
@@ -1233,6 +1313,7 @@ async function renderAppPageLifecycleImpl(
       capturedRscDataPromise: capturedRscDataRef.value,
       cleanPathname: options.cleanPathname,
       clientTraceMetadataMarker,
+      getCaughtHttpError: write.getCaughtHttpError,
       consumeDynamicUsage: consumeRenderDynamicUsage,
       consumeRenderObservationState,
       createHtmlRenderObservation(input) {
@@ -1283,6 +1364,8 @@ async function renderAppPageLifecycleImpl(
         revalidateSeconds,
       }),
       linkHeader: write.linkHeader,
+      // A special error's document isn't the page's.
+      onDynamicRender: write.status === undefined ? options.onDynamicRender : undefined,
       status: write.status,
       waitUntil(cachePromise) {
         options.waitUntil?.(cachePromise);
@@ -1299,10 +1382,10 @@ async function renderAppPageLifecycleImpl(
     resolveEarlyResponseCacheControl(options) === null;
 
   // Whether a prerender writes a special error that escaped the shell, as
-  // Next.js's build does. A speculative or fallback-shell prerender doesn't.
+  // Next.js's build does, for a route with or without segment config. A
+  // fallback-shell prerender doesn't.
   const mayPrerenderShellSpecialError = (): boolean =>
     options.isPrerender === true &&
-    options.isSpeculativePrerender !== true &&
     options.pprFallbackShellSignal === undefined &&
     shouldCaptureRscForCacheMetadata &&
     capturedRscDataRef.value !== null &&
@@ -1333,6 +1416,9 @@ async function renderAppPageLifecycleImpl(
     if (response.status !== specialError.statusCode) {
       return applyIneligibleRouteCachePolicy(response, options);
     }
+    // A redirect a Suspense boundary caught before the shell rejected keeps
+    // its status and location, and an earlier access fallback its status.
+    const responseError = preferAppPageHttpError(prerenderHttpError, specialError) ?? specialError;
     // The boundary renders as its document streams, so its tagged fetches,
     // cacheLife() and dynamic API use are known once the document is read.
     const body = await response.arrayBuffer();
@@ -1353,16 +1439,21 @@ async function renderAppPageLifecycleImpl(
     }
     applyPrerenderCacheLifeHeader(headers, requestCacheLife);
     applyPrerenderCacheTagsHeader(headers, cacheTags);
+    const storedHeaders = resolveAppPageSpecialErrorStoredHeaders(responseError, options.basePath);
+    if (responseError !== specialError) {
+      headers.delete("location");
+      if (storedHeaders?.location !== undefined) headers.set("location", storedHeaders.location);
+    }
     // Recorded outside the response, which middleware can also produce, with
     // the redirect's own location. The prerender server marks the response.
     getRequestExecutionContext()?.recordPrerenderSpecialError?.({
-      headers: resolveAppPageSpecialErrorStoredHeaders(specialError, options.basePath) ?? {},
-      status: response.status,
+      headers: storedHeaders ?? {},
+      status: responseError.statusCode,
     });
     const prerenderResponse = new Response(body, {
       headers,
-      status: response.status,
-      statusText: response.statusText,
+      status: responseError.statusCode,
+      statusText: responseError === specialError ? response.statusText : undefined,
     });
     copyLinkHeaderProvenance(response.headers, prerenderResponse.headers);
     return prerenderResponse;
@@ -1506,6 +1597,8 @@ async function renderAppPageLifecycleImpl(
         reactMaxHeadersLength: options.reactMaxHeadersLength,
         rootParams: options.rootParams,
         pprFallbackShellSignal: options.pprFallbackShellSignal,
+        isPprFallbackShellPartial: options.isPprFallbackShellPartial,
+        pprShellResume: options.pprShellResume,
         preloadRoutePattern: options.routePattern,
         formState: options.formState ?? null,
         rscStream: rscForResponse,
@@ -1520,7 +1613,10 @@ async function renderAppPageLifecycleImpl(
         isStaticGeneration: options.isPrerender === true,
         isForceStatic: options.isForceStatic,
         isCacheCandidate: isCacheCandidateHtmlRender,
-        onSsrError: createAppPageSsrErrorHandler(onSsrError, rscErrorTracker.isCapturedError),
+        onSsrError: withPrerenderHttpErrorCapture(
+          createAppPageSsrErrorHandler(onSsrError, rscErrorTracker.isCapturedError),
+          capturePrerenderHttpError,
+        ),
         // A document that streams a special error a boundary caught carries
         // Next.js's `self.__next_f` Flight transport, as the boundary's own
         // document does.
@@ -1607,14 +1703,29 @@ async function renderAppPageLifecycleImpl(
   if (!htmlStream) {
     throw new Error("[vinext] Expected an HTML stream when no fallback response was returned");
   }
+  if (options.isPrerender === true && options.pprFallbackShellSignal) {
+    // The shell's cache entries are all settled once its body ends.
+    const resumeDataCache = _getResumeDataCacheCollector();
+    const { appendAppPprFallbackShellState } = await import("./app-ppr-fallback-shell.js");
+    const prelude = htmlRender.pprShellPrelude;
+    htmlStream = appendAppPprFallbackShellState(htmlStream, () => ({
+      prelude: prelude !== undefined,
+      postponed: prelude?.postponed ?? null,
+      resumeDataCache:
+        resumeDataCache && !isResumeDataCacheEmpty(resumeDataCache)
+          ? stringifyResumeDataCache(resumeDataCache)
+          : null,
+      // The build and shell production record the generated params themselves.
+      generated: null,
+    }));
+  }
 
   // Combine React's preload `Link` header (captured via onHeaders during SSR)
-  // with the font preload `Link` header, capped to `reactMaxHeadersLength`.
-  const linkHeader = buildAppPageLinkHeader(
-    htmlRender.linkHeader,
-    fontLinkHeader,
-    options.reactMaxHeadersLength,
-  );
+  // with the font preload `Link` header, capped to `reactMaxHeadersLength`. A
+  // resumed shell sends the header its render sent.
+  const linkHeader =
+    options.pprShellResume?.linkHeader ??
+    buildAppPageLinkHeader(htmlRender.linkHeader, fontLinkHeader, options.reactMaxHeadersLength);
 
   if (options.isPrerender === true) {
     await htmlRender.metadataReady;
@@ -1709,6 +1820,7 @@ async function renderAppPageLifecycleImpl(
     return response;
   }
 
+  if (htmlResponsePolicy.cacheControl === NEVER_CACHE_CONTROL) options.onDynamicRender?.();
   if (shouldWriteHtmlCache) {
     const isrResponse = buildAppPageHtmlResponse(safeHtmlStream, {
       cacheTags: options.isPrerender === true ? options.getPageTags() : undefined,
@@ -1722,11 +1834,12 @@ async function renderAppPageLifecycleImpl(
     });
 
     if (options.isPrerender === true) {
-      return isrResponse;
+      return applyPrerenderHttpErrorStatus(isrResponse, prerenderHttpError, options.basePath);
     }
 
     return finalizeHtmlCacheWrite(isrResponse, {
       capturedDynamicUsageBeforeContextCleanup: () => dynamicUsedBeforeContextCleanup,
+      getCaughtHttpError,
       htmlResponsePolicy,
       linkHeader: linkHeader ?? null,
     });
@@ -1748,6 +1861,7 @@ async function renderAppPageLifecycleImpl(
     },
     consumeDynamicUsage: consumeRenderDynamicUsage,
     consumeRenderObservationState,
+    getCaughtHttpError,
     getPageTags() {
       return options.getPageTags();
     },

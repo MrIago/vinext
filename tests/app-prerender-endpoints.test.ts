@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import { handleAppPrerenderEndpoint } from "../packages/vinext/src/server/app-prerender-endpoints.js";
 import { createAppPrerenderStaticParamsResolver } from "../packages/vinext/src/server/app-prerender-static-params.js";
 import { getRootParam } from "../packages/vinext/src/shims/root-params.js";
+import { resolveAppParamMatchingPolicies } from "../packages/vinext/src/server/app-param-matching.js";
 
 type TestPageRoute = {
   pattern: string;
@@ -383,5 +384,104 @@ describe("App prerender endpoint helpers", () => {
     await expect(missingPatternResponse?.text()).resolves.toBe("missing pattern");
     expect(thrownResponse?.status).toBe(500);
     await expect(thrownResponse?.json()).resolves.toEqual({ error: "Error: boom" });
+  });
+
+  // Ported from Next.js: test/production/app-dir/param-matching-not-found/param-matching-not-found.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/production/app-dir/param-matching-not-found/param-matching-not-found.test.ts
+  describe("parameter matching endpoint", () => {
+    const page = (segments: string[], mod: Record<string, unknown>) => ({
+      layouts: [{}],
+      layoutTreePositions: [0],
+      page: mod,
+      params: segments.filter((segment) => segment.startsWith("[")).map((s) => s.slice(1, -1)),
+      pattern: "/" + segments.map((s) => (s.startsWith("[") ? `:${s.slice(1, -1)}` : s)).join("/"),
+      routeSegments: segments,
+    });
+
+    it("resolves every page route's policy, including routes without one", async () => {
+      const ensureRouteLoaded = vi.fn();
+      const routes = [
+        page(["[lang]", "a"], { unstable_paramMatching: { lang: "not-found" } }),
+        page(["[lang]", "b"], {
+          async unstable_generateParamMatching() {
+            return { lang: "not-found" };
+          },
+        }),
+        page(["blog", "[slug]"], {}),
+      ];
+      const response = await handleAppPrerenderEndpoint(
+        new Request("http://localhost/__vinext/prerender/param-matching"),
+        {
+          isPrerenderEnabled: () => true,
+          pathname: "/__vinext/prerender/param-matching",
+          resolveParamMatchingPolicies: () =>
+            resolveAppParamMatchingPolicies(routes, { cacheComponents: true, ensureRouteLoaded }),
+          staticParamsMap: {},
+        },
+      );
+
+      expect(ensureRouteLoaded).toHaveBeenCalledTimes(3);
+      expect(response?.status).toBe(200);
+      await expect(response?.json()).resolves.toEqual({
+        "/:lang/a": { lang: "not-found" },
+        "/:lang/b": { lang: "not-found" },
+        "/blog/:slug": null,
+      });
+    });
+
+    it("fails on a parameter that is not explicitly closed in every route", async () => {
+      const routes = [
+        page(["[lang]", "a"], { unstable_paramMatching: { lang: "not-found" } }),
+        page(["[lang]", "b"], {}),
+      ];
+      const response = await handleAppPrerenderEndpoint(
+        new Request("http://localhost/__vinext/prerender/param-matching"),
+        {
+          isPrerenderEnabled: () => true,
+          pathname: "/__vinext/prerender/param-matching",
+          resolveParamMatchingPolicies: () =>
+            resolveAppParamMatchingPolicies(routes, { cacheComponents: true }),
+          staticParamsMap: {},
+        },
+      );
+
+      expect(response?.status).toBe(500);
+      const { error } = (await response!.json()) as { error: string };
+      expect(error).toContain('Parameter "lang"');
+      expect(error).toContain('must explicitly configure "not-found"');
+      expect(error).toContain("/:lang/b");
+    });
+
+    it("rejects parameter matching exported by a route handler", async () => {
+      await expect(
+        resolveAppParamMatchingPolicies(
+          [
+            {
+              layouts: [],
+              params: ["lang"],
+              pattern: "/:lang/api",
+              routeHandler: { unstable_paramMatching: { lang: "not-found" } },
+              routeSegments: ["[lang]", "api"],
+            },
+          ],
+          { cacheComponents: true },
+        ),
+      ).rejects.toThrow(
+        "cannot export parameter matching. It is only supported in layouts and pages",
+      );
+    });
+
+    it("returns 404 outside prerender mode", async () => {
+      const response = await handleAppPrerenderEndpoint(
+        new Request("http://localhost/__vinext/prerender/param-matching"),
+        {
+          isPrerenderEnabled: () => false,
+          pathname: "/__vinext/prerender/param-matching",
+          resolveParamMatchingPolicies: async () => ({}),
+          staticParamsMap: {},
+        },
+      );
+      expect(response?.status).toBe(404);
+    });
   });
 });

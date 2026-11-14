@@ -66,7 +66,7 @@ describe("Next.js compat: server action under node-runtime middleware", () => {
     // middleware read it).
     expect(res.status).toBe(200);
     expect(res.headers.get("x-nextjs-action-not-found")).toBeNull();
-    expect(text).not.toContain("Server action not found");
+    expect(text).not.toContain("Server Action unavailable");
     // The action returns `echo:world`; a successful dispatch encodes it in the
     // RSC payload's returnValue.
     expect(text).toContain("echo:world");

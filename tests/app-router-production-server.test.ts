@@ -1699,6 +1699,115 @@ describe("App Router Production server (startProdServer)", () => {
     expect(ts2).toBe(ts1);
   });
 
+  // The runtime ISR side of Next.js's prerendered-http-status-codes test
+  // (vercel/next.js#99078): an entry written at request time, not at build,
+  // stores the status of a notFound(), forbidden(), unauthorized() or
+  // redirect() a Suspense boundary caught, and a redirect's location, so the
+  // requests it serves answer with them. A redirect wins over a not-found.
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerendered-http-status-codes/index.test.ts
+  describe("runtime ISR keeps the status of an HTTP error a Suspense boundary caught", () => {
+    it.each([
+      ["not-found", 404, null],
+      ["forbidden", 403, null],
+      ["unauthorized", 401, null],
+      ["redirect", 307, "/"],
+      ["permanent-redirect", 308, "/"],
+      ["precedence", 307, "/second"],
+    ])("%s: the cached entry answers with %i", async (kind, status, location) => {
+      const pathname = `/nextjs-compat/isr-http-status-codes/${kind}`;
+      // The first request streams its document before the error, so it is a
+      // 200, and writes the entry.
+      const first = await fetch(`${baseUrl}${pathname}`, { redirect: "manual" });
+      expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+      expect(await first.text()).toContain('id="layout"');
+
+      let cached!: Response;
+      await waitForCondition(async () => {
+        cached = await fetch(`${baseUrl}${pathname}`, { redirect: "manual" });
+        return cached.headers.get("x-vinext-cache") === "HIT";
+      });
+      expect(cached.status).toBe(status);
+      expect(cached.headers.get("location")).toBe(location);
+      const html = await cached.text();
+      expect(html).toContain('id="layout"');
+    });
+
+    // An RSC miss stores the payload with the status too. Like Next.js, an RSC
+    // request for a redirect is a 200 whose payload carries it.
+    it.each([
+      ["rsc-not-found", 404, null],
+      ["rsc-forbidden", 403, null],
+      ["rsc-redirect", 200, "/"],
+    ])("%s: the cached RSC entry answers with %i", async (kind, status, location) => {
+      const pathname = `/nextjs-compat/isr-http-status-codes/${kind}`;
+      const first = await fetchRsc(baseUrl, pathname, { redirect: "manual" });
+      expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+      await first.arrayBuffer();
+
+      let cached!: Response;
+      await waitForCondition(async () => {
+        cached = await fetchRsc(baseUrl, pathname, { redirect: "manual" });
+        return cached.headers.get("x-vinext-cache") === "HIT";
+      });
+      expect(cached.status).toBe(status);
+      expect(cached.headers.get("location")).toBe(location);
+      await cached.arrayBuffer();
+    });
+
+    it("a page without an error is still a 200", async () => {
+      const pathname = "/nextjs-compat/isr-http-status-codes/none";
+      await (await fetch(`${baseUrl}${pathname}`)).text();
+      let cached!: Response;
+      await waitForCondition(async () => {
+        cached = await fetch(`${baseUrl}${pathname}`);
+        return cached.headers.get("x-vinext-cache") === "HIT";
+      });
+      expect(cached.status).toBe(200);
+      expect(await cached.text()).toContain('id="page"');
+    });
+  });
+
+  // Ported from Next.js: test/e2e/app-dir/prerender-encoding/prerender-encoding.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/prerender-encoding/prerender-encoding.test.ts
+  // A literal `%` survives the request's single decode as `%`. Matching the
+  // decoded pathname again must not decode it a second time, or the page
+  // looks like another route's spelling and is never cached.
+  describe("prerender-encoding: percent-containing catch-all params", () => {
+    function readSlug(html: string): string | undefined {
+      return html.match(/params\.slug is (?:<!-- -->)?([^<]*)</)?.[1];
+    }
+
+    it.each([
+      ["/prerender-encoding/closed/docs/space%20here/100%25", "docs/space%20here/100%25"],
+      [
+        "/prerender-encoding/closed/docs/space%20here/with%2Fslash/100%25",
+        "docs/space%20here/with%2Fslash/100%25",
+      ],
+    ])("serves the exact closed catch-all path %s", async (pathname, slug) => {
+      const res = await fetch(`${baseUrl}${pathname}`);
+      expect(res.status).toBe(200);
+      expect(readSlug(await res.text())).toBe(slug);
+      expect(res.headers.get("cache-control")).not.toContain("private");
+    });
+
+    it.each([
+      ["/prerender-encoding/open/docs/space%20here/fallback%25", "docs/space%20here/fallback%25"],
+      [
+        "/prerender-encoding/open/docs/space%20here/with%2Fslash/fallback%25",
+        "docs/space%20here/with%2Fslash/fallback%25",
+      ],
+    ])("generates and then reuses the open catch-all fallback %s", async (pathname, slug) => {
+      const first = await fetch(`${baseUrl}${pathname}`);
+      expect(first.status).toBe(200);
+      expect(readSlug(await first.text())).toBe(slug);
+
+      const second = await fetch(`${baseUrl}${pathname}`);
+      expect(second.status).toBe(200);
+      expect(readSlug(await second.text())).toBe(slug);
+      expect(second.headers.get("x-vinext-cache")).toBe("HIT");
+    });
+  });
+
   // Regression test for issue 1487 — App Router page-segment `revalidate = Infinity`
   // (and `revalidate = false`) should produce a stable cached response. Two
   // requests must return identical HTML bytes; the first MISS render writes
@@ -1930,8 +2039,9 @@ describe("App Router Production server (startProdServer)", () => {
     expect(body).toContain("guest");
   });
 
-  // The layout reads cookies behind Suspense 300 ms into the render, after
-  // these documents' headers have been sent.
+  // Like Next.js, the miss renders the root not-found inside the root layout
+  // only, so the segment's layout, which reads cookies behind Suspense, never
+  // runs.
   it("never caches a generated-param miss's not-found document", async () => {
     const session = `user-${randomUUID()}`;
     const res = await fetch(`${baseUrl}/late-cookie-layout/handbook/${randomUUID()}`, {
@@ -1941,7 +2051,9 @@ describe("App Router Production server (startProdServer)", () => {
     expect(res.headers.get("cache-control")).toBe(
       "private, no-cache, no-store, max-age=0, must-revalidate",
     );
-    expect(await res.text()).toContain(session);
+    const html = await res.text();
+    expect(html).toContain("404 - Page Not Found");
+    expect(html).not.toContain(session);
   });
 
   it("never caches the error document of a page that throws", async () => {
@@ -2801,7 +2913,8 @@ describe("App Router Production server (startProdServer)", () => {
     for (const [query, status] of [
       ["url=%2Fheart.png&w=65&q=75", 400],
       ["url=%2Flogo%2Flogo.svg&w=64&q=75", 400],
-      ["url=%2Fmissing.png&w=64&q=75", 400],
+      // Next.js keeps a missing source's 404 (https://github.com/vercel/next.js/pull/97957).
+      ["url=%2Fmissing.png&w=64&q=75", 404],
     ] as const) {
       const res = await fetch(`${baseUrl}/_next/image?${query}`);
       expect(res.status, query).toBe(status);
@@ -2817,6 +2930,24 @@ describe("App Router Production server (startProdServer)", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-app-public-basepath-"));
     const fixtureRoot = path.join(tmpDir, "fixture");
     let basePathServer: import("node:http").Server | undefined;
+    const previousPagesClientAssets = getPagesClientAssets();
+    const prodGlobalKeys = [
+      "__vite_rsc_client_require__",
+      "__vite_rsc_require__",
+      "__vite_rsc_server_require__",
+      "__webpack_chunk_load__",
+      "__webpack_require__",
+    ];
+    // startProdServer installs build/runtime globals process-wide, and this
+    // second server's bundle would keep answering the shared server's
+    // server-reference loads (a cached result decodes its Server Actions
+    // through `__vite_rsc_server_require__`). Restore them before later tests.
+    const previousGlobals = new Map(
+      prodGlobalKeys.map((key) => [
+        key,
+        { exists: Reflect.has(globalThis, key), value: Reflect.get(globalThis, key) },
+      ]),
+    );
 
     try {
       fs.cpSync(APP_FIXTURE_DIR, fixtureRoot, { recursive: true });
@@ -2885,10 +3016,20 @@ describe("App Router Production server (startProdServer)", () => {
       const protectedImageRes = await fetch(
         `${tmpBaseUrl}/app/_next/image?url=%2Fapp%2Fmembers%20only%2Fprivate.png&w=640&q=75`,
       );
-      expect(protectedImageRes.status).toBe(400);
-      expect(await protectedImageRes.text()).toBe("The requested resource isn't a valid image.");
+      expect(protectedImageRes.status).toBe(403);
+      expect(await protectedImageRes.text()).toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
     } finally {
       basePathServer?.close();
+      setPagesClientAssets(previousPagesClientAssets);
+      for (const [key, previous] of previousGlobals) {
+        if (previous.exists) {
+          Reflect.set(globalThis, key, previous.value);
+        } else {
+          Reflect.deleteProperty(globalThis, key);
+        }
+      }
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -3761,7 +3902,7 @@ describe("App Router Production server (startProdServer)", () => {
       expect(actionRes.status).toBe(200);
       expect(actionRes.headers.get("x-nextjs-action-not-found")).toBeNull();
       const text = await actionRes.text();
-      expect(text).not.toContain("Server action not found");
+      expect(text).not.toContain("Server Action unavailable");
       return text;
     };
 
@@ -3838,7 +3979,7 @@ describe("App Router Production server (startProdServer)", () => {
     });
     const payload = await response.text();
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(409);
     expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(payload).not.toContain("VICTIM_PRIVATE_RECORD");
   });
@@ -3916,7 +4057,7 @@ describe("App Router Production server (startProdServer)", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("x-nextjs-action-not-found")).toBeNull();
-    expect(text).not.toContain("Server action not found");
+    expect(text).not.toContain("Server Action unavailable");
     expect(text).toContain("echo:world");
   });
 

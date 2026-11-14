@@ -141,6 +141,7 @@ const appPrerenderStaticParamsPath = resolveEntryPath(
   "../server/app-prerender-static-params.js",
   import.meta.url,
 );
+const appParamMatchingPath = resolveEntryPath("../server/app-param-matching.js", import.meta.url);
 const seedCachePath = resolveEntryPath("../server/seed-cache.js", import.meta.url);
 const pregeneratedConcretePathsPath = resolveEntryPath(
   "../server/pregenerated-concrete-paths.js",
@@ -229,6 +230,8 @@ type AppRouterConfig = {
    * @see https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/global-not-found
    */
   globalNotFoundPath?: string | null;
+  /** Absolute path to `app/not-found.{tsx,ts,js,jsx}` when present. */
+  appNotFoundPath?: string | null;
   /**
    * When true, the project has a `pages/` directory alongside the App Router.
    * The generated RSC entry exposes `/__vinext/prerender/pages-static-paths`
@@ -570,6 +573,11 @@ export const __imageAllowedWidths = ${JSON.stringify([
   ])};
 export const __imageConfig = ${JSON.stringify({
     qualities: config?.imageConfig?.qualities,
+    formats: config?.imageConfig?.formats,
+    remotePatterns: config?.imageConfig?.remotePatterns,
+    domains: config?.imageConfig?.domains,
+    maximumRedirects: config?.imageConfig?.maximumRedirects,
+    maximumDiskCacheSize: config?.imageConfig?.maximumDiskCacheSize,
     localPatterns: config?.imageConfig?.localPatterns,
     dangerouslyAllowSVG: config?.imageConfig?.dangerouslyAllowSVG,
     dangerouslyAllowLocalIP: config?.imageConfig?.dangerouslyAllowLocalIP,
@@ -800,6 +808,11 @@ export function generateRscEntry(
   ];
   const imageConfig = {
     qualities: config?.imageConfig?.qualities,
+    formats: config?.imageConfig?.formats,
+    remotePatterns: config?.imageConfig?.remotePatterns,
+    domains: config?.imageConfig?.domains,
+    maximumRedirects: config?.imageConfig?.maximumRedirects,
+    maximumDiskCacheSize: config?.imageConfig?.maximumDiskCacheSize,
     localPatterns: config?.imageConfig?.localPatterns,
     dangerouslyAllowSVG: config?.imageConfig?.dangerouslyAllowSVG,
     dangerouslyAllowLocalIP: config?.imageConfig?.dangerouslyAllowLocalIP,
@@ -815,6 +828,7 @@ export function generateRscEntry(
     globalErrorPath,
     globalNotFoundPath:
       config?.globalNotFound === true ? (config.globalNotFoundPath ?? null) : null,
+    appNotFoundPath: config?.appNotFoundPath ?? null,
   });
   const {
     imports,
@@ -827,6 +841,8 @@ export function generateRscEntry(
     rootForbiddenVar,
     rootUnauthorizedVar,
     rootLayoutVars,
+    hasAppRootLayout,
+    appNotFoundVar,
     globalErrorVar,
     globalNotFoundImportSpecifier,
   } = manifestCode;
@@ -1017,12 +1033,13 @@ ${
   cacheComponents
     ? `import {
   appPagePprRuntime as __appPagePprRuntime,
-  createAppPprFallbackShells as __createAppPprFallbackShells,
+  createAppPprRequestFallbackShells as __createAppPprRequestFallbackShells,
 } from ${JSON.stringify(appPagePprRuntimePath)};`
     : ""
 }
 import {
   resolveAppPageGenerateStaticParamsSources as __resolveAppPageGenerateStaticParamsSources,
+  validateAppPageRouteDynamicParams as __validateAppPageRouteDynamicParams,
 } from ${JSON.stringify(appPageRequestPath)};
 import {
   collectAppPageStaticGenerationRuntimes as __collectAppPageStaticGenerationRuntimes,
@@ -1045,10 +1062,14 @@ import {
   appIsrRscKey as __isrRscKey,
   appIsrRouteKey as __isrRouteKey,
   isrGet as __isrGet,
+  isrGetFallbackShell as __isrGetFallbackShell,
   isrSet as __isrSet,
+  isrSetFallbackShell as __isrSetFallbackShell,
   isrSetPrerenderedAppPage as __isrSetPrerenderedAppPage,
+  isrSetPrerenderedFallbackShell as __isrSetPrerenderedFallbackShell,
   isOnDemandRevalidateRequest as __isOnDemandRevalidateRequest,
   triggerBackgroundRegeneration as __triggerBackgroundRegeneration,
+  triggerFallbackShellRegeneration as __triggerFallbackShellRegeneration,
 } from ${JSON.stringify(isrCachePath)};
 // Import server-only state module to register ALS-backed accessors.
 import "vinext/navigation-state";
@@ -1073,6 +1094,7 @@ import { clearAppRequestContext as __clearRequestContext, setAppNavigationContex
 __configureMemoryCacheHandler({ cacheMaxMemorySize: ${JSON.stringify(cacheMaxMemorySize)} });
 import { createAppPrerenderStaticParamsResolver as __createAppPrerenderStaticParamsResolver } from ${JSON.stringify(appPrerenderStaticParamsPath)};
 import { ensureAppRouteModulesLoaded as __ensureRouteLoaded } from ${JSON.stringify(appRouteModuleLoaderPath)};
+import { resolveAppParamMatchingPolicies as __resolveAppParamMatchingPolicies } from ${JSON.stringify(appParamMatchingPath)};
 import {
   getRenderedConcreteUrlPathsForRoute as __getRenderedConcreteUrlPathsForRoute,
   initPregeneratedPathsFromGlobals as __initPregeneratedPathsFromGlobals,
@@ -1168,6 +1190,25 @@ function __resolveRouteSegmentConfig(route, segmentConfigBranches) {
     page: route.page,
     parallelBranches: segmentConfigBranches,
     parallelPages: Object.values(route.slots ?? {}).map((slot) => slot.page ?? slot.default),
+    routeSegments: route.routeSegments,
+  });
+}
+
+function __resolveRouteGenerateStaticParams(route) {
+  return __resolveAppPageGenerateStaticParamsSources({
+    layouts: route.layouts,
+    layoutTreePositions: route.layoutTreePositions,
+    page: route.page,
+    parallelBranches: Object.values(route.slots ?? {}).map((slot) => ({
+      layout: slot.layout,
+      configLayouts: slot.configLayouts,
+      configLayoutTreePositions: slot.configLayoutTreePositions,
+      page: slot.page ?? slot.default,
+      paramNames: slot.slotParamNames,
+      patternParts: slot.slotPatternParts,
+      routeSegments: slot.routeSegments,
+    })),
+    routePatternParts: route.patternParts,
     routeSegments: route.routeSegments,
   });
 }
@@ -1299,6 +1340,8 @@ function __createFallbackRenderer() {
   globalErrorModule: ${globalErrorVar ? globalErrorVar : "null"},
   loadGlobalNotFoundModule: __loadGlobalNotFoundModule,
   globalNotFoundEnabled: ${config?.globalNotFound === true},
+  hasAppRootLayout: ${hasAppRootLayout},
+  appNotFoundModule: ${appNotFoundVar ?? "null"},
   metadataRoutes,
   ssrLoader() {
     return import.meta.viteRsc.loadModule("ssr", "index");
@@ -1419,6 +1462,9 @@ export async function seedMemoryCacheFromPrerender(serverDir) {
     writeAppPageEntry(key, data, metadata) {
       return __isrSetPrerenderedAppPage(key, data, metadata);
     },
+    writeAppPageFallbackShellEntry(key, data, metadata) {
+      return __isrSetPrerenderedFallbackShell(key, data, metadata);
+    },
     writeAppRouteEntry(key, data, policy) {
       return __isrSet(key, data, policy);
     },
@@ -1461,6 +1507,21 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   basePath: __basePath,
   buildId: process.env.__VINEXT_BUILD_ID ?? null,
   ensureRouteLoaded: __ensureRouteLoaded,
+  async isDynamicParamsMiss(route, params) {
+    if (!route.isDynamic) return false;
+    const __segmentConfig = __resolveRouteSegmentConfig(route, __resolveRouteSegmentConfigBranches(route));
+    if (__segmentConfig.dynamicParamsConfig !== false) return false;
+    return (await __validateAppPageRouteDynamicParams({
+      dynamicConfig: __segmentConfig.dynamicConfig,
+      dynamicParamsConfig: __segmentConfig.dynamicParamsConfig,
+      fetchCache: __segmentConfig.fetchCache ?? null,
+      generateStaticParams: __resolveRouteGenerateStaticParams(route),
+      isDynamicRoute: route.isDynamic,
+      isProduction: process.env.NODE_ENV === "production",
+      params,
+      routeSegments: route.routeSegments,
+    })) !== null;
+  },
   prefetchInlining: ${JSON.stringify(prefetchInlining)},
   clearRequestContext() {
     __clearRequestContext();
@@ -1470,7 +1531,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   ${
     cacheComponents
       ? `createPprFallbackShells(route, params) {
-    return __createAppPprFallbackShells(route, params);
+    return __createAppPprRequestFallbackShells(route, params);
   },`
       : ""
   }
@@ -1480,7 +1541,10 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   isDev: process.env.NODE_ENV !== "production",
   draftModeSecret: __draftModeSecret,
   devForwardedMiddlewareContextKey: ${JSON.stringify(config?.devForwardedMiddlewareContextKey ?? null)},
-  dispatchMatchedPage({
+  dispatchMatchedPage(__pageArgs) {
+    // Rebuilt for a fallback shell, so its callbacks render the shell's request.
+    function __createAppPageDispatchOptions(__dispatchArgs) {
+    const {
     bypassInterceptionContextCache,
     cachePathname,
     cleanPathname,
@@ -1500,6 +1564,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     pprFallbackCacheShells,
     pprFallbackShell,
     renderedConcreteUrlPaths,
+    resumeRoutingAfterMiss,
     skipStaticParamsValidation,
     staticParamsValidationParams,
     rootParams,
@@ -1510,28 +1575,13 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     searchParams,
     renderMode,
     renderWholeDocument,
-  }) {
+    } = __dispatchArgs;
     const PageComponent = route.page?.default;
     const __segmentConfigBranches = __resolveRouteSegmentConfigBranches(route);
     const __segmentConfig = __resolveRouteSegmentConfig(route, __segmentConfigBranches);
     const __staticGeneration = __resolveRouteStaticGeneration(route, __segmentConfigBranches);
-    const __generateStaticParams = __resolveAppPageGenerateStaticParamsSources({
-      layouts: route.layouts,
-      layoutTreePositions: route.layoutTreePositions,
-      page: route.page,
-      parallelBranches: Object.values(route.slots ?? {}).map((slot) => ({
-        layout: slot.layout,
-        configLayouts: slot.configLayouts,
-        configLayoutTreePositions: slot.configLayoutTreePositions,
-        page: slot.page ?? slot.default,
-        paramNames: slot.slotParamNames,
-        patternParts: slot.slotPatternParts,
-        routeSegments: slot.routeSegments,
-      })),
-      routePatternParts: route.patternParts,
-      routeSegments: route.routeSegments,
-    });
-    return __dispatchAppPage({
+    const __generateStaticParams = __resolveRouteGenerateStaticParams(route);
+    return {
       basePath: __basePath,
       bypassInterceptionContextCache,
       ensureRouteLoaded: __ensureRouteLoaded,
@@ -1557,6 +1607,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           onHeadPrepared: buildOptions?.onHeadPrepared,
         }, displayPathname, scriptNonce);
       },
+      cachePathname,
       cleanPathname,
       displayPathname,
       clearRequestContext() {
@@ -1603,6 +1654,8 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       isRscRequest,
       isrDebug: __isrDebug,
       isrGet: __isrGet,
+      isrGetFallbackShell: __isrGetFallbackShell,
+      isrSetFallbackShell: __isrSetFallbackShell,
       isrFallbackShellHtmlKey: __isrFallbackShellHtmlKey,
       isrHtmlKey(pathname) {
         return __isrHtmlKey(pathname === cleanPathname ? cachePathname : pathname);
@@ -1627,6 +1680,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       pprFallbackShell,
       pprRuntime: ${cacheComponents ? "__appPagePprRuntime" : "undefined"},
       renderedConcreteUrlPaths,
+      resumeRoutingAfterMiss,
       skipStaticParamsValidation,
       staticParamsValidationParams,
       rootParams,
@@ -1657,10 +1711,10 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
           interceptionContext,
           interceptionId,
         );
-        return __fallbackRenderer.renderHttpAccessFallback(route, statusCode, isRscRequest, request, opts, scriptNonce, currentMiddlewareContext, {
-          isEdgeRuntime: __isEdgeRuntime(__segmentConfig.runtime),
+        return __fallbackRenderer.renderHttpAccessFallback(opts.routeMiss ? null : route, statusCode, isRscRequest, request, opts, scriptNonce, currentMiddlewareContext, {
+          isEdgeRuntime: !opts.routeMiss && __isEdgeRuntime(__segmentConfig.runtime),
           routePathname: cleanPathname,
-          sourcePageSegments: __activeIntercept?.slotKey === __SIBLING_PAGE_INTERCEPT_SLOT_KEY
+          sourcePageSegments: !opts.routeMiss && __activeIntercept?.slotKey === __SIBLING_PAGE_INTERCEPT_SLOT_KEY
             ? __activeIntercept.sourcePageSegments
             : null,
         });
@@ -1692,12 +1746,20 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       scheduleBackgroundRegeneration(key, renderFn, errorContext) {
         __triggerBackgroundRegeneration(key, renderFn, errorContext);
       },
+      scheduleFallbackShellRegeneration(key, renderFn, errorContext) {
+        __triggerFallbackShellRegeneration(key, renderFn, errorContext);
+      },
       scriptNonce,
       searchParams,
       setNavigationContext,
       renderMode,
       renderWholeDocument,
-    });
+      withRequest(requestArgs) {
+        return __createAppPageDispatchOptions({ ...__dispatchArgs, ...requestArgs });
+      },
+    };
+    }
+    return __dispatchAppPage(__createAppPageDispatchOptions(__pageArgs));
   },
   async dispatchMatchedRouteHandler({
     bypassInterceptionContextCache,
@@ -1705,7 +1767,9 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     cleanPathname,
     middlewareContext,
     params,
+    renderNotFound,
     request,
+    resumeRoutingAfterMiss,
     route,
     searchParams,
   }) {
@@ -1731,12 +1795,14 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       middlewareContext,
       middlewareRequestHeaders: middlewareContext.requestHeaders,
       params,
+      renderNotFound,
       request,
       route: {
         pattern: route.pattern,
         routeHandler: route.routeHandler,
         routeSegments: route.routeSegments,
       },
+      resumeRoutingAfterMiss,
       scheduleBackgroundRegeneration: __triggerBackgroundRegeneration,
       searchParams,
     });
@@ -2166,6 +2232,12 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       : ""
   }
   rootParamNamesByPattern: rootParamNamesMap,
+  resolvePrerenderParamMatchingPolicies() {
+    return __resolveAppParamMatchingPolicies(routes, {
+      cacheComponents: ${cacheComponents},
+      ensureRouteLoaded: __ensureRouteLoaded,
+    });
+  },
   setNavigationContext,
   skipProxyUrlNormalize: ${JSON.stringify(config?.skipProxyUrlNormalize ?? false)},
   skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},

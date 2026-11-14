@@ -178,6 +178,21 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     fs.rmSync(nodeModulesLink, { recursive: true, force: true });
   });
 
+  // Every @font-face rule the page loads: the stylesheets the head links to
+  // (Google fonts and extracted local fonts) plus the inline
+  // `<style data-vinext-fonts>` block.
+  async function loadFontCss(html: string): Promise<string> {
+    const parts = [...html.matchAll(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/g)].map(
+      (m) => m[1],
+    );
+    for (const [, href] of html.matchAll(
+      /<link rel="stylesheet"[^>]*href="(\/_next\/static\/[^"]+\.css[^"]*)"/g,
+    )) {
+      parts.push(await (await fetch(`${fontBaseUrl}${href}`)).text());
+    }
+    return parts.join("\n");
+  }
+
   it("emits served URLs in the HTTP Link response header (not filesystem paths)", async () => {
     const res = await fetch(`${fontBaseUrl}/`);
     expect(res.status).toBe(200);
@@ -203,7 +218,11 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     expect(html).toMatch(
       /<link rel="preload"[^>]*href="\/_next\/static\/_vinext_fonts\/[^"]+\.woff2"[^>]*as="font"/,
     );
-    expect(html).not.toContain("?dpl=dpl-font-prod-test");
+    // Font files are immutable and stay query-free; only the stylesheet
+    // link carries the deployment id, like every other `_next/static` CSS.
+    for (const [preload] of html.matchAll(/<link rel="preload"[^>]*as="font"[^>]*>/g)) {
+      expect(preload).not.toContain("?dpl=dpl-font-prod-test");
+    }
     expect(html).not.toContain(FONT_FIXTURE_DIR);
     expect(html).not.toContain(".vinext/fonts");
   });
@@ -218,15 +237,21 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     ].map((m) => m[1]);
     expect(preloadHrefs.length).toBeGreaterThan(0);
     const googleFontHref = preloadHrefs.find((href) => href.includes("/_vinext_fonts/"));
-    const localFontHref = preloadHrefs.find((href) => !href.includes("/_vinext_fonts/"));
+    const localFontHref = preloadHrefs.find(
+      (href) => !href.includes("/_vinext_fonts/") && href.endsWith(".ttf"),
+    );
     expect(googleFontHref).toBeDefined();
     expect(localFontHref).toBeDefined();
     const styleMatch = html.match(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/);
     expect(styleMatch).not.toBeNull();
-    const localFontFace = styleMatch![1]
+    const fontCss = await loadFontCss(html);
+    const localFontFace = fontCss
       .match(/@font-face\s*\{[^}]*\}/g)
       ?.find((fontFace) => fontFace.includes(localFontHref!));
     expect(localFontFace).toBeDefined();
+    // Byte-identical to the preload, deployment query included, so the
+    // browser reuses the preloaded file.
+    expect(localFontFace).toContain(`url(${localFontHref})`);
     expect(localFontFace).not.toContain("font-weight:");
     // The fixture mirrors #2793's 400/600/700 reproduction. Its omitted
     // local-font weight also matches the equivalent Next.js fixture:
@@ -237,11 +262,11 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     }
     for (const href of preloadHrefs) {
       expect(href).not.toContain("?");
-      expect(styleMatch![1]).toContain(href);
+      expect(fontCss).toContain(href);
       const fontRes = await fetch(`${fontBaseUrl}${href}`);
       expect(fontRes.status, href).toBe(200);
       expect(fontRes.headers.get("content-type")).toBe(
-        href === localFontHref
+        href.endsWith(".ttf")
           ? "font/ttf"
           : href.endsWith(".otf")
             ? "font/otf"
@@ -257,9 +282,28 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     expect(linkHrefs.some((href) => !href.includes("/_vinext_fonts/"))).toBe(true);
     for (const href of linkHrefs) {
       expect(href).not.toContain("?");
-      expect(styleMatch![1]).toContain(href);
+      expect(fontCss).toContain(href);
       expect(preloadHrefs).toContain(href);
     }
+  });
+
+  it("serves next/font/local @font-face rules from a stylesheet, not inline", async () => {
+    // Next.js generates next/font/local's @font-face rules at build time and
+    // ships them in the build's CSS, including for a font declared in its own
+    // module (app/fonts.ts here):
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/next-font/with-font-declarations-file.test.ts
+    const html = await (await fetch(`${fontBaseUrl}/`)).text();
+    const inline = [...html.matchAll(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/g)]
+      .map((m) => m[1])
+      .join("\n");
+    for (const fontFace of inline.match(/@font-face\s*\{[^}]*\}/g) ?? []) {
+      expect(fontFace).not.toMatch(/localSans|declaredFont/);
+    }
+    expect(inline).toContain("--font-declared: 'declaredFont', sans-serif;");
+    const fontCss = await loadFontCss(html);
+    expect(fontCss).toMatch(/@font-face\s*\{[^}]*font-family:\s*'?localSans'?[;}]/);
+    expect(fontCss).toMatch(/@font-face\s*\{[^}]*font-family:\s*'?declaredFont'?[;}]/);
+    expect(fontCss).toMatch(/@font-face\s*\{[^}]*font-family:\s*'?localSans Fallback'?[;}]/);
   });
 
   it("self-hosts an extensionless Google font URL as WOFF2 with matching preloads", async () => {
@@ -278,7 +322,7 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     expect(preload![0]).toContain('type="font/woff2"');
     expect(res.headers.get("link")).toContain(`<${href}>; rel=preload; as=font; type=font/woff2`);
 
-    const styleContent = html.match(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/)![1];
+    const styleContent = await loadFontCss(html);
     expect(styleContent).toContain(`url(${href}) format('woff2')`);
     expect(styleContent).not.toContain("/l/font?");
     expect(styleContent).not.toContain("fonts.gstatic.com");
@@ -310,20 +354,32 @@ describe("App Router Production server self-hosted next/font/google headers", ()
     }
   });
 
-  it("emits served URLs in the injected <style data-vinext-fonts> block", async () => {
-    // The injected @font-face CSS is the upstream source of truth the body
+  it("emits served URLs in the external @font-face stylesheet", async () => {
+    // The served @font-face CSS is the upstream source of truth the head
     // `<link>` tags and HTTP `Link:` header are both derived from — a
     // regression here would reproduce the bug across all three emission
-    // paths at once.
+    // paths at once. Since issue #1897, the CSS is no longer inlined into
+    // the HTML; it is served as an external cacheable stylesheet referenced
+    // by a `<link rel="stylesheet">` tag.
     const res = await fetch(`${fontBaseUrl}/`);
     const html = await res.text();
-    const styleMatch = html.match(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/);
-    expect(styleMatch).not.toBeNull();
-    const styleContent = styleMatch![1];
-    expect(styleContent).toMatch(/url\(\/_next\/static\/_vinext_fonts\/[^)]+\.woff2\)/);
-    expect(styleContent).not.toContain("?dpl=");
-    expect(styleContent).not.toContain(FONT_FIXTURE_DIR);
-    expect(styleContent).not.toContain(".vinext/fonts");
+    const linkMatch = html.match(
+      /<link rel="stylesheet"[^>]*href="(\/_next\/static\/_vinext_fonts\/[^"?]+\.css)(?:\?[^"]*)?"/,
+    );
+    expect(linkMatch).not.toBeNull();
+    const cssRes = await fetch(`${fontBaseUrl}${linkMatch![1]}`);
+    expect(cssRes.status).toBe(200);
+    expect(cssRes.headers.get("content-type")).toContain("text/css");
+    const cssContent = await cssRes.text();
+    expect(cssContent).toMatch(/url\(\/_next\/static\/_vinext_fonts\/[^)]+\.woff2\)/);
+    expect(cssContent).not.toContain(FONT_FIXTURE_DIR);
+    expect(cssContent).not.toContain(".vinext/fonts");
+    // The HTML itself must not inline any Google @font-face src urls.
+    const styleBlocks = [...html.matchAll(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/g)];
+    for (const [, styleContent] of styleBlocks) {
+      expect(styleContent).not.toContain("/_vinext_fonts/");
+      expect(styleContent).not.toContain(FONT_FIXTURE_DIR);
+    }
   });
 
   it("serves the cached font files copied into the client output", async () => {

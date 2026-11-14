@@ -20,6 +20,14 @@ const STALE_REVALIDATE_CACHE_CONTROL = "s-maxage=0, stale-while-revalidate";
 
 export const NO_STORE_CACHE_CONTROL = "no-store, must-revalidate";
 
+/**
+ * Development documents and RSC/data payloads. Next.js sends a bare `no-store`
+ * (vercel/next.js#97505): `must-revalidate` only governs reuse of a stored
+ * stale response, and nothing is stored. Dev static assets keep a
+ * revalidatable header so unchanged files still come back as `304`.
+ */
+export const DEV_DOCUMENT_CACHE_CONTROL = "no-store";
+
 const SHARED_CACHE_DIRECTIVE_RE = /(?:^|,)\s*s-maxage\s*=/i;
 export function shouldUseNextDeployCacheControl(): boolean {
   return process.env.VINEXT_NEXT_DEPLOY_CACHE_CONTROL === "1";
@@ -199,15 +207,13 @@ export function applyCdnResponseBuildIdentityHeaders(response: Response): Respon
     applyResponseHeaderMap(response.headers, map);
     return response;
   } catch {
-    // Response.redirect() has immutable headers. Recreate only those responses
-    // that need adapter identity so the outer runtime boundary can stamp them.
-    const headers = new Headers(response.headers);
-    applyResponseHeaderMap(headers, map);
-    return new Response(response.body, {
-      headers,
-      status: response.status,
-      statusText: response.statusText,
-    });
+    // Response.redirect() and fetch() responses have immutable headers.
+    // Recreate only those responses that need adapter identity so the outer
+    // runtime boundary can stamp them. Using the response as the init keeps
+    // workerd's webSocket, which a 101 upgrade cannot be constructed without.
+    const rebuilt = new Response(response.body, response as ResponseInit);
+    applyResponseHeaderMap(rebuilt.headers, map);
+    return rebuilt;
   }
 }
 

@@ -4,20 +4,30 @@ import type { NavigationContext } from "vinext/shims/navigation";
 import { runInWorkStoreScope } from "vinext/shims/internal/work-store-scope";
 import {
   _captureRequestScopedCacheLifeAccessors,
+  _getResumeDataCacheSeed,
   _isOnDemandRevalidate,
+  _setResumeDataCacheCollector,
+  _setResumeDataCacheSeed,
 } from "vinext/shims/cache-request-state";
-import type { RootParams } from "vinext/shims/root-params";
-import type { PprFallbackShellState } from "vinext/shims/ppr-fallback-shell";
+import { createResumeDataCache } from "vinext/shims/resume-data-cache";
+import { setRootParams, type RootParams } from "vinext/shims/root-params";
+import type {
+  PprFallbackShellPrefetchStage,
+  PprFallbackShellState,
+} from "vinext/shims/ppr-fallback-shell";
 import {
   consumeDynamicUsage,
   consumeInvalidDynamicUsageError,
+  getActiveDraftModeState,
   getAndClearPendingCookies,
   getDraftModeCookieHeader,
   getHeadersContext,
+  type HeadersContext,
   isDraftModeRequest,
   peekDynamicUsage,
   peekRenderRequestApiUsage,
   runWithConnectionProbe,
+  runStaticParamsCheckDetached,
   runWithDetachedDynamicUsage,
   setHeadersContext,
 } from "vinext/shims/headers";
@@ -37,7 +47,6 @@ import {
   setCurrentFetchRevalidate,
   setCurrentForceDynamicFetchDefault,
   setCurrentFetchSoftTags,
-  setRefreshStaleFetchesInForeground,
 } from "vinext/shims/fetch-cache";
 import type { AppOutgoingElements } from "./app-elements.js";
 import type { AppPagePprFallbackCacheShell } from "./app-ppr-fallback-shell.js";
@@ -71,9 +80,10 @@ import {
   type AppPageInterceptState,
   buildAppPageElement,
   resolveAppPageInterceptionRerenderTarget,
+  resolveAppPageGeneratedStaticParams,
   resolveAppPageIntercept,
   resolveAppPageInterceptState,
-  validateAppPageDynamicParams,
+  validateAppPageRouteDynamicParams,
   type ValidateAppPageDynamicParamsOptions,
 } from "./app-page-request.js";
 import { applyIneligibleRouteCachePolicy, renderAppPageLifecycle } from "./app-page-render.js";
@@ -94,11 +104,18 @@ import {
 } from "./app-rsc-cache-busting.js";
 import {
   APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
+  APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
   APP_RSC_RENDER_MODE_NAVIGATION,
+  getStaticShellPrefetchStage,
+  VINEXT_VARY_PARAMS_HEADER,
   type AppRscRenderMode,
 } from "./app-rsc-render-mode.js";
 import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
-import { createAppPageRscErrorTracker, type AppPageSsrHandler } from "./app-page-stream.js";
+import {
+  createAppPageRscErrorTracker,
+  type AppPagePprShellResume,
+  type AppPageSsrHandler,
+} from "./app-page-stream.js";
 import {
   NEXT_ROUTER_PREFETCH_HEADER,
   VINEXT_INTERCEPTION_ID_HEADER,
@@ -107,6 +124,7 @@ import {
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
 } from "./headers.js";
 import { parseMountedLayoutsHeader } from "./app-mounted-layouts.js";
+import { markRouteMissResponse } from "./route-miss-response.js";
 import { buildAppPageTags } from "./implicit-tags.js";
 import { resolveAppPageTraceOperation } from "./app-page-tracing.js";
 import {
@@ -124,11 +142,36 @@ import {
 import {
   cacheabilityManifestPageState,
   type CacheabilityManifest,
+  type CacheabilityManifestRouteState,
   type CacheabilityRepresentation,
 } from "./cacheability-manifest.js";
 import type { AppRenderErrorContextOverrides } from "./app-rsc-error-handler.js";
 import { traceResponseStart } from "./response-start-tracing.js";
+import { encodePrerenderRouteParams } from "./prerender-route-params.js";
+import { runWithPrerenderWorkUnit } from "./prerender-work-unit-setup.js";
+import { normalizePregeneratedPathname } from "./pregenerated-concrete-paths.js";
 import { getFrameworkLinkHeader } from "./app-response-header-provenance.js";
+import { notFoundResponse } from "./http-error-responses.js";
+import {
+  collectGeneratedParamNames,
+  getResolvedClosedParamNames,
+  isParamMatchingFallbackShellAllowed,
+  resolveParamMatchingAdmission,
+  resolveRouteParamMatching,
+  validateParamMatchingParams,
+  type ParamMatching,
+  type ParamMatchingFallbackMode,
+  type ParamMatchingRoute,
+} from "./app-param-matching.js";
+import { patternToNextFormat } from "../routing/route-validation.js";
+import {
+  createEmptyStaticParamsError,
+  createIncompleteStaticParamsErrorInStaticRoute,
+  createMissingGspErrorInStaticRoute,
+  createNonPrerenderableBodyErrorInStaticRoute,
+  findMissingStaticParamNames,
+  isEnsureStaticNavigationRoute,
+} from "./app-ensure-static.js";
 
 type AppPageParams = Record<string, string | string[]>;
 type AppPageElement = ReactNode | Readonly<Record<string, ReactNode>>;
@@ -313,13 +356,33 @@ export type AppPagePprRuntime<TRoute extends AppPageDispatchRoute> = {
   beginFinalRender(state: AppPagePprState): void;
   getState(): AppPagePprState | null;
   run<T>(shell: NonNullable<DispatchAppPageOptions<TRoute>["pprFallbackShell"]>, fn: () => T): T;
+  /** Run a shell's one render, which stops at its holes once its caches settle. */
+  runSinglePass<T>(
+    shell: NonNullable<DispatchAppPageOptions<TRoute>["pprFallbackShell"]>,
+    fn: () => T,
+  ): T;
   tryServe(
     options: DispatchAppPageOptions<TRoute>,
     currentRevalidateSeconds: number | null,
     isDraftMode: boolean,
     isForceStatic: boolean,
     isForceDynamic: boolean,
-  ): Promise<Response | null>;
+  ): Promise<Response | AppPagePprShellResume | null>;
+  /**
+   * After a page rendered dynamically, produce in the background the shell of
+   * its path that later requests resume.
+   */
+  produceConcreteShell(
+    options: DispatchAppPageOptions<TRoute>,
+    currentRevalidateSeconds: number | null,
+    isDraftMode: boolean,
+    isForceDynamic: boolean,
+  ): void;
+  /** Produce the missing shells of a generated path rendered for the cache. */
+  produceMissingShells(
+    options: DispatchAppPageOptions<TRoute>,
+    currentRevalidateSeconds: number | null,
+  ): Promise<void>;
   warm(options: WarmPprFallbackShellCachesOptions): Promise<void>;
 };
 
@@ -402,6 +465,11 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   hasPageDefaultExport: boolean;
   hasPageModule: boolean;
   handlerStart: number;
+  /**
+   * The pathname the page's cache entries key by: a rewrite's source rather
+   * than its destination. Defaults to `cleanPathname`.
+   */
+  cachePathname?: string;
   htmlLimitedBots?: string;
   interceptionContext: string | null;
   isEdgeRuntime?: boolean;
@@ -418,6 +486,10 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   isrDebug?: AppPageDebugLogger;
   isrGet: AppPageCacheGetter;
   isrFallbackShellHtmlKey: (pathname: string) => string;
+  /** Read a fallback shell from the data cache. Defaults to `isrGet`. */
+  isrGetFallbackShell?: AppPageCacheGetter;
+  /** Store a fallback shell a request rendered. Without it, shells are only read. */
+  isrSetFallbackShell?: AppPageCacheSetter;
   isrHtmlKey: (pathname: string) => string;
   isrRscKey: (
     pathname: string,
@@ -434,7 +506,10 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   pprFallbackCacheShells?: readonly AppPagePprFallbackCacheShell[] | null;
   pprFallbackShell?: {
     fallbackParamNames: readonly string[];
+    isRuntimePrefetch?: boolean;
+    prefetchStage?: PprFallbackShellPrefetchStage;
     routePattern: string;
+    varyParams?: Set<string>;
   };
   pprRuntime?: AppPagePprRuntime<TRoute>;
   /**
@@ -445,6 +520,11 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
    * has a transient gap. Falls through to a fresh render instead.
    */
   renderedConcreteUrlPaths?: ReadonlySet<string>;
+  /**
+   * Called on a dynamicParams = false miss. When it returns true, routing
+   * resumes with the fallback rewrites, so the miss renders no 404.
+   */
+  resumeRoutingAfterMiss?: () => boolean;
   skipStaticParamsValidation?: boolean;
   staticParamsValidationParams?: AppPageParams;
   rootParams?: RootParams;
@@ -470,6 +550,8 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
       matchedParams: AppPageParams;
       /** The route's render threw the signal, so the document keeps the route's head. */
       routeHead?: AppPageFallbackRouteHead;
+      /** Render the root not-found as if no route matched, as Next.js routing does. */
+      routeMiss?: boolean;
     },
     middlewareContext: AppPageMiddlewareContext | null,
   ) => Promise<Response | null>;
@@ -500,6 +582,8 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   route: TRoute;
   runWithSuppressedHookWarning<T>(probe: () => Promise<T>): Promise<T>;
   scheduleBackgroundRegeneration: AppPageBackgroundRegenerator;
+  /** Regenerate a stale fallback shell. Defaults to `scheduleBackgroundRegeneration`. */
+  scheduleFallbackShellRegeneration?: AppPageBackgroundRegenerator;
   scriptNonce?: string;
   searchParams: URLSearchParams;
   setNavigationContext: (context: {
@@ -514,6 +598,43 @@ export type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
    * render no client is waiting on, such as its regeneration or a warm-up.
    */
   renderWholeDocument?: boolean;
+  /**
+   * These options rebuilt for another request, such as a fallback shell's, or
+   * with some of this request's fields replaced, so every callback that closes
+   * over the request renders that one instead.
+   */
+  withRequest?: (request: Partial<AppPageDispatchRequest>) => DispatchAppPageOptions<TRoute>;
+};
+
+/** The request a page dispatch's options are built from. */
+export type AppPageDispatchRequest = {
+  actionError?: unknown;
+  actionFailed?: boolean;
+  bypassInterceptionContextCache: boolean;
+  cachePathname: string;
+  cleanPathname: string;
+  displayPathname: string;
+  formState: ReactFormState | null;
+  interceptionContext: string | null;
+  interceptionId: string | null;
+  interceptionPathname: string;
+  isProgressiveActionRender: boolean;
+  isRscRequest: boolean;
+  middlewareContext: AppPageMiddlewareContext;
+  mountedSlotsHeader: string | null;
+  params: AppPageParams;
+  pprFallbackCacheShells: readonly AppPagePprFallbackCacheShell[] | null;
+  pprFallbackShell?: NonNullable<DispatchAppPageOptions<AppPageDispatchRoute>["pprFallbackShell"]>;
+  renderedConcreteUrlPaths?: ReadonlySet<string>;
+  renderedPathAndSearch: string | null;
+  renderMode: AppRscRenderMode;
+  renderWholeDocument: boolean;
+  request: Request;
+  rootParams?: RootParams;
+  scriptNonce?: string;
+  searchParams: URLSearchParams;
+  skipStaticParamsValidation?: boolean;
+  staticParamsValidationParams?: AppPageParams;
 };
 
 export function shouldReadAppPageCache(options: {
@@ -553,12 +674,7 @@ export function hasSearchParams(searchParams: URLSearchParams | null | undefined
   return searchParams !== null && searchParams !== undefined && searchParams.size > 0;
 }
 
-async function runAppPageRevalidationContext<
-  TResult extends {
-    html: string;
-    tags: string[];
-  },
->(
+async function runAppPageRevalidationContext<TResult>(
   options: {
     cleanPathname: string;
     displayPathname?: string;
@@ -566,6 +682,8 @@ async function runAppPageRevalidationContext<
     currentFetchRevalidate?: number | null;
     draftModeSecret: string;
     dynamicConfig?: string;
+    /** The render's request data; a static generation has none. */
+    headersContext?: HeadersContext;
     params: AppPageParams;
     rootParams?: RootParams;
     routePattern: string;
@@ -575,13 +693,15 @@ async function runAppPageRevalidationContext<
   renderFn: () => Promise<TResult>,
 ): Promise<TResult> {
   const { createStaticGenerationHeadersContext } = await import("./app-static-generation.js");
-  const headersContext = createStaticGenerationHeadersContext({
-    draftModeEnabled: false,
-    draftModeSecret: options.draftModeSecret,
-    dynamicConfig: options.dynamicConfig,
-    routeKind: "page",
-    routePattern: options.routePattern,
-  });
+  const headersContext =
+    options.headersContext ??
+    createStaticGenerationHeadersContext({
+      draftModeEnabled: false,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      routeKind: "page",
+      routePattern: options.routePattern,
+    });
   const requestContext = createRequestContext({
     headersContext,
     currentFetchCacheMode: options.currentFetchCacheMode ?? null,
@@ -595,7 +715,6 @@ async function runAppPageRevalidationContext<
   const revalidation = runWithRequestContext(requestContext, () =>
     runInWorkStoreScope(async () => {
       ensureFetchPatch();
-      setRefreshStaleFetchesInForeground(process.env.VINEXT_PRERENDER === "1");
       setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], options.routeSegments));
       options.setNavigationContext({
         pathname: options.displayPathname ?? options.cleanPathname,
@@ -610,6 +729,31 @@ async function runAppPageRevalidationContext<
   } finally {
     await closeAfterResponse(requestContext);
   }
+}
+
+/**
+ * Run work a request needs that the build runs apart from any render, such as
+ * asking generateStaticParams which paths it produces, so the request's render
+ * state neither reaches it nor sees what it does.
+ */
+export function runAppPageStaticGenerationWork<TRoute extends AppPageDispatchRoute, TResult>(
+  options: DispatchAppPageOptions<TRoute>,
+  work: () => Promise<TResult>,
+): Promise<TResult> {
+  return runAppPageRevalidationContext(
+    {
+      cleanPathname: options.cleanPathname,
+      currentFetchCacheMode: options.fetchCache ?? null,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      params: options.params,
+      rootParams: options.rootParams,
+      routePattern: options.route.pattern,
+      routeSegments: options.route.routeSegments,
+      setNavigationContext: options.setNavigationContext,
+    },
+    work,
+  );
 }
 
 function toInterceptOptions(
@@ -655,25 +799,231 @@ function toInterceptOptions(
  * and every path keeps candidate mode, as on core.
  */
 function hasNoManifestAdmissionState(routePattern: string): boolean {
-  const admission = readRouteCacheabilityState()?.admission;
+  return readManifestAdmissionState(routePattern) === null;
+}
+
+/**
+ * Whether the Workers Cache request stage dropped the query from this
+ * dispatch, as it does for a path its deploy manifest gives the
+ * `static-candidate` state unless a next.config cache policy applies.
+ */
+export function isQueryFreeManifestDispatch(routePattern: string): boolean {
   return (
-    admission?.policy === "manifest" &&
-    admission.representation !== undefined &&
-    admission.routePathname !== undefined &&
-    cacheabilityManifestPageState(
-      admission.manifest as CacheabilityManifest,
-      { kind: "app-page", pattern: routePattern },
-      admission.representation as CacheabilityRepresentation,
-      admission.routePathname,
-    ) === null
+    readRouteCacheabilityState()?.dropsStaticCandidateQuery === true &&
+    readManifestAdmissionState(routePattern) === "static-candidate"
   );
+}
+
+/** The deploy manifest's state for the request's path, or `undefined` without one. */
+function readManifestAdmissionState(
+  routePattern: string,
+): CacheabilityManifestRouteState | null | undefined {
+  const admission = readRouteCacheabilityState()?.admission;
+  if (
+    admission?.policy !== "manifest" ||
+    admission.representation === undefined ||
+    admission.routePathname === undefined
+  ) {
+    return undefined;
+  }
+  return cacheabilityManifestPageState(
+    admission.manifest as CacheabilityManifest,
+    { kind: "app-page", pattern: routePattern },
+    admission.representation as CacheabilityRepresentation,
+    admission.routePathname,
+  );
+}
+
+/** The options rebuilt for another render mode, `buildPageElement` included. */
+function withRenderMode<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  renderMode: AppRscRenderMode,
+): DispatchAppPageOptions<TRoute> {
+  return options.withRequest?.({ renderMode }) ?? { ...options, renderMode };
+}
+
+type AppPageParamMatchingAdmission = {
+  fallbackMode: ParamMatchingFallbackMode | undefined;
+  paramMatching: ParamMatching;
+  resolvedParamCount: number;
+};
+
+const paramMatchingAdmissions = new WeakMap<
+  Request,
+  Promise<AppPageParamMatchingAdmission | null>
+>();
+
+/**
+ * Where the request stands under its route's `unstable_paramMatching` policy,
+ * once per request. Null when the route configures none, or for a render that
+ * isn't a request for the route's URL: a fallback shell's own render, which
+ * leaves its params as placeholders, or one that skips generated-param checks.
+ *
+ * Like Next.js's prerender matchers, the most specific generated prefix of
+ * the request's params decides, and the first configured param after it gives
+ * the mode. Next.js reads both from its prerender manifest; vinext asks
+ * generateStaticParams, as `dynamicParams = false` does, so a deploy without
+ * prerendering decides the same way.
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/base-server.ts
+ */
+function getAppPageParamMatchingAdmission<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+): Promise<AppPageParamMatchingAdmission | null> {
+  if (
+    options.pprFallbackShell !== undefined ||
+    options.skipStaticParamsValidation === true ||
+    options.route.params.length === 0
+  ) {
+    return Promise.resolve(null);
+  }
+  let admission = paramMatchingAdmissions.get(options.request);
+  if (!admission) {
+    admission = resolveAppPageParamMatchingAdmission(options);
+    paramMatchingAdmissions.set(options.request, admission);
+  }
+  return admission;
+}
+
+async function resolveAppPageParamMatchingAdmission<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+): Promise<AppPageParamMatchingAdmission | null> {
+  const route = options.route as TRoute & ParamMatchingRoute;
+  const paramMatching = await resolveRouteParamMatching(route, {
+    cacheComponents: options.pprRuntime !== undefined,
+    run: (work) => runAppPageStaticGenerationWork(options, work),
+  });
+  if (!paramMatching) return null;
+
+  const { hasGeneratedStaticParamsFor, resolveAppPageGeneratedStaticParams } =
+    await import("./app-page-request.js");
+  const params = options.staticParamsValidationParams ?? options.params;
+  const generated = await runAppPageStaticGenerationWork(options, () =>
+    resolveAppPageGeneratedStaticParams({
+      generateStaticParams: options.generateStaticParams,
+      params,
+      routeParamNames: {
+        optionalCatchAllParamNames: route.pattern
+          .split("/")
+          .filter((part) => part.startsWith(":") && part.endsWith("*"))
+          .map((part) => part.slice(1, -1)),
+        paramNames: route.params,
+      },
+    }),
+  );
+  const staticParams = generated?.staticParams ?? [];
+  // The build checks this against every generated set; dev checks it here,
+  // as Next.js's dev server does when it resolves the route's static paths.
+  const { generatedParamNames, missingParamNames } = collectGeneratedParamNames(
+    route.params,
+    staticParams,
+  );
+  validateParamMatchingParams(
+    route.pattern,
+    paramMatching,
+    generatedParamNames,
+    missingParamNames,
+    route.params,
+    undefined,
+  );
+
+  if (generated?.isGenerated) {
+    return { fallbackMode: undefined, paramMatching, resolvedParamCount: route.params.length };
+  }
+  return {
+    paramMatching,
+    ...resolveParamMatchingAdmission({
+      dynamicParams: options.dynamicParamsConfig,
+      isGenerated: (paramNames) => hasGeneratedStaticParamsFor(params, staticParams, paramNames),
+      paramMatching,
+      rootParamNames: route.rootParamNames ?? [],
+      routeParamNames: route.params,
+    }),
+  };
+}
+
+/**
+ * The fallback shells a request may resume under its admission: none past a
+ * blocking boundary, and only those leaving a fallback boundary unknown.
+ */
+function filterParamMatchingFallbackShells<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  admission: AppPageParamMatchingAdmission | null,
+): DispatchAppPageOptions<TRoute> {
+  if (!admission || !options.pprFallbackCacheShells?.length) return options;
+  const rootParamNames = (options.route as TRoute & ParamMatchingRoute).rootParamNames ?? [];
+  return {
+    ...options,
+    pprFallbackCacheShells:
+      admission.fallbackMode === "blocking"
+        ? []
+        : options.pprFallbackCacheShells.filter((shell) =>
+            isParamMatchingFallbackShellAllowed(
+              admission.paramMatching,
+              shell.fallbackParamNames,
+              rootParamNames,
+            ),
+          ),
+  };
 }
 
 export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
 ): Promise<Response> {
+  const prefetchStage =
+    options.renderMode === undefined ? undefined : getStaticShellPrefetchStage(options.renderMode);
+  // A rejected param value is a 404 before any prefetch serves its route, so
+  // client route discovery never learns a tree for it.
+  if (
+    prefetchStage !== undefined &&
+    (await getAppPageParamMatchingAdmission(options))?.fallbackMode !== "not-found"
+  ) {
+    const {
+      markRuntimePrefetchResponse,
+      prefetchesAtRuntime,
+      serveAppPageRuntimePrefetch,
+      serveAppPageStaticShellPrefetch,
+    } = await import("./app-page-static-shell-prefetch.js");
+    const isDraftMode = isDraftModeRequest(options.request, options.draftModeSecret);
+    // Like Next.js with Partial Prefetching, a prefetch past the shell stage
+    // renders for the request: it holds the page's cached content, private
+    // caches included, and leaves its dynamic data out.
+    if (
+      prefetchStage === "prefetch" ||
+      prefetchStage === "navigation" ||
+      prefetchesAtRuntime(options.route)
+    ) {
+      const runtimePrefetchResponse = await serveAppPageRuntimePrefetch(
+        options,
+        isDraftMode,
+        prefetchStage ?? undefined,
+      );
+      if (runtimePrefetchResponse) return runtimePrefetchResponse;
+      // A prefetch that can't be prerendered, such as a draft mode one, gets
+      // the page's navigation payload.
+      return markRuntimePrefetchResponse(
+        await dispatchAppPage(withRenderMode(options, APP_RSC_RENDER_MODE_NAVIGATION)),
+      );
+    }
+    const staticShellResponse = await serveAppPageStaticShellPrefetch(
+      options,
+      isDraftMode,
+      prefetchStage === "shell" ? "shell" : undefined,
+    );
+    if (staticShellResponse) return staticShellResponse;
+    // A prefetch that can't have a static shell gets the route's loading
+    // shell, without the static-shell header.
+    return dispatchAppPage(withRenderMode(options, APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL));
+  }
   const dispatch = () =>
-    runWithFetchDedupe(async () => dispatchAppPageInner(await withResolvedIntercept(options)));
+    runWithFetchDedupe(async () => {
+      const response = await dispatchAppPageInner(await withResolvedIntercept(options));
+      // Like Next.js, a document resumed from a fallback shell is marked as
+      // having postponed.
+      if (!options.isRscRequest && _getResumeDataCacheSeed() !== null) {
+        response.headers.set("x-nextjs-postponed", "1");
+      }
+      return response;
+    });
   let response: Response;
   if (!options.pprFallbackShell || !options.pprRuntime) {
     response = await dispatch();
@@ -721,6 +1071,233 @@ async function withResolvedIntercept<TRoute extends AppPageDispatchRoute>(
     isStaticGenerationEdgeRuntime: config.isStaticGenerationEdgeRuntime,
     revalidateSeconds: config.revalidateSeconds,
   };
+}
+
+/**
+ * Render a fallback shell as the build prerenders it, for a request that found
+ * none stored: an isolated static generation of the shell's pathname whose
+ * fallback params suspend. The response is buffered, with the shell's resume
+ * data cache after its HTML.
+ */
+export async function renderAppPageFallbackShell<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  shell: AppPagePprFallbackCacheShell,
+): Promise<Response> {
+  const pprRuntime = options.pprRuntime;
+  if (!pprRuntime) throw new Error("[vinext] A fallback shell needs cacheComponents.");
+  const route = options.route;
+  // The params the build's prerender request carries for this shell.
+  const params =
+    encodePrerenderRouteParams(route.pattern, shell.params, shell.fallbackParamNames)?.params ?? {};
+  const pathname = normalizePregeneratedPathname(shell.pathname);
+  const pprFallbackShell = {
+    fallbackParamNames: shell.fallbackParamNames,
+    routePattern: route.pattern,
+  };
+  if (!options.withRequest) throw new Error("[vinext] A fallback shell needs its own request.");
+  // The build's prerender request for the shell. A shell keeps every root param.
+  const shellOptions = options.withRequest({
+    actionError: undefined,
+    actionFailed: false,
+    bypassInterceptionContextCache: false,
+    cachePathname: pathname,
+    cleanPathname: pathname,
+    displayPathname: pathname,
+    formState: null,
+    interceptionContext: null,
+    interceptionId: null,
+    interceptionPathname: pathname,
+    isProgressiveActionRender: false,
+    isRscRequest: false,
+    middlewareContext: { headers: null, status: null },
+    mountedSlotsHeader: null,
+    params,
+    pprFallbackCacheShells: null,
+    pprFallbackShell,
+    renderedConcreteUrlPaths: undefined,
+    renderedPathAndSearch: shell.pathname,
+    renderMode: APP_RSC_RENDER_MODE_NAVIGATION,
+    renderWholeDocument: false,
+    request: new Request(
+      new URL(`${options.basePath ?? ""}${shell.pathname}`, options.request.url),
+    ),
+    rootParams: options.rootParams,
+    scriptNonce: undefined,
+    searchParams: new URLSearchParams(),
+    skipStaticParamsValidation: true,
+    staticParamsValidationParams: undefined,
+  });
+  return runAppPageRevalidationContext(
+    {
+      cleanPathname: pathname,
+      currentFetchCacheMode: options.fetchCache ?? null,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      params,
+      rootParams: options.rootParams,
+      routePattern: route.pattern,
+      routeSegments: route.routeSegments,
+      setNavigationContext: options.setNavigationContext,
+    },
+    () =>
+      runWithPrerenderWorkUnit(
+        () =>
+          pprRuntime.run(pprFallbackShell, async () => {
+            const response = await dispatchAppPageInner(shellOptions);
+            return new Response(response.body ? await response.text() : null, {
+              headers: response.headers,
+              status: response.status,
+              statusText: response.statusText,
+            });
+          }),
+        { cacheComponents: true, prerender: true, route: route.pattern },
+      ),
+  );
+}
+
+/**
+ * Render a Cache Components page's static shell as Next.js prefetches it: the
+ * page's navigation payload prerendered, with its dynamic parts left at their
+ * Suspense fallbacks. `isPartial` tells whether it left any. The response is
+ * buffered.
+ *
+ * With `isRuntimePrefetch`, it's the page's runtime prefetch instead, as
+ * Next.js's `prerender-runtime`: the request's cookies, headers and private
+ * caches render too. `prefetchStage` is how far it renders, as
+ * `PprFallbackShellState.prefetchStage`.
+ */
+export async function renderAppPageStaticShell<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  isRuntimePrefetch = false,
+  prefetchStage?: PprFallbackShellPrefetchStage,
+): Promise<{ isPartial: boolean; response: Response }> {
+  const pprRuntime = options.pprRuntime;
+  if (!pprRuntime) throw new Error("[vinext] A static shell needs cacheComponents.");
+  if (!options.withRequest) throw new Error("[vinext] A static shell needs its own request.");
+  const route = options.route;
+  const pathname = options.cleanPathname;
+  // Closed params decide whether the route exists even when no component
+  // reads them, so a shell is shared only by URLs with the same values, as
+  // Next.js's `PrefetchHint.IsClosedParam` keeps the client from predicting.
+  const varyParams = new Set<string>(getResolvedClosedParamNames(route));
+  // Like Next.js, an App Shell is the page with every param but its root
+  // params left to holes, so it's the shell of every path that shares those.
+  // A root param stays concrete: the root layout may read it, and a locale's
+  // shell must not answer another locale (vercel/next.js@643e34a).
+  const rootParamNames = new Set(Object.keys(options.rootParams ?? {}));
+  const pprFallbackShell = {
+    fallbackParamNames:
+      prefetchStage === "shell" && !isRuntimePrefetch
+        ? route.params.filter((name) => !rootParamNames.has(name))
+        : [],
+    ...(isRuntimePrefetch ? { isRuntimePrefetch: true } : {}),
+    ...(prefetchStage ? { prefetchStage } : {}),
+    routePattern: route.pattern,
+    varyParams,
+  };
+  const requestOptions = options.withRequest({
+    actionError: undefined,
+    actionFailed: false,
+    bypassInterceptionContextCache: false,
+    cachePathname: options.cachePathname ?? pathname,
+    cleanPathname: pathname,
+    displayPathname: options.displayPathname ?? pathname,
+    formState: null,
+    interceptionContext: null,
+    interceptionId: null,
+    interceptionPathname: pathname,
+    isProgressiveActionRender: false,
+    isRscRequest: true,
+    // The shell is shared: each request's middleware merges over it when served.
+    middlewareContext: { headers: null, status: null },
+    mountedSlotsHeader: options.mountedSlotsHeader ?? null,
+    params: options.params,
+    pprFallbackCacheShells: null,
+    pprFallbackShell,
+    renderedConcreteUrlPaths: options.renderedConcreteUrlPaths,
+    renderedPathAndSearch: options.renderedPathAndSearch ?? null,
+    renderMode: APP_RSC_RENDER_MODE_NAVIGATION,
+    renderWholeDocument: false,
+    request: options.request,
+    rootParams: options.rootParams,
+    scriptNonce: undefined,
+    searchParams: isRuntimePrefetch ? options.searchParams : new URLSearchParams(),
+    skipStaticParamsValidation: options.skipStaticParamsValidation,
+    staticParamsValidationParams: options.staticParamsValidationParams,
+  });
+  // The shell renders as the page's payload, but it's never stored as one: a
+  // navigation would replay it with its dynamic parts left out.
+  const shellOptions: DispatchAppPageOptions<TRoute> = {
+    ...requestOptions,
+    isrSet: async () => {},
+  };
+  let isPartial = false;
+  const response = await runAppPageRevalidationContext(
+    {
+      cleanPathname: pathname,
+      currentFetchCacheMode: options.fetchCache ?? null,
+      draftModeSecret: options.draftModeSecret,
+      dynamicConfig: options.dynamicConfig,
+      displayPathname: options.displayPathname,
+      // A runtime prefetch renders with the request's cookies and headers.
+      headersContext: isRuntimePrefetch ? (getHeadersContext() ?? undefined) : undefined,
+      params: options.params,
+      rootParams: options.rootParams,
+      routePattern: route.pattern,
+      routeSegments: route.routeSegments,
+      setNavigationContext: options.setNavigationContext,
+    },
+    () =>
+      runWithPrerenderWorkUnit(
+        () =>
+          // One render, without a warmup: its abort waits for the caches it
+          // reads, so the shell holds what they resolve to.
+          pprRuntime.runSinglePass(pprFallbackShell, async () => {
+            const response = await dispatchAppPageInner(shellOptions);
+            const body = response.body ? await response.arrayBuffer() : null;
+            isPartial = pprRuntime.getState()?.hasDynamicBoundary === true;
+            const headers = new Headers(response.headers);
+            headers.set(VINEXT_VARY_PARAMS_HEADER, JSON.stringify([...varyParams].sort()));
+            return new Response(body, {
+              headers,
+              status: response.status,
+              statusText: response.statusText,
+            });
+          }),
+        {
+          cacheComponents: true,
+          prerender: true,
+          route: route.pattern,
+          runtime: isRuntimePrefetch,
+        },
+      ),
+  );
+  return { isPartial, response };
+}
+
+/**
+ * Next.js requires an `ensureStatic = "navigation"` page's dynamic params to
+ * come from generateStaticParams, every one of them in every result, so none
+ * is left for a fallback shell.
+ *
+ * Ported from Next.js: packages/next/src/build/static-paths/app.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/build/static-paths/app.ts
+ */
+async function assertEnsureStaticNavigationStaticParams<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+): Promise<void> {
+  const route = options.route;
+  const page = patternToNextFormat(route.pattern);
+  const generated = await resolveAppPageGeneratedStaticParams({
+    generateStaticParams: options.generateStaticParams,
+    params: options.staticParamsValidationParams ?? options.params,
+  });
+  if (generated === null) throw createMissingGspErrorInStaticRoute(page);
+  if (generated.staticParams.length === 0) throw createEmptyStaticParamsError();
+  const missingParamNames = findMissingStaticParamNames(route.params, generated.staticParams);
+  if (missingParamNames.length > 0) {
+    throw createIncompleteStaticParamsErrorInStaticRoute(page, missingParamNames);
+  }
 }
 
 async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
@@ -784,7 +1361,19 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           : null;
     if (patternDynamicReason) markRouteCacheabilityPatternDynamic(patternDynamicReason);
   }
-  const isPrerender = process.env.VINEXT_PRERENDER === "1";
+  // A fallback shell renders as the build prerenders it, whether the build or
+  // a request without the shell asked for it.
+  const isPrerender =
+    process.env.VINEXT_PRERENDER === "1" || options.pprFallbackShell !== undefined;
+  // Like Next.js, an `ensureStatic = "navigation"` page is only ever served
+  // from a full static prerender: no fallback shell, no resume, and an RSC
+  // request reads the stored payload too.
+  const isEnsureStaticNavigation =
+    options.pprRuntime !== undefined && isEnsureStaticNavigationRoute(route);
+  if (isEnsureStaticNavigation && !options.isProduction && route.isDynamic) {
+    // The build checks this before it prerenders; dev checks each request.
+    await assertEnsureStaticNavigationStaticParams(options);
+  }
   let traceOperation: "prerender" | "render" = isPrerender ? "prerender" : "render";
   const serveStreamingMetadata = shouldServeStreamingMetadata(
     options.request.headers.get("user-agent") ?? "",
@@ -796,7 +1385,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   const placeGeneratedMetadataInBody =
     (!isPrerender || options.pprFallbackShell !== undefined) && serveStreamingMetadata;
   const isPrefetchDynamicShell = options.renderMode === APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL;
-  const isDraftMode = isDraftModeRequest(options.request, options.draftModeSecret);
+  // Middleware can enable or disable draft mode for this request.
+  const isDraftMode =
+    getActiveDraftModeState() ?? isDraftModeRequest(options.request, options.draftModeSecret);
   const requestHeadersContext = getHeadersContext();
   const shouldUseEmptySearchParams = isForceStatic || isPrefetchDynamicShell;
   const hasRequestSearchParams =
@@ -885,11 +1476,64 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // fallback shells follow cacheComponents' model instead.
   const isNeverStoredPath =
     options.pprRuntime === undefined && hasNoManifestAdmissionState(route.pattern);
-  const isStoredRender = !isRouteCacheabilityProbe() && isCacheEligibleRender && !isNeverStoredPath;
+  // A fallback shell is never the concrete page cached under its pathname.
+  const isStoredRender =
+    !isRouteCacheabilityProbe() &&
+    isCacheEligibleRender &&
+    !isNeverStoredPath &&
+    options.pprFallbackShell === undefined;
   // Like Next.js's ResponseCache, an authorized on-demand revalidation never
   // serves the stored entry: it renders in the foreground and stores that.
   const isOnDemandRevalidate = _isOnDemandRevalidate();
   const shouldReadCache = isStoredRender && !isOnDemandRevalidate;
+  // A request a generated-param check rejects: `dynamicParams = false`, or a
+  // parameter matching `not-found` boundary.
+  const renderGeneratedParamMiss = async (
+    plainResponse: Response,
+    boundary: Pick<
+      Parameters<typeof options.renderHttpAccessFallbackPage>[1],
+      "boundaryComponent" | "boundaryModule" | "layouts"
+    >,
+  ): Promise<Response> => {
+    const renderedNotFound = await options.renderHttpAccessFallbackPage(
+      404,
+      { ...boundary, matchedParams: options.params },
+      options.middlewareContext,
+    );
+    const cachePolicy = {
+      dynamicStaleTimeSeconds: options.dynamicStaleTimeSeconds,
+      isDraftMode,
+      isDynamicError,
+      isForceDynamic,
+      isForceStatic,
+      isPrerender,
+      isProduction: options.isProduction,
+      isProgressiveActionRender: options.isProgressiveActionRender === true,
+      isRscRequest: options.isRscRequest,
+      isStaticEligible,
+      middlewareContext: options.middlewareContext,
+      peekDynamicUsage,
+      revalidateSeconds: currentRevalidateSeconds,
+      scriptNonce: options.scriptNonce,
+    };
+    if (renderedNotFound) {
+      return applyIneligibleRouteCachePolicy(renderedNotFound, cachePolicy);
+    }
+    options.clearRequestContext();
+    return applyIneligibleRouteCachePolicy(plainResponse, cachePolicy);
+  };
+  // Like Next.js, a parameter matching rejection is decided before the cache
+  // is read, and renders the root not-found without the route's layouts
+  // below the root one: routing rejects the URL, not the page.
+  const paramMatchingAdmission = await getAppPageParamMatchingAdmission(options);
+  if (paramMatchingAdmission?.fallbackMode === "not-found") {
+    const boundaryModule = options.rootNotFoundModule ?? getDefaultHttpAccessFallbackModule(404);
+    return renderGeneratedParamMiss(notFoundResponse(), {
+      boundaryComponent: boundaryModule?.default,
+      boundaryModule,
+      layouts: route.layouts.slice(0, 1),
+    });
+  }
   // A render that may be stored, and so must not let the request's query reach
   // its output unless it turns out dynamic. The Workers Cache deploy probe
   // renders this way too, so its manifest matches the runtime. A
@@ -1003,6 +1647,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       // from the cache, and its regeneration renders the document.
       isDynamicRscRequest:
         options.pprRuntime !== undefined &&
+        !isEnsureStaticNavigation &&
         options.isRscRequest &&
         options.request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) !== "1" &&
         options.renderedConcreteUrlPaths?.has(options.cleanPathname) !== true,
@@ -1015,6 +1660,15 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               revalidationTarget.interceptOpts,
             )
           : null;
+        if (options.pprRuntime && !isEnsureStaticNavigation && revalidationTarget.route === route) {
+          // A regeneration fills the path's missing shells, as a stored miss
+          // does, but a failure to find them doesn't fail the page.
+          await options.pprRuntime
+            .produceMissingShells(options, currentRevalidateSeconds)
+            .catch((error: unknown) => {
+              console.error("[vinext] ISR fallback shell discovery error:", error);
+            });
+        }
 
         const revalidationDynamicConfig = revalidationInterceptConfig
           ? revalidationInterceptConfig.dynamicConfig
@@ -1235,28 +1889,53 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     }
   }
 
-  // Next.js' production force-dynamic routes are absent from the prerender
-  // manifest, so they never enter its generated-path fallback gate. Dev still
-  // resolves and exact-matches generateStaticParams for the same route.
-  if (options.skipStaticParamsValidation !== true && !(options.isProduction && isForceDynamic)) {
-    const dynamicParamsResponse = await validateAppPageDynamicParams({
-      enforceStaticParamsOnly: options.dynamicParamsConfig === false,
-      generateStaticParams: options.generateStaticParams,
-      isDynamicRoute: route.isDynamic,
-      params: options.staticParamsValidationParams ?? options.params,
-    });
+  // Next.js renders an unlisted param on demand in draft mode.
+  // https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/templates/app-page.ts
+  // A parameter matching admission already decided this request's params.
+  if (
+    paramMatchingAdmission === null &&
+    options.skipStaticParamsValidation !== true &&
+    !isDraftMode
+  ) {
+    const dynamicParamsResponse = await runStaticParamsCheckDetached(() =>
+      validateAppPageRouteDynamicParams({
+        dynamicConfig,
+        dynamicParamsConfig: options.dynamicParamsConfig,
+        fetchCache: options.fetchCache,
+        routeSegments: route.routeSegments,
+        generateStaticParams: options.generateStaticParams,
+        isDynamicRoute: route.isDynamic,
+        isProduction: options.isProduction,
+        params: options.staticParamsValidationParams ?? options.params,
+      }),
+    );
     if (dynamicParamsResponse) {
-      // A generated-param miss belongs to a matched App route, so render the
-      // route's not-found boundary just like a page-level notFound() signal.
-      // The plain response remains a defensive fallback if boundary rendering
-      // is unavailable, but the normal path must include Next.js's canonical
-      // not-found markup (and custom not-found.tsx when present). The route's
-      // own not-found is the nearest one in its tree; the manifest's root
-      // not-found can belong to another root layout's (issue #4304).
-      const boundaryModule = route.notFound ?? getDefaultHttpAccessFallbackModule(404);
+      // Next.js rejects a generated-param miss while routing, so it renders
+      // the root not-found as if no route matched. None of this route's
+      // layouts or generateMetadata may run with the rejected params. The
+      // plain response remains a defensive fallback if boundary rendering is
+      // unavailable.
+      // Undo this route's config too: its fetch defaults, and the static
+      // headers context and search params of force-static / dynamic = "error".
+      const navigationContext = options.getNavigationContext();
+      if (navigationContext) {
+        options.setNavigationContext({
+          ...navigationContext,
+          params: {},
+          searchParams: options.searchParams,
+        });
+      }
+      setRootParams(null);
+      setHeadersContext(requestHeadersContext);
+      setCurrentFetchSoftTags([]);
+      setCurrentFetchCacheMode(null);
+      setCurrentFetchRevalidate(null);
+      setCurrentForceDynamicFetchDefault(false);
+      // Routing discards this response, so it marks nothing for the request.
+      if (options.resumeRoutingAfterMiss?.()) return new Response(null, { status: 404 });
       const renderedNotFound = await options.renderHttpAccessFallbackPage(
         404,
-        { boundaryModule, matchedParams: options.params },
+        { matchedParams: {}, routeMiss: true },
         options.middlewareContext,
       );
       const cachePolicy = {
@@ -1276,25 +1955,34 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         scriptNonce: options.scriptNonce,
       };
       if (renderedNotFound) {
-        return applyIneligibleRouteCachePolicy(renderedNotFound, cachePolicy);
+        return markRouteMissResponse(
+          applyIneligibleRouteCachePolicy(renderedNotFound, cachePolicy),
+        );
       }
       options.clearRequestContext();
-      return applyIneligibleRouteCachePolicy(dynamicParamsResponse, cachePolicy);
+      return markRouteMissResponse(
+        applyIneligibleRouteCachePolicy(dynamicParamsResponse, cachePolicy),
+      );
     }
   }
 
-  const fallbackShellResponse = options.pprRuntime
-    ? await options.pprRuntime.tryServe(
-        options,
-        currentRevalidateSeconds,
-        isDraftMode,
-        isForceStatic,
-        isForceDynamic,
-      )
-    : null;
-  if (fallbackShellResponse) {
-    return fallbackShellResponse;
+  // Like Next.js's blocking prerender, a param an `ensureStatic = "navigation"`
+  // page didn't generate renders in full and is stored.
+  const fallbackShellResult =
+    options.pprRuntime && !isEnsureStaticNavigation
+      ? await options.pprRuntime.tryServe(
+          filterParamMatchingFallbackShells(options, paramMatchingAdmission),
+          currentRevalidateSeconds,
+          isDraftMode,
+          isForceStatic,
+          isForceDynamic,
+        )
+      : null;
+  if (fallbackShellResult instanceof Response) {
+    return fallbackShellResult;
   }
+  // The stored shell whose prelude this request sends before its holes.
+  const pprShellResume = fallbackShellResult ?? undefined;
 
   let interceptConfig: AppPageInterceptSegmentConfig | null = null;
   // Whether the intercepted response's render is force-dynamic or
@@ -1494,7 +2182,12 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     });
 
   const fallbackShellState = options.pprRuntime?.getState() ?? null;
-  if (fallbackShellState && process.env.VINEXT_PRERENDER === "1" && !options.isRscRequest) {
+  if (fallbackShellState && isPrerender && !options.isRscRequest) {
+    // The shell's resume data cache: every cache entry its renders read or wrote.
+    const resumeDataCache = createResumeDataCache();
+    _setResumeDataCacheCollector(resumeDataCache);
+    // Its entries replay at any age, so while the shell renders, a stale cache
+    // entry refreshes first, like Next.js (see shouldRevalidateStaleCacheEntryInForeground).
     const warmupBuildResult = await buildCurrentPageElement();
     if (warmupBuildResult.response) {
       return warmupBuildResult.response;
@@ -1506,6 +2199,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       state: fallbackShellState,
     });
     discardAppPageRenderState();
+    // Like Next.js, the final render reads what the warmup collected instead of
+    // running it again.
+    _setResumeDataCacheSeed(resumeDataCache);
   }
 
   const navigationParams = resolveAppPageNavigationParams(
@@ -1524,6 +2220,24 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   // it answers, so `await res.revalidate()` resolves once the entry is stored.
   const onDemandCacheWrites: Promise<void>[] | null = isOnDemandRevalidate ? [] : null;
 
+  // Like Next.js, which prerenders a path's shell, a page that rendered
+  // dynamically gets one for later requests to resume. A response middleware
+  // gave another status isn't the page's.
+  // An `ensureStatic = "navigation"` page has no shell to resume: rendering
+  // dynamically breaks its contract, which Next.js's prerender rejects.
+  const produceConcreteShell = isEnsureStaticNavigation
+    ? () => {
+        console.error(createNonPrerenderableBodyErrorInStaticRoute(route.pattern));
+      }
+    : options.pprRuntime && !pprShellResume && (options.middlewareContext.status ?? 200) === 200
+      ? () =>
+          options.pprRuntime!.produceConcreteShell(
+            options,
+            currentRevalidateSeconds,
+            isDraftMode,
+            isForceDynamic,
+          )
+      : undefined;
   const lifecycleOptions: Parameters<typeof renderAppPageLifecycle>[0] = {
     basePath: options.basePath,
     bypassInterceptionContextCache: options.bypassInterceptionContextCache,
@@ -1602,6 +2316,10 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           options.pprRuntime!.beginFinalRender(activeFallbackShellState);
         }
       : undefined,
+    isPprFallbackShellPartial: activeFallbackShellState
+      ? () => activeFallbackShellState.hasDynamicBoundary
+      : undefined,
+    pprShellResume,
     rootParams: options.rootParams,
     peekRenderObservationState() {
       return {
@@ -1631,6 +2349,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     prerenderToReadableStream: options.prerenderToReadableStream,
     routePattern: route.pattern,
     scriptNonce: options.scriptNonce,
+    onDynamicRender: produceConcreteShell,
     waitUntil(cachePromise) {
       onDemandCacheWrites?.push(cachePromise);
       getRequestExecutionContext()?.waitUntil(cachePromise);

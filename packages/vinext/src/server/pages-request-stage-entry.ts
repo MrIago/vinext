@@ -7,6 +7,7 @@
 
 import {
   fetchWorkerFilesystemRoute,
+  pagesImageSourceStatus,
   runPagesRequest,
   wrapMiddlewareWithBasePath,
 } from "./pages-request-pipeline.js";
@@ -15,6 +16,7 @@ import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
   handleConfiguredImageOptimization,
+  imageSourceStatusResponse,
   isImageOptimizationPath,
   isImageSourceBodyStatus,
 } from "./image-optimization.js";
@@ -29,6 +31,8 @@ import {
   withRequestHeaders,
 } from "./request-pipeline.js";
 import { notFoundStaticAssetResponse } from "./http-error-responses.js";
+import { withRequestStageBypassCacheState } from "./cache-headers.js";
+import { isExternalUrl } from "../utils/external-url.js";
 import { applyMiddlewareResponseHeadersToRequest } from "../utils/middleware-request-headers.js";
 import { assetPrefixPathname, isNextStaticPath } from "../utils/asset-prefix.js";
 import { resolveClientBuildFile } from "./client-build-files.js";
@@ -192,6 +196,11 @@ const configHeaders = vinextConfig?.headers ?? [];
 const imageConfig: ImageConfig | undefined = vinextConfig?.images
   ? {
       qualities: vinextConfig.images.qualities,
+      formats: vinextConfig.images.formats,
+      remotePatterns: vinextConfig.images.remotePatterns,
+      domains: vinextConfig.images.domains,
+      maximumRedirects: vinextConfig.images.maximumRedirects,
+      maximumDiskCacheSize: vinextConfig.images.maximumDiskCacheSize,
       localPatterns: vinextConfig.images.localPatterns,
       dangerouslyAllowSVG: vinextConfig.images.dangerouslyAllowSVG,
       dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,
@@ -508,6 +517,9 @@ async function handleRequestImpl(
     let speculativeRenderRequest: Request | null = null;
     // The middleware response alone, before next.config headers are staged.
     let middlewareResponseHeaders: Headers | undefined;
+    // Whether middleware answered the request itself, by a redirect, its own
+    // response or an external rewrite.
+    let middlewareAnswered = false;
 
     const deps: PagesPipelineDeps = {
       assetPrefix: vinextConfig?.assetPrefix,
@@ -541,6 +553,9 @@ async function handleRequestImpl(
                 middlewareOptions,
               );
               middlewareResponseHeaders = undefined;
+              middlewareAnswered =
+                !result.continue ||
+                (result.rewriteUrl !== undefined && isExternalUrl(result.rewriteUrl));
               if (result.responseHeaders) {
                 middlewareResponseHeaders = new Headers();
                 for (const [key, value] of result.responseHeaders) {
@@ -820,18 +835,26 @@ async function handleRequestImpl(
           },
         },
       );
-      if (sourceResult.type !== "response") return null;
-      await sourceResult.response.body?.cancel().catch(() => {});
-      if (isImageSourceBodyStatus(sourceResult.response.status) && sourceAsset !== null) {
-        // The pipeline staged middleware and `headers()` values on its response.
-        const { withStagedCacheControl } = await import("./worker-image-optimization.js");
-        return withStagedCacheControl(
-          sourceAsset,
-          sourceResult.response.headers.get("Cache-Control"),
-        );
+      if (sourceResult.type === "response") {
+        await sourceResult.response.body?.cancel().catch(() => {});
+        if (isImageSourceBodyStatus(sourceResult.response.status) && sourceAsset !== null) {
+          // The pipeline staged middleware and `headers()` values on its response.
+          const { withStagedCacheControl } = await import("./worker-image-optimization.js");
+          return withStagedCacheControl(
+            sourceAsset,
+            sourceResult.response.headers.get("Cache-Control"),
+          );
+        }
       }
       await sourceAsset?.body?.cancel().catch(() => {});
-      return null;
+      // Like Next.js' fetchInternalImage, answer with the status a direct
+      // request receives, such as middleware's denial or a missing page's 404.
+      const status = pagesImageSourceStatus(
+        sourceResult,
+        (pathname) =>
+          typeof matchPageRoute === "function" && matchPageRoute(pathname, sourceRequest) !== null,
+      );
+      return status === null ? null : imageSourceStatusResponse(status);
     };
 
     const result = await runPagesRequest(request, deps);
@@ -839,6 +862,11 @@ async function handleRequestImpl(
       let response = result.response;
       if (sharedResponseHeaders && sharedOuterPolicyHeaders) {
         reconcileCdnResponseHeadersAfterOuterPolicy(response.headers, sharedOuterPolicyHeaders);
+      }
+      // Middleware answered in this uncached request stage, so a staged
+      // response stage and its shared cache never see this request.
+      if (!forceCacheBypass && middlewareAnswered && !responseStageDispatched) {
+        response = withRequestStageBypassCacheState(response);
       }
       if (probeMode && probeRoute && !responseStageDispatched) {
         const { finalizeRequestStageCacheabilityProbe } = await import("./cacheability-request.js");

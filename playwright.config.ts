@@ -102,6 +102,7 @@ const projectServers = {
       "app-router-prod/image-get-image-props.spec.ts",
       "app-router-prod/image-default-qualities.spec.ts",
       "app-router-prod/image-config-chunk.spec.ts",
+      "app-router-prod/pages-navigation-chunk.spec.ts",
       "app-router-prod/pages-res-revalidate.spec.ts",
       "app-router-prod/client-reference-groups.spec.ts",
       "app-router-prod/route-manifest-chunk.spec.ts",
@@ -120,6 +121,7 @@ const projectServers = {
       "app-router/preload-rejection.spec.ts",
       "app-router/external-rewrite-host-capture.spec.ts",
       "app-router/tsconfig-exact-path.spec.ts",
+      "app-router/nextjs-compat/segment-cache-dynamic-params.spec.ts",
     ],
     use: { baseURL: "http://localhost:4198" },
     server: {
@@ -181,6 +183,20 @@ const projectServers = {
       port: 4238,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
+    },
+  },
+  // Cache Components shells resumed in production: the shell is sent as
+  // stored and only its holes render.
+  "app-router-ppr-resume": {
+    testDir: "./tests/e2e/app-router-ppr-resume",
+    use: { baseURL: "http://127.0.0.1:4205" },
+    server: {
+      command:
+        "npx vp run vinext#build && node ../../../packages/vinext/dist/cli.js build && PORT=4205 node ../../../packages/vinext/dist/cli.js start --port 4205 --hostname 127.0.0.1",
+      cwd: "./tests/fixtures/app-ppr-resume",
+      port: 4205,
+      reuseExistingServer: false,
+      timeout: 60_000,
     },
   },
   "catch-error": {

@@ -25,12 +25,12 @@ test("dev reruns getStaticProps for every HTML and data request", async ({ reque
 
   const first = await request.get(TARGET);
   expect(first.status()).toBe(200);
-  expect(first.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+  expect(first.headers()["cache-control"]).toBe("no-store");
   expect(first.headers()["x-vinext-cache"]).toBeUndefined();
 
   const second = await request.get(TARGET);
   expect(second.status()).toBe(200);
-  expect(second.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+  expect(second.headers()["cache-control"]).toBe("no-store");
 
   const data = await request.get(DATA_URL);
   expect(data.status()).toBe(200);
@@ -50,7 +50,7 @@ test("dev on-demand revalidation renders once and stores no route response", asy
 
   const ordinary = await request.get(TARGET);
   expect(ordinary.status()).toBe(200);
-  expect(ordinary.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+  expect(ordinary.headers()["cache-control"]).toBe("no-store");
   expect(await generationCount(request)).toBe(2);
 });
 
@@ -65,7 +65,7 @@ test("dev recomputes terminal notFound and redirect results", async ({ request }
     expect(notFound.status()).toBe(404);
     expect(notFound.headers()["x-nextjs-cache"]).toBe("HIT");
     expect(notFound.headers()["x-vinext-cache"]).toBeUndefined();
-    expect(notFound.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+    expect(notFound.headers()["cache-control"]).toBe("no-store");
   }
   const notFoundData = await request.get(DATA_URL);
   expect(notFoundData.status()).toBe(404);

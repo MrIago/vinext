@@ -2014,15 +2014,20 @@ describe("App Router integration", () => {
     expect(ts1![2]).not.toBe(ts2![2]);
   });
 
-  it("non-force-dynamic pages do not set no-store", async () => {
+  // Ported from Next.js: test/development/dev-cache-control/dev-cache-control.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/development/dev-cache-control/dev-cache-control.test.ts
+  // Every dev document and RSC payload is no-store, whatever the route config,
+  // so a back navigation never restores output from before the latest edit.
+  it("sends no-store for App Router documents and RSC payloads in development", async () => {
     const res = await fetch(`${baseUrl}/about`);
     expect(res.status).toBe(200);
-    const cacheControl = res.headers.get("cache-control");
-    // Normal pages should not have no-store
-    expect(cacheControl).toBeNull();
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const rsc = await fetch(`${baseUrl}/about`, { headers: { RSC: "1" } });
+    expect(rsc.status).toBe(200);
+    expect(rsc.headers.get("cache-control")).toBe("no-store");
   });
 
-  it("export const dynamic = 'force-static' sets long-lived Cache-Control", async () => {
+  it("export const dynamic = 'force-static' renders as STATIC with the dev no-store Cache-Control", async () => {
     const res = await fetch(`${baseUrl}/static-test`);
     expect(res.status).toBe(200);
 
@@ -2032,7 +2037,7 @@ describe("App Router integration", () => {
 
     // force-static should set s-maxage for indefinite caching
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=31536000");
+    expect(cacheControl).toBe("no-store");
     expect(res.headers.get("x-vinext-cache")).toBe("STATIC");
   });
 
@@ -2055,7 +2060,7 @@ describe("App Router integration", () => {
     expect(html).toContain('data-testid="error-dynamic-page"');
     // Should be treated as static — long-lived cache
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=31536000");
+    expect(cacheControl).toBe("no-store");
     expect(res.headers.get("x-vinext-cache")).toBe("STATIC");
   });
 
@@ -2239,8 +2244,7 @@ describe("App Router integration", () => {
 
     // revalidate=60 should set s-maxage=60 on first request (cache MISS)
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=60");
-    expect(cacheControl).toContain("stale-while-revalidate");
+    expect(cacheControl).toBe("no-store");
   });
 
   it("keeps a revalidate page that imports CSS cacheable", async () => {
@@ -2251,8 +2255,7 @@ describe("App Router integration", () => {
     expect(await res.text()).toContain('data-testid="revalidate-css-module"');
 
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=60");
-    expect(cacheControl).toContain("stale-while-revalidate");
+    expect(cacheControl).toBe("no-store");
   });
 
   it("applies revalidate exported from a layout to child pages", async () => {
@@ -2261,8 +2264,7 @@ describe("App Router integration", () => {
     expect(await res.text()).toContain('data-testid="layout-segment-config-revalidate"');
 
     const cacheControl = res.headers.get("cache-control");
-    expect(cacheControl).toContain("s-maxage=30");
-    expect(cacheControl).toContain("stale-while-revalidate");
+    expect(cacheControl).toBe("no-store");
   });
 
   it("applies dynamic = 'force-dynamic' exported from a layout to child pages", async () => {
@@ -2322,6 +2324,10 @@ describe("App Router integration", () => {
     expect(ssrGlob).toContain("instrumentation-client.ts");
     expect(clientGlob).toContain("instrumentation.ts");
     expect(clientGlob).toContain("instrumentation-client.ts");
+    // Pages Router modules render in ssr and hydrate in client, never in rsc.
+    expect(ssrEntries).toContain("pages/**/*.{tsx,ts,jsx,js}");
+    expect(clientEntries).toContain("pages/**/*.{tsx,ts,jsx,js}");
+    expect(rscEntries).not.toContain("pages/**/*.{tsx,ts,jsx,js}");
   });
 
   it("pre-includes framework dependencies in optimizeDeps.include to avoid late discovery", () => {
@@ -2406,7 +2412,7 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "fake-action-id",
+        "x-rsc-action": "fake-action-id#missing",
         Origin: "not-a-url",
         Host: new URL(baseUrl).host,
       },
@@ -2420,16 +2426,16 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "nonexistent-action",
+        "x-rsc-action": "nonexistent-action#missing",
         Origin: baseUrl,
         Host: new URL(baseUrl).host,
         "Content-Type": "text/plain",
       },
       body: "[]",
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await res.text()).toBe("Server action not found.");
+    expect(await res.text()).toBe("Server Action unavailable.");
   });
 
   it("allows server action POST without Origin header (non-fetch navigation)", async () => {
@@ -2437,12 +2443,12 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "nonexistent-action",
+        "x-rsc-action": "nonexistent-action#missing",
         "Content-Type": "text/plain",
       },
       body: "[]",
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
   });
 
@@ -2504,7 +2510,7 @@ describe("App Router integration", () => {
         headers: { "Content-Type": "text/plain;charset=UTF-8", "Next-Action": actionId },
         body: JSON.stringify(["victim"]),
       });
-      expect(fetchAction.status).toBe(404);
+      expect(fetchAction.status).toBe(409);
       expect(fetchAction.headers.get("x-nextjs-action-not-found")).toBe("1");
       expect(await fetchAction.text()).not.toContain(secret);
 
@@ -2513,7 +2519,7 @@ describe("App Router integration", () => {
         headers: { "Content-Type": "text/plain", "x-rsc-action": actionId },
         body: JSON.stringify(["victim"]),
       });
-      expect(rscAction.status).toBe(404);
+      expect(rscAction.status).toBe(409);
       expect(rscAction.headers.get("x-nextjs-action-not-found")).toBe("1");
       expect(await rscAction.text()).not.toContain(secret);
 
@@ -2531,7 +2537,7 @@ describe("App Router integration", () => {
       if (actionId.endsWith("#$$hoist_0_readInlineRecord")) {
         expect(formAction.status).toBe(500);
       } else {
-        expect(formAction.status).toBe(404);
+        expect(formAction.status).toBe(409);
         expect(formAction.headers.get("x-nextjs-action-not-found")).toBe("1");
       }
       expect(await formAction.text()).not.toContain(secret);
@@ -2554,9 +2560,9 @@ describe("App Router integration", () => {
       headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
       body,
     });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await res.text()).toBe("Server action not found.");
+    expect(await res.text()).toBe("Server Action unavailable.");
   });
 
   // Next.js only runs Server Action handling for App pages, so a Route
@@ -2620,7 +2626,7 @@ describe("App Router integration", () => {
     const res = await fetchRsc(baseUrl, "/actions", {
       method: "POST",
       headers: {
-        "x-rsc-action": "nonexistent-action",
+        "x-rsc-action": "nonexistent-action#missing",
         Origin: baseUrl,
         Host: new URL(baseUrl).host,
       },
@@ -2628,9 +2634,9 @@ describe("App Router integration", () => {
       signal: AbortSignal.timeout(5_000),
     });
 
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(409);
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
-    expect(await res.text()).toBe("Server action not found.");
+    expect(await res.text()).toBe("Server Action unavailable.");
   });
 
   it("blocks server action POST with Origin 'null' (CSRF via sandboxed context)", async () => {

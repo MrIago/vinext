@@ -1,6 +1,8 @@
 import { ASSET_PREFIX_URL_DIR, resolveAssetUrlPrefix, resolveAssetsDir } from "./asset-prefix.js";
 import { appendDeploymentIdQuery } from "./deployment-id.js";
 
+const FONT_FILE_RE = /\.(?:woff2?|ttf|otf|eot)$/i;
+
 export function renderVinextBuiltUrl(
   filename: string,
   assetPrefix: string,
@@ -24,7 +26,11 @@ export function renderVinextBuiltUrl(
   // splitting React/RSC singleton state across duplicate module graphs.
   const workerPath = `${ASSET_PREFIX_URL_DIR}/workers/`;
   const belongsToWorkerGraph = filename.includes(workerPath) || hostId?.includes(workerPath);
-  return hostType === "js" && !belongsToWorkerGraph
-    ? url
-    : appendDeploymentIdQuery(url, deploymentId);
+  if (hostType === "js" && !belongsToWorkerGraph) return url;
+  // Font files are content-hashed and preloaded by the bare URL the font
+  // shims render (`<link rel="preload">` and the `Link` header). An
+  // `@font-face` url() must match it byte for byte, or the browser ignores
+  // the preload and downloads the font a second time.
+  if (hostType === "css" && FONT_FILE_RE.test(filename)) return url;
+  return appendDeploymentIdQuery(url, deploymentId);
 }

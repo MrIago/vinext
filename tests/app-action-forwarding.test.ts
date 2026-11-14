@@ -328,7 +328,7 @@ describe("server action forwarding", () => {
       }),
     );
 
-    expect(unknown?.status).toBe(404);
+    expect(unknown?.status).toBe(409);
     expect(await forwarded?.text()).toBe("{}");
     expect(clearRequestContext).toHaveBeenCalledTimes(2);
     expect(warning).toHaveBeenCalledTimes(1);
@@ -349,11 +349,11 @@ describe("server action forwarding", () => {
       }),
     );
 
-    expect(response?.status).toBe(404);
+    expect(response?.status).toBe(409);
     expect(response?.headers.get("x-nextjs-action-not-found")).toBe("1");
     expect(response?.headers.get("x-source")).toBe("kept");
     expect(response?.headers.getSetCookie()).toEqual(["source=1"]);
-    expect(await response?.text()).toBe("Server action not found.");
+    expect(await response?.text()).toBe("Server Action unavailable.");
   });
 
   it("preserves marked action redirects from the owner", async () => {
@@ -415,7 +415,7 @@ describe("server action forwarding", () => {
       const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
       const response = await forwardServerActionIfNeeded(options({ actionId }));
 
-      expect(response?.status).toBe(404);
+      expect(response?.status).toBe(409);
       warning.mockRestore();
     },
   );
@@ -477,4 +477,43 @@ describe("server action forwarding", () => {
     expect(cancelCalled).toBe(true);
     expect(await response?.json()).toEqual({});
   });
+});
+
+// Ported from Next.js test/e2e/app-dir/actions-unrecognized (vercel/next.js#98123):
+// a malformed action id is a 400, a well-formed unknown one a 409.
+describe("unrecognized Server Action responses", () => {
+  it("answers a malformed id with 400 Invalid Server Action request.", async () => {
+    const { createServerActionNotFoundResponse } =
+      await import("../packages/vinext/src/server/server-action-not-found.js");
+    const response = createServerActionNotFoundResponse("not-an-action-id");
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Invalid Server Action request.");
+    expect(response.headers.get("x-nextjs-action-not-found")).toBe("1");
+  });
+
+  it("answers a well-formed unknown id with 409 Server Action unavailable.", async () => {
+    const { createServerActionNotFoundResponse } =
+      await import("../packages/vinext/src/server/server-action-not-found.js");
+    const response = createServerActionNotFoundResponse("/app/actions.ts#missing");
+    expect(response.status).toBe(409);
+    expect(await response.text()).toBe("Server Action unavailable.");
+  });
+
+  it.each(["", "#name", "/app/a.ts#", "/app/a.ts#1bad", "/app/a b.ts#x", "/app/a.ts#x y"])(
+    "treats %j as malformed",
+    async (actionId) => {
+      const { isMalformedServerActionId } =
+        await import("../packages/vinext/src/server/server-action-not-found.js");
+      expect(isMalformedServerActionId(actionId)).toBe(true);
+    },
+  );
+
+  it.each(["/app/actions.ts#submit", "000000000000#missing", "c1a2b3#default", "x#$$hoist_0"])(
+    "treats %j as well-formed",
+    async (actionId) => {
+      const { isMalformedServerActionId } =
+        await import("../packages/vinext/src/server/server-action-not-found.js");
+      expect(isMalformedServerActionId(actionId)).toBe(false);
+    },
+  );
 });

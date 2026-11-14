@@ -16,10 +16,17 @@ import {
   toLinkPrefetchRoute,
   toLinkPrefetchRoutes,
 } from "../packages/vinext/src/entries/app-browser-entry.js";
-import { buildAppRscManifestCode } from "../packages/vinext/src/entries/app-rsc-manifest.js";
+import {
+  buildAppRscManifestCode,
+  rootBoundaryFiles,
+  rootBoundaryRouteFiles,
+} from "../packages/vinext/src/entries/app-rsc-manifest.js";
 import {
   isAppInterceptRenderedDynamically,
   isAppPageRouteRenderedDynamically,
+  readAppInterceptInstantConfig,
+  readAppPageRouteHasPartialPrefetching,
+  readAppPageRouteInstantConfig,
 } from "../packages/vinext/src/build/app-page-static-eligibility.js";
 import {
   generateAppRequestRscEntry,
@@ -620,6 +627,112 @@ describe("App Router generated manifest construction", () => {
     } finally {
       fs.rmSync(appDir, { force: true, recursive: true });
     }
+  });
+
+  it("records each route's unstable_instant config, parallel slots' and intercepts' included", async () => {
+    const graph = await buildAppRouteGraph(
+      path.resolve(import.meta.dirname, "fixtures/app-instant-config/app"),
+      createValidFileMatcher(),
+    );
+    const prefetchRoutes = toLinkPrefetchRoutes(graph.routes, undefined, {
+      route: (route) => readAppPageRouteInstantConfig(route, null),
+      intercept: (intercept, layoutPaths) =>
+        readAppInterceptInstantConfig(intercept, layoutPaths, null),
+    });
+    const instantByPattern = Object.fromEntries(
+      prefetchRoutes.map((route) => [route.patternParts.join("/"), route.instant]),
+    );
+    expect(instantByPattern).toEqual({
+      "": undefined,
+      feed: undefined,
+      "opted-out": undefined,
+      "photos/:id": undefined,
+      "runtime/:id": "runtime",
+      slot: "runtime",
+      static: "static",
+    });
+    // The intercepting page's config applies under its interception context.
+    expect(
+      prefetchRoutes.find((route) => route.patternParts.join("/") === "photos/:id")?.intercepts,
+    ).toEqual([
+      { instant: "static", sourcePatternParts: ["feed"], targetPatternParts: ["photos", ":id"] },
+    ]);
+  });
+
+  // Next.js's `SubtreeHasPartialPrefetching` route tree hint
+  // (vercel/next.js#94448, #94655): any segment's `prefetch = "partial"` opts
+  // the route in, and the document's own route tree carries it.
+  it("records which routes opt into Partial Prefetching", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-partial-prefetching-"));
+    const appDir = path.join(tmpDir, "app");
+    const page = "export default function Page() { return null; }\n";
+    const layout = "export default function Layout({ children }) { return children; }\n";
+    const write = (relativePath: string, source: string) => {
+      fs.mkdirSync(path.dirname(path.join(appDir, relativePath)), { recursive: true });
+      fs.writeFileSync(path.join(appDir, relativePath), source);
+    };
+    try {
+      write("layout.tsx", layout);
+      write("page.tsx", page);
+      write("partial/page.tsx", `export const prefetch = "partial";\n${page}`);
+      write("legacy/layout.tsx", `export const unstable_prefetch = "partial";\n${layout}`);
+      write("legacy/page.tsx", page);
+      write("slot/layout.tsx", layout);
+      write("slot/page.tsx", page);
+      write("slot/@panel/page.tsx", `export const prefetch = "partial";\n${page}`);
+      write("auto/page.tsx", `export const prefetch = "auto";\n${page}`);
+      const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+      const hasPartialPrefetching = (route: AppRoute) =>
+        readAppPageRouteHasPartialPrefetching(route, null);
+      const prefetchRoutes = toLinkPrefetchRoutes(
+        graph.routes,
+        undefined,
+        undefined,
+        hasPartialPrefetching,
+      );
+      expect(
+        Object.fromEntries(
+          prefetchRoutes.map((route) => [route.patternParts.join("/"), route.partialPrefetching]),
+        ),
+      ).toEqual({
+        "": undefined,
+        auto: undefined,
+        legacy: true,
+        partial: true,
+        slot: true,
+      });
+      const entryCode = generateBrowserEntry(
+        graph.routes,
+        [],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hasPartialPrefetching,
+      );
+      expect(entryCode).toContain('"partialPrefetching":true');
+    } finally {
+      fs.rmSync(tmpDir, { force: true, recursive: true });
+    }
+  });
+
+  it("reads an intercepting page's unstable_instant config from its own layouts only", () => {
+    const appDir = path.resolve(import.meta.dirname, "fixtures/app-instant-config/app");
+    const intercept = {
+      convention: "..",
+      targetPattern: "/photos/:id",
+      sourceMatchPattern: "/feed",
+      pagePath: path.join(appDir, "feed/@modal/(..)photos/[id]/page.tsx"),
+      layoutPaths: [],
+      loadingPaths: [],
+      loadingTreePositions: [],
+      params: ["id"],
+    } satisfies AppRoute["siblingIntercepts"][number];
+    // `runtime/layout.tsx` opts into runtime prefetches but isn't above the page.
+    const layoutPaths = ["layout.tsx", "feed/layout.tsx", "runtime/layout.tsx"].map((file) =>
+      path.join(appDir, file),
+    );
+    expect(readAppInterceptInstantConfig(intercept, layoutPaths, null)).toBe("static");
   });
 
   it("classifies each intercepting page as its own route for its target", async () => {
@@ -1490,6 +1603,147 @@ describe("App Router generated manifest construction", () => {
     expect(routeEntry).toContain("errors: [null, null]");
     expect(routeEntry).toContain("__loadErrors: [load_");
     expect(routeEntry).toContain("errorTreePositions: [0,1]");
+  });
+
+  it("keeps a grouped root page's layout and not-found out of the root boundaries", () => {
+    const routes = [
+      {
+        pattern: "/",
+        patternParts: [],
+        pagePath: "/tmp/test/app/(marketing)/page.tsx",
+        routePath: null,
+        layouts: ["/tmp/test/app/layout.tsx", "/tmp/test/app/(marketing)/layout.tsx"],
+        templates: [],
+        parallelSlots: [],
+        loadingPath: null,
+        errorPath: null,
+        layoutErrorPaths: [null, null],
+        notFoundPath: "/tmp/test/app/(marketing)/not-found.tsx",
+        notFoundPaths: ["/tmp/test/app/not-found.tsx", "/tmp/test/app/(marketing)/not-found.tsx"],
+        forbiddenPath: null,
+        forbiddenPaths: [null, null],
+        unauthorizedPath: null,
+        unauthorizedPaths: [null, null],
+        routeSegments: ["(marketing)"],
+        templateTreePositions: [],
+        layoutTreePositions: [0, 1],
+        isDynamic: false,
+        params: [],
+        siblingIntercepts: [],
+      },
+    ] satisfies AppRoute[];
+
+    const manifest = buildAppRscManifestCode({ routes, metadataRoutes: [], globalErrorPath: null });
+    const imports = manifest.imports.join("\n");
+
+    expect(rootBoundaryRouteFiles(routes, "/tmp/test/app/not-found.tsx")).toEqual([
+      "/tmp/test/app/layout.tsx",
+      "/tmp/test/app/not-found.tsx",
+    ]);
+    expect(manifest.rootLayoutVars).toHaveLength(1);
+    expect(imports).toContain(
+      `import * as ${manifest.rootLayoutVars[0]} from "/tmp/test/app/layout.tsx";`,
+    );
+    expect(imports).toContain(
+      `import * as ${manifest.rootNotFoundVar} from "/tmp/test/app/not-found.tsx";`,
+    );
+  });
+
+  it("renders app/not-found in an app without app/layout", () => {
+    const routes = [
+      {
+        pattern: "/:locale",
+        patternParts: [":locale"],
+        pagePath: "/tmp/test/app/[locale]/page.tsx",
+        routePath: null,
+        layouts: ["/tmp/test/app/[locale]/layout.tsx"],
+        templates: [],
+        parallelSlots: [],
+        loadingPath: null,
+        errorPath: null,
+        layoutErrorPaths: [null],
+        notFoundPath: "/tmp/test/app/[locale]/not-found.tsx",
+        notFoundPaths: ["/tmp/test/app/[locale]/not-found.tsx"],
+        segmentNotFoundPaths: [
+          "/tmp/test/app/not-found.tsx",
+          "/tmp/test/app/[locale]/not-found.tsx",
+        ],
+        segmentNotFoundTreePositions: [0, 1],
+        forbiddenPath: null,
+        forbiddenPaths: [null],
+        unauthorizedPath: null,
+        unauthorizedPaths: [null],
+        routeSegments: ["[locale]"],
+        templateTreePositions: [],
+        layoutTreePositions: [1],
+        isDynamic: true,
+        params: ["locale"],
+        siblingIntercepts: [],
+      },
+    ] satisfies AppRoute[];
+
+    const manifest = buildAppRscManifestCode({
+      routes,
+      metadataRoutes: [],
+      globalErrorPath: null,
+      appNotFoundPath: "/tmp/test/app/not-found.tsx",
+    });
+
+    expect(manifest.hasAppRootLayout).toBe(false);
+    expect(manifest.imports.join("\n")).toContain(
+      `import * as ${manifest.appNotFoundVar} from "/tmp/test/app/not-found.tsx";`,
+    );
+    // A render without a matched route ships only the not-found's client
+    // references, not those of a route group's root layout it never renders.
+    expect(rootBoundaryRouteFiles(routes, "/tmp/test/app/not-found.tsx")).toEqual([
+      "/tmp/test/app/not-found.tsx",
+    ]);
+    // Nor does any render load a route group's boundaries outside its routes.
+    expect(rootBoundaryFiles(routes)).toEqual([]);
+  });
+
+  it("renders app/not-found in an app with only route handlers, also below a nearer not-found", () => {
+    const routes = [
+      {
+        pattern: "/api",
+        patternParts: ["api"],
+        pagePath: null,
+        routePath: "/tmp/test/app/api/route.ts",
+        layouts: [],
+        templates: [],
+        parallelSlots: [],
+        loadingPath: null,
+        errorPath: null,
+        layoutErrorPaths: [],
+        notFoundPath: "/tmp/test/app/api/not-found.tsx",
+        notFoundTreePosition: 1,
+        notFoundPaths: [],
+        segmentNotFoundPaths: [],
+        segmentNotFoundTreePositions: [],
+        forbiddenPath: null,
+        forbiddenPaths: [],
+        unauthorizedPath: null,
+        unauthorizedPaths: [],
+        routeSegments: ["api"],
+        templateTreePositions: [],
+        layoutTreePositions: [],
+        isDynamic: false,
+        params: [],
+        siblingIntercepts: [],
+      },
+    ] satisfies AppRoute[];
+
+    const manifest = buildAppRscManifestCode({
+      routes,
+      metadataRoutes: [],
+      globalErrorPath: null,
+      appNotFoundPath: "/tmp/test/app/not-found.tsx",
+    });
+
+    expect(manifest.hasAppRootLayout).toBe(false);
+    expect(manifest.imports.join("\n")).toContain(
+      `import * as ${manifest.appNotFoundVar} from "/tmp/test/app/not-found.tsx";`,
+    );
   });
 
   it("derives route-miss root boundaries when the app has no root page", () => {

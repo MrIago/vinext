@@ -1,5 +1,13 @@
 import type { AppPageSpecialError } from "./app-page-execution.js";
-import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
+import {
+  runWithFetchDedupe,
+  setCurrentFetchCacheMode,
+  setCurrentFetchRevalidate,
+  setCurrentFetchSoftTags,
+  setCurrentForceDynamicFetchDefault,
+  type FetchCacheMode,
+} from "vinext/shims/fetch-cache";
+import { buildAppStaticParamsTags } from "./implicit-tags.js";
 import { getAppPageSegmentParamName } from "./app-page-params.js";
 import { matchRoutePattern } from "../routing/route-pattern.js";
 import { notFoundResponse } from "./http-error-responses.js";
@@ -557,6 +565,13 @@ function rewritesParentParams(
   );
 }
 
+/**
+ * The results each generator returns, by the generator and the parent row it
+ * ran for. Sharing one across a request's lookups, which may run at once,
+ * calls each generator once per parent.
+ */
+export type GeneratedStaticParamsMemo = Map<unknown, Map<string, Promise<unknown>>>;
+
 type GeneratedStaticParamsRow = {
   params: Record<string, unknown>;
   // Identifies the row by its position in the generation tree, so a rerun
@@ -568,18 +583,19 @@ async function generateChainedStaticParams(
   sources: readonly GenerateStaticParamsSource[],
   requestParams: AppPageParams | null,
   // A rerun over every combination reuses the results each generator already
-  // returned, so it calls generators only for the parents it skipped.
-  results = new Map<GenerateStaticParamsSource, Map<string, unknown>>(),
+  // returned, so it calls generators only for the parents it skipped. Keyed by
+  // the generator, as each lookup normalizes the route's sources afresh.
+  results: GeneratedStaticParamsMemo = new Map(),
 ): Promise<Record<string, unknown>[]> {
   let generatedRows: GeneratedStaticParamsRow[] = [];
   let skippedParents = false;
   let needsEveryCombination = false;
 
   for (const source of sources) {
-    let sourceResults = results.get(source);
+    let sourceResults = results.get(source.generateStaticParams);
     if (!sourceResults) {
       sourceResults = new Map();
-      results.set(source, sourceResults);
+      results.set(source.generateStaticParams, sourceResults);
     }
     const hasParentParams = generatedRows.length > 0;
     let parents = hasParentParams ? generatedRows : [{ params: {}, lineage: "" }];
@@ -598,13 +614,20 @@ async function generateChainedStaticParams(
     if (hasParentParams && parents.length < generatedRows.length) skippedParents = true;
 
     for (const parent of parents) {
-      let result = sourceResults.get(parent.lineage);
-      if (!sourceResults.has(parent.lineage)) {
-        result = await runWithFetchDedupe(() =>
-          source.generateStaticParams({ params: parent.params as AppPageParams }),
+      let pendingResult = sourceResults.get(parent.lineage);
+      if (!pendingResult) {
+        // A generator that throws synchronously still settles the shared
+        // promise, so concurrent lookups don't call it again.
+        pendingResult = new Promise((resolve) =>
+          resolve(
+            runWithFetchDedupe(() =>
+              source.generateStaticParams({ params: parent.params as AppPageParams }),
+            ),
+          ),
         );
-        sourceResults.set(parent.lineage, result);
+        sourceResults.set(parent.lineage, pendingResult);
       }
+      const result = await pendingResult;
       if (Array.isArray(result) && result.length > 0) {
         result.forEach((item, index) => {
           if (item === null || typeof item !== "object" || Array.isArray(item)) return;
@@ -655,6 +678,19 @@ function normalizeGenerateStaticParams(
   });
 }
 
+export function routePatternParamNames(patternParts: readonly string[]): string[] {
+  return patternParts.flatMap((part) => {
+    if (!part.startsWith(":")) return [];
+    return [part.slice(1, part.endsWith("+") || part.endsWith("*") ? -1 : undefined)];
+  });
+}
+
+export function routePatternOptionalCatchAllParamNames(patternParts: readonly string[]): string[] {
+  return patternParts.flatMap((part) =>
+    part.startsWith(":") && part.endsWith("*") ? [part.slice(1, -1)] : [],
+  );
+}
+
 export async function validateAppPageDynamicParams(
   options: ValidateAppPageDynamicParamsOptions,
 ): Promise<Response | null> {
@@ -667,6 +703,110 @@ export async function validateAppPageDynamicParams(
     return notFoundResponse();
   }
 
+  return (await matchGeneratedStaticParams(generateStaticParamsSources, options))
+    ? null
+    : notFoundResponse();
+}
+
+/**
+ * A route's params, which a generated path matches each of: an optional
+ * catch-all the request leaves out matches only an empty generated value.
+ */
+export type AppPageRouteParamNames = {
+  optionalCatchAllParamNames: readonly string[];
+  paramNames: readonly string[];
+};
+
+/**
+ * Whether generateStaticParams produces the request's params, and the params it
+ * generated on the way, with the same rules as `dynamicParams = false`. Null
+ * when the route has no generateStaticParams.
+ */
+export async function resolveAppPageGeneratedStaticParams(
+  options: Pick<ValidateAppPageDynamicParamsOptions, "generateStaticParams" | "params"> & {
+    memo?: GeneratedStaticParamsMemo;
+    routeParamNames?: AppPageRouteParamNames;
+  },
+): Promise<{ isGenerated: boolean; staticParams: Record<string, unknown>[] } | null> {
+  const generateStaticParamsSources = normalizeGenerateStaticParams(options.generateStaticParams);
+  if (generateStaticParamsSources.length === 0) return null;
+  const staticParams: Record<string, unknown>[] = [];
+  const isGenerated = await matchGeneratedStaticParams(
+    generateStaticParamsSources,
+    options,
+    staticParams,
+    options.memo,
+  );
+  return { isGenerated, staticParams };
+}
+
+/**
+ * The params generateStaticParams produces that agree with `params` on
+ * `paramNames`, as a fallback shell keeping those params records them. Null
+ * when the route's generators aren't one top-down chain, as a parallel
+ * route's are, so its requests ask generateStaticParams themselves.
+ */
+export async function resolveAppPageGeneratedStaticParamsFor(
+  options: Pick<ValidateAppPageDynamicParamsOptions, "generateStaticParams" | "params"> & {
+    paramNames: readonly string[];
+    memo?: GeneratedStaticParamsMemo;
+  },
+): Promise<Record<string, unknown>[] | null> {
+  const generateStaticParamsSources = normalizeGenerateStaticParams(options.generateStaticParams);
+  if (generateStaticParamsSources.length === 0) return [];
+  if (generateStaticParamsSources.some((source) => !source.chained)) return null;
+  const staticParams = await generateChainedStaticParams(
+    generateStaticParamsSources,
+    options.params,
+    options.memo,
+  );
+  return staticParams.filter((staticParamSet) =>
+    areStaticParamsAllowed(options.params, [staticParamSet], false, options.paramNames),
+  );
+}
+
+/**
+ * Whether the request's params are among those generateStaticParams produced,
+ * with the rules `resolveAppPageGeneratedStaticParams` applies to a chain.
+ */
+export function isAppPageParamsGenerated(
+  params: AppPageParams,
+  staticParams: readonly Record<string, unknown>[],
+  routeParamNames: AppPageRouteParamNames,
+): boolean {
+  return areStaticParamsAllowed(
+    params,
+    staticParams,
+    false,
+    routeParamNames.paramNames,
+    routeParamNames.optionalCatchAllParamNames,
+  );
+}
+
+/** Whether a generated params set agrees with the request on `paramNames`. */
+export function hasGeneratedStaticParamsFor(
+  params: AppPageParams,
+  staticParams: readonly Record<string, unknown>[],
+  paramNames: readonly string[],
+): boolean {
+  return areStaticParamsAllowed(params, staticParams, false, paramNames);
+}
+
+/**
+ * Runs the route's generators and matches the request against their results.
+ * With `collectedStaticParams`, every generator runs and its results are
+ * collected; otherwise matching stops at the first generator that rules the
+ * request out.
+ */
+async function matchGeneratedStaticParams(
+  generateStaticParamsSources: readonly GenerateStaticParamsSource[],
+  options: Pick<
+    ValidateAppPageDynamicParamsOptions,
+    "optionalCatchAllParamNames" | "params" | "requiredParamNames"
+  > & { routeParamNames?: AppPageRouteParamNames },
+  collectedStaticParams?: Record<string, unknown>[],
+  memo?: GeneratedStaticParamsMemo,
+): Promise<boolean> {
   const chainedSources = generateStaticParamsSources.filter((source) => source.chained);
   let chainedStaticParams: Record<string, unknown>[] | null = null;
   if (chainedSources.length > 0) {
@@ -682,7 +822,9 @@ export async function validateAppPageDynamicParams(
     chainedStaticParams = await generateChainedStaticParams(
       chainedSources,
       hasIndependentSources ? null : options.params,
+      memo,
     );
+    collectedStaticParams?.push(...chainedStaticParams);
   }
 
   const independentChains = new Map<unknown, GenerateStaticParamsSource[]>();
@@ -692,6 +834,7 @@ export async function validateAppPageDynamicParams(
     independentChains.set(source.independentChain ?? source, chain);
   }
 
+  let isGenerated = true;
   let validatedIndependentResults = false;
   for (const sources of independentChains.values()) {
     const result = await generateIndependentStaticParams(
@@ -699,6 +842,7 @@ export async function validateAppPageDynamicParams(
       chainedStaticParams,
       options.params,
     );
+    collectedStaticParams?.push(...result.staticParams);
     if (result.validated) {
       validatedIndependentResults = true;
       if (
@@ -706,17 +850,18 @@ export async function validateAppPageDynamicParams(
           options.params,
           result.staticParams,
           options.requiredParamNames === undefined,
-          options.requiredParamNames,
-          options.optionalCatchAllParamNames,
+          options.routeParamNames?.paramNames ?? options.requiredParamNames,
+          options.routeParamNames?.optionalCatchAllParamNames ?? options.optionalCatchAllParamNames,
         )
       ) {
-        return notFoundResponse();
+        if (!collectedStaticParams) return false;
+        isGenerated = false;
       }
     }
   }
 
   if (options.requiredParamNames && !validatedIndependentResults) {
-    return notFoundResponse();
+    return false;
   }
 
   if (chainedStaticParams && !validatedIndependentResults) {
@@ -724,12 +869,61 @@ export async function validateAppPageDynamicParams(
     // results are validated against those combinations above; without a
     // parallel result, the primary chain itself must match exactly.
     // https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/static-paths/app.ts
-    if (!areStaticParamsAllowed(options.params, chainedStaticParams)) {
-      return notFoundResponse();
+    if (
+      !areStaticParamsAllowed(
+        options.params,
+        chainedStaticParams,
+        false,
+        options.routeParamNames?.paramNames,
+        options.routeParamNames?.optionalCatchAllParamNames,
+      )
+    ) {
+      return false;
     }
   }
 
-  return null;
+  return isGenerated;
+}
+
+type ValidateAppPageRouteDynamicParamsOptions = {
+  dynamicConfig?: string;
+  dynamicParamsConfig?: boolean;
+  fetchCache?: FetchCacheMode | null;
+  generateStaticParams?: ValidateAppPageDynamicParamsOptions["generateStaticParams"];
+  isDynamicRoute: boolean;
+  isProduction: boolean;
+  params: AppPageParams;
+  routeSegments?: readonly string[];
+};
+
+/**
+ * Next.js rejects a `dynamicParams = false` miss while routing, before any of
+ * the route's segments render: it serves `/_not-found` instead.
+ * https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/server/base-server.ts
+ */
+export function validateAppPageRouteDynamicParams(
+  options: ValidateAppPageRouteDynamicParamsOptions,
+): Promise<Response | null> {
+  // Next.js' production force-dynamic routes are absent from the prerender
+  // manifest, so they never enter its generated-path fallback gate. Dev still
+  // resolves and exact-matches generateStaticParams for the same route.
+  if (options.isProduction && options.dynamicConfig === "force-dynamic") {
+    return Promise.resolve(null);
+  }
+  // Next.js runs generateStaticParams in a work store of its own: the route's
+  // fetchCache and implicit tags, and no revalidate or force-dynamic default.
+  // Callers run this check apart from the request, so these stay out of it.
+  // https://github.com/vercel/next.js/blob/v16.2.7/packages/next/src/build/static-paths/app.ts
+  setCurrentFetchCacheMode(options.fetchCache ?? null);
+  setCurrentFetchSoftTags(buildAppStaticParamsTags(options.routeSegments ?? []));
+  setCurrentFetchRevalidate(null);
+  setCurrentForceDynamicFetchDefault(false);
+  return validateAppPageDynamicParams({
+    enforceStaticParamsOnly: options.dynamicParamsConfig === false,
+    generateStaticParams: options.generateStaticParams,
+    isDynamicRoute: options.isDynamicRoute,
+    params: options.params,
+  });
 }
 
 export async function resolveAppPageInterceptState<TRoute, TPage>(

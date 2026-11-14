@@ -7,8 +7,6 @@ import { server } from "./_msw/server.js";
 import vinext from "../packages/vinext/src/index.js";
 import {
   parseStaticObjectLiteral,
-  _findBalancedObject as findBalancedObject,
-  _findCallEnd as findCallEnd,
   _rewriteCachedFontCssToServedUrls as rewriteCachedFontCssToServedUrls,
 } from "../packages/vinext/src/plugins/fonts.js";
 import type { Plugin } from "vite-plus";
@@ -63,6 +61,18 @@ function mockGoogleFontFiles(body = new Uint8Array([0, 1, 2, 3])): { urls: strin
 }
 
 /** Extract the vinext:google-fonts plugin from the plugin array */
+/**
+ * The @font-face CSS a transform self-hosted: the external stylesheet named
+ * by `selfHostedCSSUrl`, read back from the font cache under `root`, or the
+ * transformed code itself when the CSS was inlined.
+ */
+function selfHostedCss(code: string, root: string): string {
+  const url = /selfHostedCSSUrl: "([^"]+)"/.exec(code)?.[1];
+  if (!url) return code;
+  const relative = url.slice(url.indexOf("/_vinext_fonts/") + "/_vinext_fonts/".length);
+  return fs.readFileSync(path.join(root, ".vinext", "fonts", relative), "utf-8");
+}
+
 function getGoogleFontsPlugin(): Plugin {
   const plugins = vinext() as Plugin[];
   const plugin = plugins.find((p) => p.name === "vinext:google-fonts");
@@ -685,6 +695,26 @@ describe("vinext:google-fonts plugin", () => {
     expect(result.code).toContain("virtual:vinext-google-fonts?");
   });
 
+  it("leaves next/font/google import text inside a string untouched", async () => {
+    // A code sample held in a template literal (a docs page, a codegen
+    // template) is not an import. Only the real import may be rewritten.
+    const plugin = getGoogleFontsPlugin();
+    initPlugin(plugin, { command: "serve" });
+    const transform = unwrapHook(plugin.transform);
+    const sample = `import { Roboto } from 'next/font/google'`;
+    const code = [
+      `import { Inter } from 'next/font/google'`,
+      "export const snippet = `",
+      sample,
+      "`",
+      `export { Inter }`,
+    ].join("\n");
+    const result = await transform.call(plugin, code, "/app/layout.tsx");
+    expect(result).not.toBeNull();
+    expect(result.code).toContain("virtual:vinext-google-fonts?fonts=Inter");
+    expect(result.code).toContain(`export const snippet = \`\n${sample}\n\``);
+  });
+
   it("rewrites multi-line bracket re-exports", async () => {
     // Same wrap logic applies to `export { ... } from 'next/font/google'`
     // when the specifier list crosses printWidth. Less common in user code
@@ -767,9 +797,17 @@ describe("vinext:google-fonts plugin", () => {
     expect(result).not.toBeNull();
     expect(result.code).toContain("virtual:vinext-google-fonts?");
     expect(result.code).toContain("_vinext");
-    expect(result.code).toContain("selfHostedCSS");
+    // The @font-face CSS is not embedded in the bundle — the payload
+    // carries the external stylesheet URL plus the subset-filtered
+    // preload list (issue #1897).
+    expect(result.code).toContain("selfHostedCSSUrl");
+    expect(result.code).toContain("preloadUrls");
     expect(result.code).toContain("adjustedFallbackCSS");
-    expect(result.code).toContain("@font-face");
+    // The downloaded @font-face blocks stay out of the bundle (only the
+    // tiny `src: local(...)` fallback face from adjustedFallbackCSS may
+    // appear inline) — unicode-range only occurs in Google's blocks.
+    expect(result.code).not.toContain("selfHostedCSS: ");
+    expect(result.code).not.toContain("unicode-range");
     expect(result.code).toContain("Inter");
     expect(result.map).toBeDefined();
 
@@ -783,6 +821,14 @@ describe("vinext:google-fonts plugin", () => {
     const files = fs.readdirSync(path.join(cacheDir, interDir!));
     expect(files).toContain(CACHED_STYLESHEET);
     expect(files.some((f: string) => f.endsWith(".woff2"))).toBe(true);
+
+    // The served external stylesheet is written next to the cached files
+    // and contains the @font-face rules that used to be embedded.
+    const servedCss = files.find((f: string) => /^font\.[0-9a-f]{8}\.css$/.test(f));
+    expect(servedCss).toBeDefined();
+    const servedCssContent = fs.readFileSync(path.join(cacheDir, interDir!, servedCss!), "utf-8");
+    expect(servedCssContent).toContain("@font-face");
+    expect(servedCssContent).toContain("Inter");
 
     // Clean up
     fs.rmSync(root, { recursive: true, force: true });
@@ -989,7 +1035,7 @@ describe("vinext:google-fonts plugin", () => {
       // Must not have a double-comma — that would be a JS syntax error
       expect(result.code).not.toMatch(/,\s*,/);
       // Verify the generated code is syntactically valid by checking structure
-      expect(result.code).toContain('selfHostedCSS: "');
+      expect(result.code).toContain('selfHostedCSSUrl: "');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -1105,9 +1151,8 @@ describe("vinext:google-fonts plugin", () => {
       const result = await transform.call(plugin, code, "/app/layout.tsx");
       expect(result).not.toBeNull();
       expect(result.code).toContain("virtual:vinext-google-fonts?");
-      // selfHostedCSS must have been injected — without the fix this was absent
-      expect(result.code).toContain("selfHostedCSS");
-      expect(result.code).toContain("@font-face");
+      // The font payload must have been injected — without the fix this was absent
+      expect(result.code).toContain("selfHostedCSSUrl");
       // Verify the injected object is syntactically valid (no double-comma)
       expect(result.code).not.toMatch(/,\s*,/);
     } finally {
@@ -1141,7 +1186,7 @@ describe("vinext:google-fonts plugin", () => {
   });
 
   it("self-hosts font calls whose string values contain brace characters", async () => {
-    // Ensures _findBalancedObject doesn't treat '}' inside a string value as
+    // Ensures a '}' inside a string value is not treated as
     // the end of the options object.
     const plugin = getGoogleFontsPlugin();
     const root = path.join(import.meta.dirname, ".test-font-root-brace-string");
@@ -1396,13 +1441,18 @@ describe("fetchAndCacheFont", () => {
     const result = await transform.call(plugin, code, "/app/layout.tsx");
     expect(result).not.toBeNull();
 
-    // Verify the transformed code contains self-hosted CSS with @font-face
-    expect(result.code).toContain("selfHostedCSS");
-    expect(result.code).toContain("@font-face");
+    // Verify the transformed code carries the self-hosted payload: the
+    // external stylesheet URL and the subset-filtered preload list. The
+    // @font-face CSS itself lives in the cached `font.<hash>.css`, not in
+    // the bundle (issue #1897).
+    expect(result.code).toContain("selfHostedCSSUrl");
+    expect(result.code).toContain("/_vinext_fonts/");
     expect(result.code).toContain("Inter");
     // Should reference local file paths, not googleapis.com CDN
     expect(result.code).not.toContain("fonts.gstatic.com");
-    expect(result.code).toContain(".woff2");
+    // Inter's latin subset was requested, so the preload list must carry
+    // at least one served .woff2 URL in its stylesheet.
+    expect(selfHostedCss(result.code, root)).toContain(".woff2");
   }, 15000);
 
   describe("cache stylesheet", () => {
@@ -1469,8 +1519,10 @@ describe("fetchAndCacheFont", () => {
       const result = await transformWithFreshPlugin();
 
       expect(fonts.count()).toBe(0);
-      expect(result.code).toContain(`url(/_next/static/_vinext_fonts/${fontDirName}/inter-`);
-      expect(result.code).not.toContain("__VINEXT_FONT_CACHE_DIR__");
+      const css = selfHostedCss(result.code, root);
+      expect(css).toContain(`url(/_next/static/_vinext_fonts/${fontDirName}/inter-`);
+      expect(css).not.toContain("__VINEXT_FONT_CACHE_DIR__");
+      expect(css).not.toContain(toSlash(root));
       expect(result.code).not.toContain(toSlash(root));
     });
 
@@ -1486,7 +1538,9 @@ describe("fetchAndCacheFont", () => {
 
         const result = await transformWithFreshPlugin(moved);
 
-        expect(result.code).toContain(`url(/_next/static/_vinext_fonts/${fontDirName}/inter-`);
+        const css = selfHostedCss(result.code, moved);
+        expect(css).toContain(`url(/_next/static/_vinext_fonts/${fontDirName}/inter-`);
+        expect(css).not.toContain(toSlash(root));
         expect(result.code).not.toContain(toSlash(root));
       } finally {
         fs.rmSync(moved, { recursive: true, force: true });
@@ -1513,8 +1567,9 @@ describe("fetchAndCacheFont", () => {
       const result = await transformWithFreshPlugin();
 
       expect(fonts.count()).toBe(1);
-      expect(result.code).toContain(`url(/_next/static/_vinext_fonts/${fontDirName}/inter-`);
-      expect(result.code).not.toContain(toSlash(root));
+      const css = selfHostedCss(result.code, root);
+      expect(css).toContain(`url(/_next/static/_vinext_fonts/${fontDirName}/inter-`);
+      expect(css).not.toContain(toSlash(root));
       expect(fs.readFileSync(current, "utf-8")).toContain("__VINEXT_FONT_CACHE_DIR__");
     });
 
@@ -1539,8 +1594,9 @@ describe("fetchAndCacheFont", () => {
       const result = await transformWithFreshPlugin();
 
       expect(fonts.count()).toBe(1);
-      expect(result.code).not.toContain("inter-old.ttf");
-      expect(result.code).toMatch(
+      const css = selfHostedCss(result.code, root);
+      expect(css).not.toContain("inter-old.ttf");
+      expect(css).toMatch(
         new RegExp(
           `url\\(/_next/static/_vinext_fonts/${fontDirName}/inter-[0-9a-f]{8}\\.woff2\\) format\\('woff2'\\)`,
         ),
@@ -1617,6 +1673,32 @@ describe("fetchAndCacheFont", () => {
         try {
           const result = await transformWithFreshPlugin();
 
+          // The served stylesheet the first build wrote is still there.
+          expect(selfHostedCss(result.code, root)).toContain(
+            `url(/_next/static/_vinext_fonts/${fontDirName}/inter-`,
+          );
+          expect(fs.readdirSync(fontDir).filter((file) => file.includes(".tmp"))).toEqual([]);
+        } finally {
+          fs.chmodSync(fontDir, 0o755);
+        }
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "inlines the @font-face CSS when the served stylesheet cannot be written",
+      async () => {
+        const fontDirName = await populateCache();
+        const fontDir = path.join(cacheDir, fontDirName);
+        for (const file of fs.readdirSync(fontDir)) {
+          if (file.endsWith(".css") && file !== CACHED_STYLESHEET) {
+            fs.rmSync(path.join(fontDir, file));
+          }
+        }
+        fs.chmodSync(fontDir, 0o555);
+        try {
+          const result = await transformWithFreshPlugin();
+
+          expect(result.code).not.toContain("selfHostedCSSUrl");
           expect(result.code).toContain(`url(/_next/static/_vinext_fonts/${fontDirName}/inter-`);
           expect(fs.readdirSync(fontDir).filter((file) => file.includes(".tmp"))).toEqual([]);
         } finally {
@@ -1796,86 +1878,5 @@ describe("parseStaticObjectLiteral", () => {
   it("returns null for non-object expressions", () => {
     const result = parseStaticObjectLiteral(`"just a string"`);
     expect(result).toBeNull();
-  });
-});
-
-// ── _findBalancedObject / _findCallEnd unit tests ─────────────
-
-describe("_findBalancedObject", () => {
-  it("returns [start, end] for a simple flat object", () => {
-    const code = `{ a: 1 }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("handles nested objects", () => {
-    const code = `{ outer: { inner: 1 } }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("stops at the correct closing brace, ignoring braces in single-quoted strings", () => {
-    const code = `{ key: 'val }' }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("stops at the correct closing brace, ignoring braces in double-quoted strings", () => {
-    const code = `{ key: "font {bold}" }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("handles backslash escapes inside strings", () => {
-    const code = String.raw`{ key: "a \"quoted\" {value}" }`;
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("ignores braces inside template literals", () => {
-    const code = "{ key: `val {x}` }";
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("ignores braces inside template literal ${...} interpolations", () => {
-    // The '}' inside ${nested} must not end the string scan prematurely
-    const val = "val ${nested}";
-    const code = "{ key: `" + val + "` }";
-    expect(findBalancedObject(code, 0)).toEqual([0, code.length]);
-  });
-
-  it("returns null when no opening brace is found", () => {
-    expect(findBalancedObject(`foo`, 0)).toBeNull();
-  });
-
-  it("returns null for an unbalanced object", () => {
-    expect(findBalancedObject(`{ a: 1`, 0)).toBeNull();
-  });
-
-  it("skips leading whitespace before the opening brace", () => {
-    const code = `   { a: 1 }`;
-    const result = findBalancedObject(code, 0);
-    expect(result).not.toBeNull();
-    expect(result![0]).toBe(3); // points to '{'
-    expect(result![1]).toBe(code.length);
-  });
-});
-
-describe("_findCallEnd", () => {
-  it("returns index after ')' when it immediately follows objEnd", () => {
-    const code = `foo({})`;
-    // '{}' spans indices 4-5; objEnd (just after '}') is 6; ')' is at 6
-    expect(findCallEnd(code, 6)).toBe(7);
-  });
-
-  it("skips whitespace before ')'", () => {
-    const code = `foo({}\n)`;
-    // objEnd is 6; whitespace at 6; ')' at 7
-    expect(findCallEnd(code, 6)).toBe(code.length);
-  });
-
-  it("returns null when next non-whitespace is not ')'", () => {
-    const code = `foo({}, extra)`;
-    // objEnd is 6; next non-whitespace is ',' not ')'
-    expect(findCallEnd(code, 6)).toBeNull();
-  });
-
-  it("returns null at end of string", () => {
-    expect(findCallEnd(`{`, 1)).toBeNull();
   });
 });

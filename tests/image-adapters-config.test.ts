@@ -134,7 +134,7 @@ describe("image optimizer registry", () => {
     expect(transformCalled).toBe(true);
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("image/webp");
-    expect(response.headers.get("Cache-Control")).toContain("immutable");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=14400, must-revalidate");
   });
 
   it("preserves `this` for an optimizer implemented as a class instance", async () => {

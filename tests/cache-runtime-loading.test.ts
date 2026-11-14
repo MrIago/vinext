@@ -27,15 +27,6 @@ describe("cache runtime loading", () => {
     expect(runtimeImports).not.toContain("./cache.js");
   });
 
-  it("replays cached RSC payloads without importing server reference modules", () => {
-    const source = fs.readFileSync(
-      path.join(import.meta.dirname, "../packages/vinext/src/shims/cache-runtime.ts"),
-      "utf8",
-    );
-
-    expect(source).toContain("{ preserveServerReferences: true }");
-  });
-
   it("keeps the request that starts the shared RSC codec import alive until it settles", async () => {
     // The codec import is memoized for the isolate, and workerd drops a
     // canceled request's pending I/O. A fresh module instance has no memo yet.

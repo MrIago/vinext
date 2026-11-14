@@ -20,7 +20,6 @@
 
 import path from "pathslash";
 import fs from "node:fs";
-import type { Server as HttpServer } from "node:http";
 import type { PrerenderResult, PrerenderRouteResult } from "./prerender.js";
 import {
   prerenderApp,
@@ -34,10 +33,12 @@ import { appRouter } from "../routing/app-router.js";
 import { scanMetadataFiles } from "../server/metadata-routes.js";
 import { findDir } from "../utils/project.js";
 import { injectPregeneratedConcretePaths } from "./inject-pregenerated-paths.js";
-import { rememberCurrentServerEntryImportMtime, startProdServer } from "../server/prod-server.js";
+import { rememberCurrentServerEntryImportMtime } from "../server/prod-server.js";
+import { startPrerenderProdServer, type PrerenderProdServer } from "./prerender-server-pool.js";
 import { enterPrerenderPhase } from "./prerender-phase.js";
 import { PHASE_PRODUCTION_BUILD } from "vinext/shims/constants";
 import { resolveBuiltPagesEntryPath, resolveBuiltRscEntryPath } from "./server-entry.js";
+import { VINEXT_CLIENT_ENTRY_MANIFEST } from "../utils/client-entry-manifest.js";
 import type { VinextRouteRootConfig } from "../config/prerender.js";
 import { registerPrerenderCloudflareLoader } from "./prerender-cloudflare-loader.js";
 
@@ -116,6 +117,11 @@ type RunPrerenderOptions = {
    * Defaults to prerenderApp/prerenderPages internal defaults when omitted.
    */
   concurrency?: number;
+  /**
+   * The client environment's `publicDir`, whose files the client output keeps
+   * under the same paths. Defaults to `<root>/public`; `null` for none.
+   */
+  publicDir?: string | null;
 };
 
 /**
@@ -154,6 +160,74 @@ export function assertNoFatalPrerenderRoutes(routes: readonly PrerenderRouteResu
   throw new Error(
     `Prerender failed: ${fatalRoutes.length} route${fatalRoutes.length !== 1 ? "s" : ""} errored during static generation.\n${fatalList}`,
   );
+}
+
+/**
+ * Build metadata in the client output directory that is not part of the site.
+ * A file `publicDir` holds at the same path is the app's own and stays, as
+ * Next.js copies all of `public/` into the export (and as the build's own
+ * `.vite/` cleanup keeps `public/.vite/`, cloudflare/vinext#4697).
+ */
+function isClientBuildMetadata(relativePath: string, publicDir: string | null): boolean {
+  if (relativePath === ".vite") return false;
+  const isMetadataPath =
+    relativePath.startsWith(".vite/") ||
+    relativePath === VINEXT_CLIENT_ENTRY_MANIFEST ||
+    relativePath === ".assetsignore";
+  if (!isMetadataPath) return false;
+  return !publicDir || !fs.existsSync(path.join(publicDir, relativePath));
+}
+
+/**
+ * With `output: "export"`, a custom `distDir` names the export destination,
+ * like Next.js' `hasCustomExportOutput()` (packages/next/src/export/utils.ts):
+ * the build itself still writes to its intermediate directory (`.next` there,
+ * `dist/` here), and the finished site is copied to `distDir`. The default
+ * `.next` keeps vinext's export in the client output directory.
+ *
+ * The destination is replaced, like Next.js clearing its export `outDir`, so
+ * it must not overlap the project root or the build output it is copied from.
+ */
+export function copyStaticExportToDistDir(options: {
+  root: string;
+  exportDir: string;
+  buildOutDir: string;
+  distDir: string;
+  /** See RunPrerenderOptions.publicDir. */
+  publicDir?: string | null;
+}): void {
+  const { root, exportDir, buildOutDir, distDir } = options;
+  const publicDir = options.publicDir === undefined ? path.join(root, "public") : options.publicDir;
+  if (distDir === ".next") return;
+  const destination = path.resolve(root, distDir);
+  const overlaps = (a: string, b: string) => {
+    const relative = path.relative(a, b);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  };
+  if (
+    overlaps(destination, root) ||
+    overlaps(destination, buildOutDir) ||
+    overlaps(buildOutDir, destination) ||
+    overlaps(exportDir, destination) ||
+    // The export source inside the destination (exportDir "site/assets",
+    // distDir "site"): rmSync(destination) below would delete the source
+    // before cpSync reads it.
+    overlaps(destination, exportDir)
+  ) {
+    throw new Error(
+      `distDir "${distDir}" cannot be used as the static export destination: it overlaps the project root or vinext's build output (${path.relative(root, buildOutDir) || "."}/). Choose a separate directory, such as "out".`,
+    );
+  }
+  fs.rmSync(destination, { recursive: true, force: true });
+  fs.cpSync(exportDir, destination, {
+    recursive: true,
+    filter: (source) => !isClientBuildMetadata(path.relative(exportDir, source), publicDir),
+  });
+  // `.vite/` itself is walked so public files under it are kept; drop it when
+  // nothing of the app's ended up there.
+  try {
+    fs.rmdirSync(path.join(destination, ".vite"));
+  } catch {}
 }
 
 /**
@@ -249,7 +323,7 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
   // For hybrid builds (both app/ and pages/ present), start a single shared
   // prod server and pass it to both phases. This avoids spinning up two servers
   // and ensures both phases render against the same built bundle.
-  let sharedProdServer: { server: HttpServer; port: number } | null = null;
+  let sharedProdServer: PrerenderProdServer | null = null;
   let sharedPrerenderSecret: string | undefined;
   // Match Next's static-worker phase while user modules execute. This wider
   // scope also covers shared-server startup; the nested router helpers restore
@@ -261,14 +335,9 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
       // Hybrid build: start a single shared prod server.
       // The App Router bundle (dist/server/index.js) handles both App Router and
       // Pages Router routes in a hybrid build, so we only need one server.
-      sharedProdServer = await startProdServer({
-        port: 0,
-        host: "127.0.0.1",
-        outDir: buildOutDir,
+      sharedProdServer = await startPrerenderProdServer(buildOutDir, {
         rscEntryPath: rscBundlePath,
         serverDir,
-        noCompression: true,
-        purpose: "prerender",
       });
 
       // Read the prerender secret from vinext-server.json so it can be passed
@@ -353,9 +422,7 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
   } finally {
     try {
       // Close the shared prod server if we started one.
-      if (sharedProdServer) {
-        await new Promise<void>((resolve) => sharedProdServer!.server.close(() => resolve()));
-      }
+      if (sharedProdServer) await sharedProdServer.close();
     } finally {
       restorePrerenderPhase();
     }
@@ -404,6 +471,16 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
         `Remove server-side data fetching (getServerSideProps, force-dynamic, revalidate) from these routes, ` +
         `or remove \`output: "export"\` from next.config.js.`,
     );
+  }
+
+  if (mode === "export") {
+    copyStaticExportToDistDir({
+      root,
+      exportDir: outDir,
+      buildOutDir,
+      distDir: config.distDir,
+      publicDir: options.publicDir,
+    });
   }
 
   injectPregeneratedConcretePaths(root, rscBundlePath, manifestDir, [configuredRscServerDir]);

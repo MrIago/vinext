@@ -52,7 +52,7 @@ test("soft navigates with basePath module URLs after a fresh GSP render", async 
   for (const response of [firstResponse, secondResponse]) {
     expect(response.headers()["x-nextjs-cache"]).toBe("HIT");
     expect(response.headers()["x-vinext-cache"]).toBeUndefined();
-    expect(response.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+    expect(response.headers()["cache-control"]).toBe("no-store");
   }
 
   const moduleRequests: string[] = [];

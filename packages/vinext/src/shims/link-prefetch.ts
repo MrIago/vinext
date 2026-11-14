@@ -16,7 +16,7 @@ export type LinkPrefetchDecision =
 
 export function canLinkPrefetch(input: {
   nodeEnv: string | undefined;
-  prefetch: boolean | "auto" | null | undefined;
+  prefetch: boolean | "auto" | "shell" | "prefetch" | "navigation" | null | undefined;
   isDangerous: boolean;
 }): boolean {
   return input.nodeEnv === "production" && input.prefetch !== false && !input.isDangerous;
@@ -24,7 +24,7 @@ export function canLinkPrefetch(input: {
 
 export function canLinkIntentPrefetch(input: {
   nodeEnv: string | undefined;
-  prefetch: boolean | "auto" | null | undefined;
+  prefetch: boolean | "auto" | "shell" | "prefetch" | "navigation" | null | undefined;
   isDangerous: boolean;
   routerMode: LinkPrefetchRouterMode;
 }): boolean {
@@ -34,7 +34,7 @@ export function canLinkIntentPrefetch(input: {
 
 export function getLinkPrefetchDecision(input: {
   nodeEnv: string | undefined;
-  prefetch: boolean | "auto" | null | undefined;
+  prefetch: boolean | "auto" | "shell" | "prefetch" | "navigation" | null | undefined;
   isDangerous: boolean;
   intent: LinkPrefetchIntent;
   routerMode?: LinkPrefetchRouterMode;

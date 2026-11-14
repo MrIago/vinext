@@ -183,6 +183,26 @@ describe("prerender output paths for /index", () => {
     expect(getAppRouteOutputPath("/")).toBe("index.route");
     expect(getAppRouteOutputPath("/index")).toBe("index/index.route");
   });
+
+  // normalizePagePath throws when posix.normalize resolves the path elsewhere,
+  // so no artifact path can climb out of its output directory.
+  it("rejects paths with dot segments", () => {
+    const mismatch = "Requested and resolved page mismatch: /x/../../.. /";
+    expect(() => getOutputPath("/x/../../..", true)).toThrow(mismatch);
+    expect(() => getOutputPath("/x/../../..", false, "/docs")).toThrow(mismatch);
+    expect(() => getRscOutputPath("/x/../../..")).toThrow(mismatch);
+    expect(() => getRscOutputPath("/x/../../..", { mode: "export", trailingSlash: true })).toThrow(
+      mismatch,
+    );
+    expect(() => getAppRouteOutputPath("/x/../../..")).toThrow(mismatch);
+    expect(() => getOutputPath("/x/.", false)).toThrow(
+      "Requested and resolved page mismatch: /x/. /x",
+    );
+    expect(getOutputPath("/x/..a/.b.", false)).toBe("x/..a/.b..html");
+    expect(() => getOutputPath("/index/..", false)).toThrow(
+      "Requested and resolved page mismatch: /index/index/.. /index",
+    );
+  });
 });
 
 describe("extractRscPayloadFromPrerenderedHtml", () => {
@@ -356,7 +376,7 @@ describe("prerenderApp — RSC extraction", () => {
         routes,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(requestedPaths).toContain("/docs");
@@ -422,7 +442,7 @@ describe("prerenderApp — RSC extraction", () => {
         ],
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(requestedPaths).toContain("/docs/robots.txt");
@@ -514,7 +534,7 @@ describe("prerenderApp — RSC extraction", () => {
           ],
           outDir,
           config,
-          _prodServer: { server, port },
+          _prodServer: { port },
         });
 
         for (const route of ["/manifest.webmanifest", "/icon"]) {
@@ -580,7 +600,7 @@ describe("prerenderApp — RSC extraction", () => {
         routes,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(findRoute(prerenderResult.routes, "/")).toMatchObject({
@@ -651,7 +671,7 @@ describe("prerenderApp — RSC extraction", () => {
         routes,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(findRoute(prerenderResult.routes, "/")).toMatchObject({
@@ -718,7 +738,7 @@ describe("prerenderApp — RSC extraction", () => {
         routes,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(findRoute(prerenderResult.routes, "/")).toMatchObject({
@@ -782,7 +802,7 @@ describe("prerenderApp — RSC extraction", () => {
         routes,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       const route = findRoute(prerenderResult.routes, "/");
@@ -835,7 +855,7 @@ describe("prerenderApp — special errors that escape the shell", () => {
         routes: await appRouter(appDir),
         outDir,
         config: await resolveNextConfig({}),
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
       const read = (file: string) =>
         fs.existsSync(path.join(outDir, file))
@@ -990,7 +1010,7 @@ describe("prerenderPages — basePath export", () => {
         pagesDir,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(requestedPaths).toEqual(expect.arrayContaining(["/docs", "/docs/about"]));
@@ -1097,6 +1117,15 @@ describe("prerenderPages — default mode (pages-basic)", () => {
     expect(r).toMatchObject({ route: "/404", status: "rendered", revalidate: false });
     if (r?.status === "rendered") {
       expect(r.outputFiles).toContain("404.html");
+    }
+  });
+
+  // Next.js always emits pages/500 as 500.html, though it answers with 500.
+  it("renders 500 page", () => {
+    const r = findRoute(results, "/500");
+    expect(r).toMatchObject({ route: "/500", status: "rendered", revalidate: false });
+    if (r?.status === "rendered") {
+      expect(r.outputFiles).toContain("500.html");
     }
   });
 
@@ -1356,6 +1385,14 @@ describe("prerenderPages — export mode (pages-basic)", () => {
     });
   });
 
+  it("exports the 500 page", () => {
+    const r = findRoute(results, "/500");
+    expect(r).toMatchObject({ route: "/500", status: "rendered" });
+    if (r?.status === "rendered") {
+      expect(fs.readFileSync(path.join(outDir, "500.html"), "utf8")).toContain("custom pages/500");
+    }
+  });
+
   it("errors on SSR pages in export mode", () => {
     const ssr = findRoute(results, "/ssr");
     expect(ssr).toMatchObject({ status: "error" });
@@ -1421,6 +1458,74 @@ describe("prerenderApp — default mode (app-basic)", () => {
   it("does not store a page whose render error an error.tsx catches", () => {
     expect(findRoute(results, "/error-server-test")).toMatchObject({ status: "skipped" });
     expect(fs.existsSync(path.join(outDir, "error-server-test.html"))).toBe(false);
+  });
+
+  // Ported from Next.js: test/e2e/prerendered-http-status-codes/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerendered-http-status-codes/index.test.ts
+  describe("HTTP errors a prerender throws", () => {
+    const base = "/nextjs-compat/prerendered-http-status-codes";
+    const readHtml = (route: string) =>
+      fs.readFileSync(path.join(outDir, `${route.slice(1)}.html`), "utf8");
+
+    it.each([
+      { route: "unauthorized", status: 401, location: undefined },
+      { route: "forbidden", status: 403, location: undefined },
+      { route: "not-found", status: 404, location: undefined },
+      { route: "redirect", status: 307, location: "/" },
+      { route: "permanent-redirect", status: 308, location: "/" },
+    ])("writes $status for $route inside Suspense, keeping the layout and fallback", (c) => {
+      const route = `${base}/with-suspense/${c.route}`;
+      const result = findRoute(results, route);
+      expect(result).toMatchObject({ status: "rendered", responseStatus: c.status });
+      if (result?.status !== "rendered") throw new Error("expected the page to render");
+      expect(result.headers?.location).toBe(c.location);
+      const html = readHtml(route);
+      expect(html).toContain('<h1 id="layout">Shared layout</h1>');
+      expect(html).toContain('<p id="suspense-fallback">Loading...</p>');
+    });
+
+    it.each([
+      { route: "unauthorized", status: 401, location: undefined },
+      { route: "forbidden", status: 403, location: undefined },
+      { route: "not-found", status: 404, location: undefined },
+      { route: "redirect", status: 307, location: "/" },
+      { route: "permanent-redirect", status: 308, location: "/" },
+    ])("writes $status for $route outside Suspense", (c) => {
+      const result = findRoute(results, `${base}/without-suspense/${c.route}`);
+      expect(result).toMatchObject({ status: "rendered", responseStatus: c.status });
+      if (result?.status !== "rendered") throw new Error("expected the page to render");
+      expect(result.headers?.location).toBe(c.location);
+    });
+
+    // A request-time render streams its 200 before the error.
+    it("leaves a notFound() after connection() to the request", () => {
+      expect(findRoute(results, `${base}/with-suspense/dynamic-not-found`)).toMatchObject({
+        status: "skipped",
+        reason: "dynamic",
+      });
+    });
+
+    describe.each(["suspense", "root"])("with the second error caught at %s", (boundary) => {
+      it.each([
+        ["not-found", "forbidden", 404, undefined],
+        ["forbidden", "not-found", 403, undefined],
+        ["unauthorized", "redirect", 307, "/second"],
+        ["redirect", "not-found", 307, "/first"],
+        ["redirect", "permanent-redirect", 307, "/first"],
+      ] as const)("%s then %s answers %i", (first, second, status, location) => {
+        const route = `${base}/precedence/${first}/${second}/${boundary}`;
+        const result = findRoute(results, route);
+        expect(result).toMatchObject({ status: "rendered", responseStatus: status });
+        if (result?.status !== "rendered") throw new Error("expected the page to render");
+        expect(result.headers?.location).toBe(location);
+        if (boundary === "suspense") {
+          const html = readHtml(route);
+          expect(html).toContain('<h1 id="precedence-layout">HTTP error precedence</h1>');
+          expect(html).toContain('<p id="first-fallback">First fallback</p>');
+          expect(html).toContain('<p id="second-fallback">Second fallback</p>');
+        }
+      });
+    });
   });
 
   // ── Static routes with explicit config ────────────────────────────────────
@@ -1768,22 +1873,22 @@ describe("prerenderApp — default mode (app-basic)", () => {
   // Ported from Next.js: test/e2e/app-dir/rsc-redirect/rsc-redirect.test.ts
   // ('should get 307 status code for document request')
   //
-  // A speculative prerender of a route that calls `redirect()` must not
-  // follow the redirect server-side and cache the destination's HTML under
-  // the redirecting URL. Doing so makes the prod server reply with 200 and
-  // the destination's body on every document request to the redirecting
-  // route, instead of emitting an HTTP 307 with a Location header.
+  // A prerender of a route that calls `redirect()` must not follow the
+  // redirect server-side and cache the destination's HTML under the
+  // redirecting URL, which would make the prod server reply with 200 and the
+  // destination's body (#1530). As in Next.js's build, which prerenders a
+  // route without segment config too, it writes the redirect itself: a 307
+  // with its location.
   //
   // See: https://github.com/cloudflare/vinext/issues/1530
-  it("skips /redirect-test instead of capturing the destination HTML", () => {
+  it("writes /redirect-test as its redirect instead of the destination HTML", () => {
     const r = findRoute(results, "/redirect-test");
-    expect(r).toBeDefined();
-    expect(r?.status).toBe("skipped");
-    // No HTML/RSC must be written for the redirecting route — otherwise the
-    // prod server serves the cached destination body with status 200 for
-    // every document request to /redirect-test.
-    expect(fs.existsSync(path.join(outDir, "redirect-test.html"))).toBe(false);
-    expect(fs.existsSync(path.join(outDir, "redirect-test.rsc"))).toBe(false);
+    expect(r).toMatchObject({ status: "rendered", responseStatus: 307 });
+    if (r?.status !== "rendered") throw new Error("expected /redirect-test to render");
+    expect(r.headers?.location).toBe("/about");
+    expect(fs.readFileSync(path.join(outDir, "redirect-test.html"), "utf8")).not.toContain(
+      "This is the about page.",
+    );
   });
 
   // As in Next.js's build, a page's special error that escapes the shell is
@@ -1813,11 +1918,18 @@ describe("prerenderApp — default mode (app-basic)", () => {
     },
   );
 
-  // A Suspense boundary caught the special error, so the shell rendered.
-  it("writes a special error caught under loading.tsx as a 200", () => {
+  // A Suspense boundary caught the special error, so the shell rendered. As
+  // in Next.js's prerender, the document still answers with its status.
+  // Ported from Next.js: test/e2e/prerendered-http-status-codes/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerendered-http-status-codes/index.test.ts
+  it("writes a special error caught under loading.tsx with its status", () => {
     const r = findRoute(results, "/nextjs-compat/isr-special-error/loading-not-found");
-    expect(r).toMatchObject({ status: "rendered", revalidate: 60 });
-    expect(r).not.toHaveProperty("responseStatus");
+    expect(r).toMatchObject({ status: "rendered", revalidate: 60, responseStatus: 404 });
+    const html = fs.readFileSync(
+      path.join(outDir, "nextjs-compat/isr-special-error/loading-not-found.html"),
+      "utf8",
+    );
+    expect(html).toContain("<p>loading</p>");
   });
 
   // ── API routes — always skipped ────────────────────────────────────────────
@@ -1943,6 +2055,43 @@ describe("runPrerender — hybrid app+pages (app-basic)", () => {
   });
 });
 
+describe("prerenderApp — prerender server health", () => {
+  it("fails the build when the prerender server drops connections", async () => {
+    const outDir = tmpDir("vinext-prerender-server-health-");
+    // Stands in for a forked prerender server that died mid-build.
+    const server = createServer((req) => req.socket.destroy());
+    const port = await listen(server);
+    const transportErrors: unknown[] = [];
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const appDir = path.resolve(import.meta.dirname, "fixtures/app-prerender-open-handle/app");
+
+      await expect(
+        prerenderApp({
+          mode: "default",
+          rscBundlePath: path.join(outDir, "dist", "server", "index.js"),
+          routes: await appRouter(appDir),
+          outDir,
+          config: await resolveNextConfig({}),
+          _prodServer: {
+            port,
+            recordRenderError: (err) => transportErrors.push(err),
+            assertHealthy: () => {
+              if (transportErrors.length > 0) throw new Error("prerender server exited");
+            },
+          },
+        }),
+      ).rejects.toThrow("prerender server exited");
+      expect(transportErrors.length).toBeGreaterThan(0);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () => {
   // Ported from Next.js: test/production/app-dir/generate-static-params-errors/generate-static-params-errors.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/production/app-dir/generate-static-params-errors/generate-static-params-errors.test.ts
@@ -1998,7 +2147,7 @@ describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () 
         routes,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       const route = result.routes.find((r) => r.route.includes("slug"));
@@ -2058,7 +2207,7 @@ describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () 
         routes,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       const route = result.routes.find((r) => r.route.includes("slug"));
@@ -2105,7 +2254,7 @@ describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () 
         routes,
         outDir,
         config: await resolveNextConfig({}),
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(result.routes).toContainEqual({
@@ -2162,7 +2311,7 @@ describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () 
         pagesDir,
         outDir,
         config,
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       const route = result.routes.find((r) => r.route.includes("posts"));
@@ -2177,6 +2326,115 @@ describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () 
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+// Next.js fails `next build` in every output mode when a getStaticPaths entry
+// has a `.` or `..` segment: normalizePagePath, applied to every prerendered
+// page, throws because posix.normalize resolves the path elsewhere. vinext
+// wrote those entries' HTML outside the output directory. Refs #4583
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/page-path/normalize-page-path.ts
+describe("prerenderPages — getStaticPaths dot segments (#4583)", () => {
+  const fixtureDir = path.resolve(
+    import.meta.dirname,
+    "./fixtures/pages-static-paths-dot-segments",
+  );
+
+  function listFiles(dir: string): string[] {
+    return fs
+      .readdirSync(dir, { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => path.relative(dir, path.join(entry.parentPath, entry.name)))
+      .sort();
+  }
+
+  const cases = [
+    {
+      mode: "export",
+      nextConfig: { output: "export", trailingSlash: true },
+      files: [
+        "index.html",
+        "object/safe/slug/page/index.html",
+        "string-path/foo%2F..%2Fbar/index.html",
+        "vinext-prerender.json",
+      ],
+    },
+    {
+      mode: "default",
+      nextConfig: {},
+      files: [
+        "index.html",
+        "object/safe/slug/page.html",
+        "string-path/foo%2F..%2Fbar.html",
+        "vinext-prerender.json",
+      ],
+    },
+  ] as const;
+
+  for (const { mode, nextConfig, files } of cases) {
+    it(`fails the routes as fatal and writes nothing outside outDir (${mode} mode)`, async () => {
+      const pagesBundlePath = await buildPagesFixture(fixtureDir, nextConfig);
+      const root = tmpDir(`vinext-prerender-dot-segments-${mode}-`);
+      // Deep enough that the `/object/../../..` entry would land inside `root`.
+      const outDir = path.join(root, "a", "b", "out");
+      try {
+        const { prerenderPages } = await import("../packages/vinext/src/build/prerender.js");
+        const { pagesRouter, apiRouter } =
+          await import("../packages/vinext/src/routing/pages-router.js");
+        const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+        const pagesDir = path.join(fixtureDir, "pages");
+
+        const result = await prerenderPages({
+          mode,
+          pagesBundlePath,
+          routes: await pagesRouter(pagesDir),
+          apiRoutes: await apiRouter(pagesDir),
+          pagesDir,
+          outDir,
+          config: await resolveNextConfig(nextConfig),
+        });
+
+        expect(listFiles(root)).toEqual(files.map((file) => path.join("a", "b", "out", file)));
+        const errors = result.routes
+          .filter((route) => route.status === "error")
+          .sort((a, b) => a.route.localeCompare(b.route));
+        expect(errors).toEqual([
+          {
+            route: "/encoded-string-path/:a",
+            status: "error",
+            error: "Requested and resolved page mismatch: /encoded-string-path/.. /",
+            fatal: true,
+          },
+          {
+            route: "/mismatched-string-path/:a",
+            status: "error",
+            error:
+              "Requested and resolved page mismatch: /mismatched-string-path/safe/.. /mismatched-string-path",
+            fatal: true,
+          },
+          {
+            route: "/object/:a/:b/:c",
+            status: "error",
+            error: "Requested and resolved page mismatch: /object/../../.. /",
+            fatal: true,
+          },
+          {
+            route: "/single-dot/:slug",
+            status: "error",
+            error: "Requested and resolved page mismatch: /single-dot/. /single-dot",
+            fatal: true,
+          },
+          {
+            route: "/string-path/:a",
+            status: "error",
+            error: "Requested and resolved page mismatch: /string-path/.. /",
+            fatal: true,
+          },
+        ]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }, 60_000);
+  }
 });
 
 describe("prerenderApp — layout generateStaticParams", () => {
@@ -2236,7 +2494,7 @@ describe("prerenderApp — layout generateStaticParams", () => {
         routes: await appRouter(appDir),
         outDir,
         config: await resolveNextConfig({ output: "export" }),
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(findRoute(result.routes, "/en/news/details")).toMatchObject({
@@ -2304,7 +2562,7 @@ describe("prerenderApp — layout generateStaticParams", () => {
         routes: await appRouter(appDir),
         outDir,
         config: await resolveNextConfig({ output: "export" }),
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
 
       expect(result.routes.find((route) => route.route === "/:id/details")).toMatchObject({
@@ -2382,7 +2640,7 @@ describe("prerenderApp — layout generateStaticParams contract", () => {
         routes: await appRouter(appDir),
         outDir: path.join(root, "out"),
         config: await resolveNextConfig({}),
-        _prodServer: { server, port },
+        _prodServer: { port },
       });
       return { result, renderedPaths, staticParamRequests };
     } finally {
@@ -2650,6 +2908,20 @@ describe("routeStaticParamSets", () => {
     ).toThrow('Missing: "b".');
   });
 
+  // Ported from Next.js: test/e2e/app-dir/ensure-static-navigation
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation/ensure-static-navigation.test.ts
+  it("rejects incomplete sets of an ensureStatic = navigation page", () => {
+    expect(() =>
+      routeStaticParamSets(
+        { pattern: "/default/static-params-incomplete/:slug/:snail" },
+        [{ slug: "123" }],
+        { ensureStaticNavigation: true },
+      ),
+    ).toThrow(
+      'Page "/default/static-params-incomplete/[slug]/[snail]": `generateStaticParams()` returned incomplete params. Routes using `ensureStatic = "navigation"` must return every dynamic route parameter. Missing: "snail".',
+    );
+  });
+
   it("rejects a set whose value does not fit its segment", () => {
     expect(() => routeStaticParamSets({ pattern: "/:id" }, [{ id: 1 }])).toThrow(
       "Parameter id from generateStaticParams for /:id must be a string.",
@@ -2660,10 +2932,20 @@ describe("routeStaticParamSets", () => {
 describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => {
   async function prerenderDynamicRootParamRoute(
     cacheComponents: boolean,
-    experimentalFallbackShells = false,
+    fallbackShellState?: string,
+    previousFallbackPostponed?: string,
+    staticParamsFor: (pattern: string | null) => unknown = () => [{ locale: "en", slug: "hello" }],
+    withRoutes?: (routes: AppRoute[]) => void,
   ) {
     const root = tmpDir("vinext-prerender-ppr-shell-");
     const outDir = path.join(root, "out");
+    if (previousFallbackPostponed !== undefined) {
+      fs.mkdirSync(path.join(outDir, "en", "blog"), { recursive: true });
+      fs.writeFileSync(
+        path.join(outDir, "en", "blog", "[slug].postponed"),
+        previousFallbackPostponed,
+      );
+    }
     const appDir = path.join(root, "app");
     const pageDir = path.join(appDir, "[locale]", "blog", "[slug]");
     fs.mkdirSync(pageDir, { recursive: true });
@@ -2681,7 +2963,7 @@ describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => 
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       if (url.pathname === "/__vinext/prerender/static-params") {
         res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify([{ locale: "en", slug: "hello" }]));
+        res.end(JSON.stringify(staticParamsFor(url.searchParams.get("pattern"))));
         return;
       }
       if (url.pathname === "/__vinext_nonexistent_for_404__") {
@@ -2692,13 +2974,17 @@ describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => 
 
       renderedPaths.push(url.pathname);
       res.setHeader("content-type", "text/html");
+      const isFallbackShell = url.pathname === "/en/blog/[slug]";
       res.end(
-        "<html><body>" +
+        "<!DOCTYPE html><html><body>" +
           runtimeRscChunkScript(
             `0:["$","div",null,{"children":${JSON.stringify(url.pathname)}}]\n`,
           ) +
           runtimeRscDoneScript() +
-          "</body></html>",
+          "</body></html>" +
+          (isFallbackShell && fallbackShellState !== undefined
+            ? `<!--vinext-ppr-shell-state:${fallbackShellState}-->`
+            : ""),
       );
     });
 
@@ -2708,65 +2994,38 @@ describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => 
       const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
       const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
       const routes = await appRouter(appDir);
+      withRoutes?.(routes);
       const config = await resolveNextConfig({ cacheComponents });
 
-      const previousExperimentalFallbackShells =
-        process.env.__VINEXT_EXPERIMENTAL_PPR_FALLBACK_SHELLS;
-      if (experimentalFallbackShells) {
-        process.env.__VINEXT_EXPERIMENTAL_PPR_FALLBACK_SHELLS = "1";
-      } else {
-        delete process.env.__VINEXT_EXPERIMENTAL_PPR_FALLBACK_SHELLS;
-      }
+      const result = await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config,
+        _prodServer: { port },
+      });
 
-      let result;
-      try {
-        result = await prerenderApp({
-          mode: "default",
-          rscBundlePath: path.join(root, "dist", "server", "index.js"),
-          routes,
-          outDir,
-          config,
-          _prodServer: { server, port },
-        });
-      } finally {
-        if (previousExperimentalFallbackShells === undefined) {
-          delete process.env.__VINEXT_EXPERIMENTAL_PPR_FALLBACK_SHELLS;
-        } else {
-          process.env.__VINEXT_EXPERIMENTAL_PPR_FALLBACK_SHELLS =
-            previousExperimentalFallbackShells;
-        }
-      }
+      const readOutput = (file: string) => {
+        const filePath = path.join(outDir, "en", "blog", file);
+        return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : null;
+      };
 
-      const fallbackHtmlPath = path.join(outDir, "en", "blog", "[slug].html");
-      const fallbackHtml = fs.existsSync(fallbackHtmlPath)
-        ? fs.readFileSync(fallbackHtmlPath, "utf8")
-        : null;
-
-      return { fallbackHtml, renderedPaths, routes: result.routes };
+      return {
+        fallbackHtml: readOutput("[slug].html"),
+        fallbackPostponed: readOutput("[slug].postponed"),
+        renderedPaths,
+        routes: result.routes,
+      };
     } finally {
       await closeServer(server);
       fs.rmSync(root, { recursive: true, force: true });
     }
   }
 
-  it("does not queue incomplete fallback-shell artifacts by default", async () => {
-    const { renderedPaths, routes } = await prerenderDynamicRootParamRoute(true);
-
-    expect(findRoute(routes, "/en/blog/hello")).toMatchObject({
-      route: "/:locale/blog/:slug",
-      path: "/en/blog/hello",
-      status: "rendered",
-    });
-    expect(findRoute(routes, "/en/blog/[slug]")).toBeUndefined();
-    expect(renderedPaths).toContain("/en/blog/hello");
-    expect(renderedPaths).not.toContain("/en/blog/[slug]");
-  });
-
-  it("queues fallback-shell artifacts only with the internal opt-in", async () => {
-    const { fallbackHtml, renderedPaths, routes } = await prerenderDynamicRootParamRoute(
-      true,
-      true,
-    );
+  it("queues fallback-shell artifacts with cacheComponents", async () => {
+    const { fallbackHtml, fallbackPostponed, renderedPaths, routes } =
+      await prerenderDynamicRootParamRoute(true);
 
     expect(findRoute(routes, "/en/blog/hello")).toMatchObject({
       route: "/:locale/blog/:slug",
@@ -2781,6 +3040,252 @@ describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => 
     });
     expect(renderedPaths).toEqual(expect.arrayContaining(["/en/blog/hello", "/en/blog/[slug]"]));
     expect(fallbackHtml).toContain("<!--vinext-ppr-dynamic-fallback-shell-->");
+    // Without a state to resume from, the shell keeps only its generated params.
+    expect(fallbackPostponed).not.toContain("replayNodes");
+  });
+
+  it.each([
+    ["no generateStaticParams", null],
+    ["an empty generateStaticParams", []],
+  ])(
+    "keeps the layout's root params in the fallback shells of a page with %s",
+    async (_label, pageStaticParams) => {
+      const { parseAppPprShellState } =
+        await import("../packages/vinext/src/server/app-ppr-fallback-shell.js");
+      const { fallbackHtml, fallbackPostponed, renderedPaths } =
+        await prerenderDynamicRootParamRoute(true, undefined, undefined, (pattern) =>
+          pattern === "layouts:[locale]" ? [{ locale: "en" }] : pageStaticParams,
+        );
+
+      expect(renderedPaths).toContain("/en/blog/[slug]");
+      expect(fallbackHtml).toContain("<!--vinext-ppr-dynamic-fallback-shell-->");
+      // The shell records the layout's params, so a request under `en` uses it.
+      expect(parseAppPprShellState(fallbackPostponed ?? undefined)?.generated).toEqual([
+        { locale: "en" },
+      ]);
+    },
+  );
+
+  // Ported from Next.js: test/e2e/app-dir/ensure-static-navigation and
+  // test/e2e/app-dir/ensure-static-navigation-runtime
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation/ensure-static-navigation.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/ensure-static-navigation-runtime/ensure-static-navigation-runtime.test.ts
+  describe('ensureStatic = "navigation"', () => {
+    const makeEnsureStatic = (routes: AppRoute[]) => {
+      for (const route of routes) {
+        if (!route.pagePath) continue;
+        fs.writeFileSync(
+          route.pagePath,
+          'export const ensureStatic = "navigation";\nexport default function Page() { return null; }\n',
+        );
+      }
+    };
+
+    it("prerenders its generated params without fallback shells", async () => {
+      const { renderedPaths, routes } = await prerenderDynamicRootParamRoute(
+        true,
+        undefined,
+        undefined,
+        undefined,
+        makeEnsureStatic,
+      );
+      expect(findRoute(routes, "/en/blog/hello")).toMatchObject({ status: "rendered" });
+      expect(renderedPaths).toEqual(["/en/blog/hello"]);
+    });
+
+    it.each([
+      [
+        "no generateStaticParams",
+        null,
+        'Page "/[locale]/blog/[slug]": `ensureStatic = "navigation"` requires an exported `generateStaticParams()` function.',
+      ],
+      [
+        "an empty generateStaticParams",
+        [],
+        "When using Cache Components, all `generateStaticParams` functions must return at least one result.",
+      ],
+    ])("fails the build with %s", async (_label, staticParams, message) => {
+      const { renderedPaths, routes } = await prerenderDynamicRootParamRoute(
+        true,
+        undefined,
+        undefined,
+        () => staticParams,
+        makeEnsureStatic,
+      );
+      expect(routes).toContainEqual(
+        expect.objectContaining({
+          error: expect.stringContaining(message),
+          fatal: true,
+          route: "/:locale/blog/:slug",
+          status: "error",
+        }),
+      );
+      expect(renderedPaths.filter((pathname) => pathname.includes("blog"))).toEqual([]);
+    });
+
+    it("fails the build when its layouts generate only some of its params", async () => {
+      const { routes } = await prerenderDynamicRootParamRoute(
+        true,
+        undefined,
+        undefined,
+        (pattern) => (pattern === "layouts:[locale]" ? [{ locale: "en" }] : null),
+        makeEnsureStatic,
+      );
+      expect(routes).toContainEqual(
+        expect.objectContaining({
+          error: expect.stringContaining('Missing: "slug".'),
+          fatal: true,
+          status: "error",
+        }),
+      );
+    });
+  });
+
+  it("writes a fallback shell's state beside it, out of the served HTML, with its generated params", async () => {
+    const { formatAppPprShellState, parseAppPprShellState } =
+      await import("../packages/vinext/src/server/app-ppr-fallback-shell.js");
+    const resumeDataCache = JSON.stringify({ cache: { key: { body: "e30=" } }, fetch: {} });
+    const state = formatAppPprShellState({
+      prelude: true,
+      postponed: { replayNodes: [] },
+      resumeDataCache,
+      generated: null,
+    });
+    const { fallbackHtml, fallbackPostponed } = await prerenderDynamicRootParamRoute(true, state);
+
+    expect(fallbackHtml).not.toContain("vinext-ppr-shell-state");
+    expect(parseAppPprShellState(fallbackPostponed ?? undefined)).toEqual({
+      prelude: true,
+      postponed: { replayNodes: [] },
+      resumeDataCache,
+      generated: [{ locale: "en", slug: "hello" }],
+    });
+  });
+
+  it("records only the generated params that agree with the values a fallback shell keeps", async () => {
+    const { formatAppPprShellState, parseAppPprShellState } =
+      await import("../packages/vinext/src/server/app-ppr-fallback-shell.js");
+    const state = formatAppPprShellState({
+      prelude: true,
+      postponed: { replayNodes: [] },
+      resumeDataCache: null,
+      generated: null,
+    });
+    const { fallbackPostponed } = await prerenderDynamicRootParamRoute(
+      true,
+      state,
+      undefined,
+      (pattern) =>
+        pattern === "layouts:[locale]"
+          ? [{ locale: "en" }, { locale: "fr" }]
+          : [{ slug: "hello" }, { slug: "world" }],
+    );
+
+    expect(parseAppPprShellState(fallbackPostponed ?? undefined)?.generated).toEqual([
+      { locale: "en", slug: "hello" },
+      { locale: "en", slug: "world" },
+    ]);
+  });
+
+  // A param set that names an optional catch-all as undefined generates the
+  // path without it (build/static-paths/app.ts hadAllParamsGenerated), though
+  // JSON drops the property on its way from the static params endpoint.
+  it("records an optional catch-all generated as undefined", async () => {
+    const { parseAppPprShellState } =
+      await import("../packages/vinext/src/server/app-ppr-fallback-shell.js");
+    const root = tmpDir("vinext-prerender-ppr-optional-catch-all-");
+    const appDir = path.join(root, "app");
+    const outDir = path.join(root, "out");
+    fs.mkdirSync(path.join(appDir, "shop", "[[...path]]"), { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, "shop", "[[...path]]", "page.tsx"),
+      "export default function Page() { return null; }\n",
+    );
+    const renderedPaths: string[] = [];
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (url.pathname === "/__vinext/prerender/static-params") {
+        void handleAppPrerenderEndpoint(new Request(url), {
+          isPrerenderEnabled: () => true,
+          pathname: url.pathname,
+          staticParamsMap: {
+            "/shop/:path*": createAppPrerenderStaticParamsResolver([
+              () => [{ path: undefined }, { path: ["a"] }],
+            ]),
+          },
+        }).then(async (response) => {
+          res.statusCode = response?.status ?? 404;
+          res.end(await response?.text());
+        });
+        return;
+      }
+      renderedPaths.push(url.pathname);
+      res.setHeader("content-type", "text/html");
+      res.end(
+        "<!DOCTYPE html><html><body>" +
+          runtimeRscChunkScript(`0:["$","div",null,{}]\n`) +
+          runtimeRscDoneScript() +
+          "</body></html>",
+      );
+    });
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes: await appRouter(appDir),
+        outDir,
+        config: await resolveNextConfig({ cacheComponents: true }),
+        _prodServer: { port },
+      });
+
+      expect(renderedPaths).toEqual(expect.arrayContaining(["/shop", "/shop/a"]));
+      const postponed = path.join(outDir, "shop", "[[...path]].postponed");
+      expect(parseAppPprShellState(fs.readFileSync(postponed, "utf8"))?.generated).toEqual([
+        { path: [] },
+        { path: ["a"] },
+      ]);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records no generated params for a route with parallel slots, whose generators the build doesn't enumerate", async () => {
+    const { parseAppPprShellState } =
+      await import("../packages/vinext/src/server/app-ppr-fallback-shell.js");
+    const { fallbackPostponed } = await prerenderDynamicRootParamRoute(
+      true,
+      undefined,
+      undefined,
+      undefined,
+      (routes) => {
+        const route = routes.find((candidate) => candidate.pattern === "/:locale/blog/:slug")!;
+        route.parallelSlots = [{ name: "modal" } as AppRoute["parallelSlots"][number]];
+      },
+    );
+
+    expect(parseAppPprShellState(fallbackPostponed ?? undefined)?.generated).toBeNull();
+  });
+
+  it("replaces an earlier build's state, keeping only the generated params when the shell has none", async () => {
+    const { parseAppPprShellState } =
+      await import("../packages/vinext/src/server/app-ppr-fallback-shell.js");
+    const { fallbackPostponed } = await prerenderDynamicRootParamRoute(
+      true,
+      undefined,
+      JSON.stringify({ cache: { stale: { body: "e30=" } }, fetch: {} }),
+    );
+
+    expect(parseAppPprShellState(fallbackPostponed ?? undefined)).toEqual({
+      prelude: false,
+      postponed: null,
+      resumeDataCache: null,
+      generated: [{ locale: "en", slug: "hello" }],
+    });
   });
 
   it("does not queue fallback-shell artifacts when cacheComponents is disabled", async () => {

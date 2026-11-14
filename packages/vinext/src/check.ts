@@ -7,10 +7,16 @@
 
 import { detectPackageManager, findDir, findViteConfigPath } from "./utils/project.js";
 import { normalizePageExtensions } from "./routing/file-matcher.js";
+import {
+  findPackageVersion,
+  isVersionBelow,
+  MINIMUM_REACT_VERSION,
+} from "./utils/react-version.js";
 import { POSTCSS_CONFIG_FILES } from "./plugins/postcss.js";
 import { parseProgram, unwrapExpression } from "./plugins/ast-utils.js";
 import type { ESTree } from "vite";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import ignore, { type Ignore } from "ignore";
 import path from "pathslash";
 
@@ -102,7 +108,7 @@ const IMPORT_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   "next/cache": {
     status: "supported",
     detail:
-      "revalidateTag, revalidatePath, updateTag, refresh, unstable_cache, unstable_noStore, io, cacheLife, cacheTag",
+      "revalidateTag, revalidatePath, updateTag, refresh, unstable_cache, unstable_noStore, io, cacheLife, cacheTag, prefetch, navigation",
   },
   "next/dynamic": { status: "supported" },
   "next/head": { status: "supported" },
@@ -115,7 +121,7 @@ const IMPORT_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   "next/font/local": {
     status: "supported",
     detail:
-      "className and variable modes both work; @font-face is generated at runtime; no adjusted fallback metrics (adjustFontFallback is ignored)",
+      "className and variable modes both work; for statically analyzable relative src paths, @font-face and adjusted fallback metrics (adjustFontFallback) are extracted into a stylesheet at build time; other src forms get @font-face at runtime",
   },
   "next/og": { status: "supported", detail: "ImageResponse via @vercel/og" },
   "next/config": {
@@ -217,7 +223,7 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   images: {
     status: "partial",
     detail:
-      "remotePatterns, deviceSizes/imageSizes, qualities, localPatterns (production only) and SVG/CSP options honoured; resizing needs an optimizer via vinext({ images: { optimizer } }), images are served as-is otherwise; loader/loaderFile are ignored",
+      "remotePatterns, deviceSizes/imageSizes, qualities, localPatterns (production only), SVG/CSP options and loaderFile honoured; resizing needs an optimizer via vinext({ images: { optimizer } }), images are served as-is otherwise; the imgix/cloudinary/akamai loader presets are ignored",
   },
   allowedDevOrigins: { status: "supported", detail: "dev server cross-origin allowlist" },
   output: {
@@ -287,8 +293,8 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
       "ignored, so imports resolve unoptimized; experimental.optimizePackageImports is supported",
   },
   typedRoutes: {
-    status: "partial",
-    detail: "typed Link hrefs are not generated; vinext typegen provides PageProps/LayoutProps",
+    status: "supported",
+    detail: "vinext typegen writes typed links (.next/types/link.d.ts) like Next.js",
   },
   "compiler.define": { status: "supported" },
   "compiler.defineServer": { status: "supported" },
@@ -344,6 +350,11 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     status: "partial",
     detail: "experimental support; behavior is incomplete",
   },
+  partialPrefetching: {
+    status: "partial",
+    detail:
+      "App Shell and partial prefetches for <Link> and router.prefetch() in production builds; per-segment prefetch requests are one request per page",
+  },
   "experimental.cacheComponents": {
     status: "partial",
     detail: "legacy alias of cacheComponents; experimental support, behavior is incomplete",
@@ -357,8 +368,8 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     detail: "renamed to cacheComponents in Next.js 16 and ignored; use cacheComponents",
   },
   "experimental.typedRoutes": {
-    status: "partial",
-    detail: "typed Link hrefs are not generated; vinext typegen provides PageProps/LayoutProps",
+    status: "supported",
+    detail: "moved to the top-level typedRoutes in Next.js 16; read as an alias",
   },
   "experimental.serverActions": {
     status: "supported",
@@ -445,9 +456,9 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     detail: "supported for Pages Router; App Router unchanged",
   },
   reactStrictMode: {
-    status: "partial",
+    status: "supported",
     detail:
-      "enforced for the Pages Router (client root wrapped in <React.StrictMode> when true); App Router is not yet wrapped (Next.js defaults App Router strict mode on)",
+      "client root wrapped in <React.StrictMode>: Pages Router when true, App Router unless false (matching Next.js defaults)",
   },
   poweredByHeader: {
     status: "supported",
@@ -1318,6 +1329,30 @@ export function analyzeConfig(root: string): CheckItem[] {
   return items;
 }
 
+/** Flag an installed react or react-dom below the version vinext supports. */
+function checkInstalledReact(root: string): CheckItem | null {
+  const req = createRequire(path.join(root, "package.json"));
+  const installed: string[] = [];
+  let tooOld = false;
+  for (const name of ["react", "react-dom"]) {
+    let version: string | null;
+    try {
+      version = findPackageVersion(req.resolve(name), name);
+    } catch {
+      continue;
+    }
+    if (!version) continue;
+    installed.push(`${name} ${version}`);
+    if (isVersionBelow(version, MINIMUM_REACT_VERSION)) tooOld = true;
+  }
+  if (!tooOld) return null;
+  return {
+    name: "react",
+    status: "unsupported",
+    detail: `installed ${installed.join(", ")}; vinext requires ${MINIMUM_REACT_VERSION.join(".")} or later, upgrade react and react-dom`,
+  };
+}
+
 /**
  * Check package.json dependencies for known libraries.
  */
@@ -1338,6 +1373,9 @@ export function checkLibraries(root: string): CheckItem[] {
       });
     }
   }
+
+  const reactItem = checkInstalledReact(root);
+  if (reactItem) items.push(reactItem);
 
   // Sort: unsupported first
   items.sort(compareByStatus);
@@ -1548,9 +1586,10 @@ export function checkConventions(root: string): CheckItem[] {
   // Emit items for the combined scan results
   if (viewTransitionFiles.length > 0) {
     items.push({
-      name: "ViewTransition (React canary API)",
-      status: "partial",
-      detail: "vinext auto-shims with a passthrough fallback, view transitions won't animate",
+      name: "ViewTransition",
+      status: "supported",
+      detail:
+        "stable in React 19.3, which vinext requires; <Link transitionTypes> and router.push/replace transitionTypes are supported",
       files: viewTransitionFiles,
     });
   }

@@ -1,4 +1,7 @@
-import { makeHangingPromise } from "./internal/make-hanging-promise.js";
+import {
+  makeHangingPromise,
+  suppressHangingPromiseAbortRejections,
+} from "./internal/make-hanging-promise.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
 
 export type PprFallbackShellState = {
@@ -13,22 +16,65 @@ export type PprFallbackShellState = {
   hasDynamicBoundary: boolean;
   isFinalRenderStarted: boolean;
   isAbortScheduled: boolean;
+  /**
+   * A runtime prefetch's render, as Next.js's `prerender-runtime`: the
+   * request's cookies, headers and private caches are rendered, and only
+   * `connection()` and caches about to go stale leave holes.
+   */
+  isRuntimePrefetch: boolean;
   pendingAbortCleanup: (() => void) | null;
   pendingCacheReadyCleanup: (() => void) | null;
   pendingCacheTasks: number;
   phase: "warmup" | "final";
+  /**
+   * How far the render goes, as Next.js's render stages: `shell` is an App
+   * Shell, which leaves out what follows `prefetch()` and `navigation()` and
+   * caches that go stale within five minutes; `prefetch` renders what follows
+   * `prefetch()`; `navigation` renders what follows both. A static shell (the
+   * whole static prerender) goes to `navigation`, a runtime prefetch to
+   * `prefetch`.
+   */
+  prefetchStage: PprFallbackShellPrefetchStage;
   routePattern: string;
+  /**
+   * The params the render reads, `?` for search params, when it records them
+   * for the client to reuse its payload for other URLs, as Next.js's
+   * `varyParams` does. Null when it doesn't.
+   */
+  varyParams: Set<string> | null;
 };
+
+export type PprFallbackShellPrefetchStage = "shell" | "prefetch" | "navigation";
+
+const PREFETCH_STAGE_ORDER: Record<PprFallbackShellPrefetchStage, number> = {
+  shell: 0,
+  prefetch: 1,
+  navigation: 2,
+};
+
+/** Whether a render that goes to `stage` renders what follows a `reached` boundary. */
+export function reachesPprFallbackShellPrefetchStage(
+  stage: PprFallbackShellPrefetchStage,
+  reached: PprFallbackShellPrefetchStage,
+): boolean {
+  return PREFETCH_STAGE_ORDER[stage] >= PREFETCH_STAGE_ORDER[reached];
+}
 
 type CreatePprFallbackShellStateOptions = {
   fallbackParamNames: readonly string[];
+  isRuntimePrefetch?: boolean;
+  prefetchStage?: PprFallbackShellPrefetchStage;
   routePattern: string;
+  varyParams?: Set<string>;
 };
 
 type PprFallbackShellCacheTask = {
   // The `cacheEpoch` the task was created in. A task that settles in a later
   // epoch (after a warmup->final transition) must not decrement the counter.
   epoch: number;
+  // Uncounted while the task waits for its encoded arguments, see
+  // `waitForPprFallbackShellCacheInput`.
+  isAwaitingInput: boolean;
   isIgnored: boolean;
   isPending: boolean;
 };
@@ -37,8 +83,6 @@ const pprFallbackShellAls = getOrCreateAls<PprFallbackShellState>("vinext.pprFal
 const pprFallbackShellCacheTaskStackAls = getOrCreateAls<PprFallbackShellCacheTask[]>(
   "vinext.pprFallbackShell.cacheTaskStack.als",
 );
-
-function noop(): void {}
 
 function scheduleAfterTask(callback: () => void): () => void {
   let firstTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
@@ -123,6 +167,10 @@ function scheduleAbortIfReady(state: PprFallbackShellState): void {
 function completeCacheTask(state: PprFallbackShellState, task: PprFallbackShellCacheTask): void {
   if (!task.isPending) return;
   task.isPending = false;
+  if (task.isAwaitingInput) {
+    task.isAwaitingInput = false;
+    return;
+  }
   // A task created in an earlier epoch was already accounted for when
   // `preparePprFallbackShellFinalRender` reset `pendingCacheTasks` to 0, so a
   // late settle must not decrement the freshly-reset counter below zero (which
@@ -151,12 +199,29 @@ export function createPprFallbackShellState(
     hasDynamicBoundary: false,
     isFinalRenderStarted: false,
     isAbortScheduled: false,
+    isRuntimePrefetch: options.isRuntimePrefetch === true,
     pendingAbortCleanup: null,
     pendingCacheReadyCleanup: null,
     pendingCacheTasks: 0,
     phase: "warmup",
+    prefetchStage:
+      options.prefetchStage ?? (options.isRuntimePrefetch === true ? "prefetch" : "navigation"),
     routePattern: options.routePattern,
+    varyParams: options.varyParams ?? null,
   };
+}
+
+/**
+ * Records a read of route params into the render's vary params: `?` for
+ * search params, else the param names.
+ */
+export function recordPprFallbackShellVaryParams(
+  state: PprFallbackShellState | null,
+  names: Iterable<string>,
+): void {
+  const varyParams = state?.varyParams;
+  if (!varyParams) return;
+  for (const name of names) varyParams.add(name);
 }
 
 export function runWithPprFallbackShellState<T>(state: PprFallbackShellState, fn: () => T): T {
@@ -172,7 +237,8 @@ export function trackPprFallbackShellCacheTask<T>(
   cacheVariant: string,
 ): Promise<T> {
   const state = getPprFallbackShellState();
-  if (state === null || cacheVariant === "private") {
+  // A runtime prefetch renders private caches, so the shell waits for them.
+  if (state === null || (cacheVariant === "private" && !state.isRuntimePrefetch)) {
     return fn();
   }
 
@@ -180,6 +246,7 @@ export function trackPprFallbackShellCacheTask<T>(
   state.pendingCacheTasks++;
   const task: PprFallbackShellCacheTask = {
     epoch: state.cacheEpoch,
+    isAwaitingInput: false,
     isIgnored: false,
     isPending: true,
   };
@@ -199,6 +266,44 @@ export function trackPprFallbackShellCacheTask<T>(
   });
 }
 
+/**
+ * Wait for a cache function's arguments without holding the shell open.
+ *
+ * Like Next.js's `createHangingInputAbortSignal`, a cache function only counts
+ * as pending once its arguments are encoded: an argument derived from fallback
+ * `params` never resolves, and the shell must still settle and abort around it.
+ * An argument that another cache produces still resolves before the shell
+ * settles, because that cache is itself pending.
+ */
+export function waitForPprFallbackShellCacheInput<T>(input: Promise<T>): Promise<T> {
+  const state = getPprFallbackShellState();
+  const task = pprFallbackShellCacheTaskStackAls.getStore()?.at(-1);
+  if (state === null || task === undefined || !task.isPending || task.isAwaitingInput) {
+    return input;
+  }
+  // Whether the task may continue: one from an aborted render stays halted, so
+  // it can't fetch or fill the resume data cache while the final render runs.
+  const renderSignal = state.abortController.signal;
+  const isHalted = () => renderSignal.aborted || task.epoch !== state.cacheEpoch;
+  if (isHalted()) return new Promise<T>(() => {});
+
+  task.isAwaitingInput = true;
+  state.pendingCacheTasks--;
+  scheduleCacheReadyIfSettled(state);
+  const resumeTask = () => {
+    task.isAwaitingInput = false;
+    // An ignored task reads fallback params, so it stays halted, uncounted.
+    if (isHalted() || task.isIgnored) return false;
+    cancelPendingCacheReady(state);
+    state.pendingCacheTasks++;
+    return true;
+  };
+  return input.then(
+    (value) => (resumeTask() ? value : new Promise<T>(() => {})),
+    (error: unknown) => (resumeTask() ? Promise.reject(error) : new Promise<T>(() => {})),
+  );
+}
+
 export function createPprFallbackShellSuspensePromiseForState<T>(
   state: PprFallbackShellState,
   expression: string,
@@ -207,13 +312,12 @@ export function createPprFallbackShellSuspensePromiseForState<T>(
   if (state.phase === "final") {
     scheduleAbortIfReady(state);
   }
-  const promise = makeHangingPromise<T>(
-    state.abortController.signal,
-    state.routePattern,
-    expression,
-  );
-  promise.catch(noop);
-  return promise;
+  // Like Next.js's unhandled-rejection filter for aborted prerenders, the
+  // shell's abort must not reject what user code derived from these promises
+  // (`params.then(...)`, an async helper awaiting `params`): nothing may be
+  // listening by then. They stay pending and the aborted render drops them.
+  suppressHangingPromiseAbortRejections(state.abortController.signal);
+  return makeHangingPromise<T>(state.abortController.signal, state.routePattern, expression);
 }
 
 function markPprFallbackShellDynamicBoundaryForState(state: PprFallbackShellState): void {
@@ -237,9 +341,97 @@ export function markPprFallbackShellDynamicBoundary(): void {
   markPprFallbackShellDynamicBoundaryForState(state);
 }
 
+/**
+ * A promise that runs `onAwait` the first time something awaits it or chains
+ * from it. Promises it derives are plain ones.
+ */
+class AwaitTrackingPromise<T> extends Promise<T> {
+  static override get [Symbol.species](): PromiseConstructor {
+    return Promise;
+  }
+
+  #onAwait: (() => void) | null = null;
+
+  static track<T>(promise: Promise<T>, onAwait: () => void): Promise<T> {
+    const tracked = new AwaitTrackingPromise<T>((resolve, reject) => {
+      promise.then(resolve, reject);
+    });
+    tracked.#onAwait = onAwait;
+    return tracked;
+  }
+
+  // oxlint-disable-next-line unicorn/no-thenable
+  override then<TResult1 = T, TResult2 = never>(
+    onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): Promise<TResult1 | TResult2> {
+    const onAwait = this.#onAwait;
+    this.#onAwait = null;
+    onAwait?.();
+    return super.then(onfulfilled, onrejected);
+  }
+}
+
+/**
+ * A shell's hole for a call whose promise may go unawaited, like a `fetch()`
+ * fired and forgotten. Like Next.js's untracked hanging promise for a
+ * prerendered `fetch()` (server/lib/patch-fetch.ts), it marks the shell's
+ * dynamic boundary only once the call's promise is awaited, so an ignored call
+ * leaves no hole.
+ */
+export type PprFallbackShellAwaitedHole = {
+  /** The hole's hanging promise. */
+  create<T>(expression: string): Promise<T>;
+  /** The call's promise, which marks the boundary of a hole it creates once awaited. */
+  track<T>(promise: Promise<T>): Promise<T>;
+};
+
+export function createPprFallbackShellAwaitedHole(): PprFallbackShellAwaitedHole | null {
+  const state = getPprFallbackShellState();
+  if (state === null) return null;
+  let isAwaited = false;
+  let isCreated = false;
+  let isMarked = false;
+  const mark = () => {
+    if (isMarked || !isAwaited || !isCreated) return;
+    isMarked = true;
+    markPprFallbackShellDynamicBoundaryForState(state);
+    if (state.phase === "final") {
+      scheduleAbortIfReady(state);
+    }
+  };
+  return {
+    create<T>(expression: string) {
+      isCreated = true;
+      mark();
+      suppressHangingPromiseAbortRejections(state.abortController.signal);
+      return makeHangingPromise<T>(state.abortController.signal, state.routePattern, expression);
+    },
+    track<T>(promise: Promise<T>) {
+      return AwaitTrackingPromise.track(promise, () => {
+        isAwaited = true;
+        mark();
+      });
+    },
+  };
+}
+
 export function createPprFallbackShellSuspensePromise<T>(expression: string): Promise<T> | null {
   const state = getPprFallbackShellState();
   if (state === null) return null;
+  return createPprFallbackShellSuspensePromiseForState<T>(state, expression);
+}
+
+/**
+ * The hole a request-data API (`cookies()`, `headers()`, a private cache)
+ * leaves in a shell, or null when it renders: outside a shell, and in a runtime
+ * prefetch, which renders the request's data.
+ */
+export function createPprFallbackShellRequestDataSuspensePromise<T>(
+  expression: string,
+): Promise<T> | null {
+  const state = getPprFallbackShellState();
+  if (state === null || state.isRuntimePrefetch) return null;
   return createPprFallbackShellSuspensePromiseForState<T>(state, expression);
 }
 

@@ -303,6 +303,22 @@ export function resolveAppPageSpecialError(error: unknown): AppPageSpecialError 
 }
 
 /**
+ * The HTTP error a document a Suspense boundary caught one in answers with, as
+ * Next.js's static generation and ISR decide it: a redirect wins over an access
+ * fallback, and otherwise the error seen first does.
+ * Ported from Next.js: packages/next/src/server/app-render/app-render.tsx
+ * (setHTTPAccessFallbackOrRedirectStatus)
+ */
+export function preferAppPageHttpError(
+  current: AppPageSpecialError | null,
+  specialError: AppPageSpecialError | null,
+): AppPageSpecialError | null {
+  if (specialError === null) return current;
+  if (current === null) return specialError;
+  return specialError.kind === "redirect" && current.kind !== "redirect" ? specialError : current;
+}
+
+/**
  * Resolve the special error that rejected an SSR shell. An error from the RSC
  * render reaches the shell decoded from its Flight digest, so whether
  * generateMetadata() threw it comes from the errors the RSC render threw with

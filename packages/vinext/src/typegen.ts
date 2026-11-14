@@ -1,3 +1,10 @@
+import { apiRouter, pagesRouter } from "./routing/pages-router.js";
+import {
+  convertCustomRouteSource,
+  generateLinkTypesFile,
+  type LinkTypesManifest,
+} from "./typegen/link-types.js";
+import { generateCacheLifeTypes } from "./typegen/cache-life-types.js";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -13,6 +20,17 @@ type GenerateRouteTypesOptions = {
   root: string;
   appDir?: string | null;
   pageExtensions?: readonly string[];
+  /** `typedRoutes`: also write the typed-links `link.d.ts` (#3075). */
+  typedRoutes?: boolean;
+  /** Resolved redirects and rewrites, whose sources typed links accept. */
+  redirects?: readonly { source: string }[];
+  rewrites?: {
+    beforeFiles: readonly { source: string }[];
+    afterFiles: readonly { source: string }[];
+    fallback: readonly { source: string }[];
+  };
+  /** Resolved `cacheLife` profiles, typed as `cacheLife()` overloads (#3244). */
+  cacheLife?: Readonly<Record<string, { stale?: number; revalidate?: number; expire?: number }>>;
 };
 
 export type GenerateRouteTypesResult = {
@@ -52,21 +70,114 @@ export async function generateRouteTypes(
   const outPath = path.join(root, ".next", "types", "routes.d.ts");
   const pagesDir = findDir(root, "pages", "src/pages");
 
+  const declareParamMatching = await nextLacksParamMatchingType(root);
   const content = appDir
     ? renderRouteTypes(
         await collectRouteTypeModel(appDir, options.pageExtensions),
         pagesDir !== null,
+        declareParamMatching,
       )
-    : renderRouteTypes(emptyRouteTypeModel(), false);
+    : renderRouteTypes(emptyRouteTypeModel(), false, declareParamMatching);
 
   await fs.mkdir(path.dirname(outPath), { recursive: true });
-  await fs.writeFile(outPath, content, "utf-8");
+  // Like Next.js's type generation, the resolved cacheLife profiles become
+  // `CacheLifeProfiles` keys and `cacheLife()` overloads in next/cache.
+  const cacheLifePath = path.join(path.dirname(outPath), "cache-life.d.ts");
+  const hasCacheLifeTypes =
+    options.cacheLife !== undefined && Object.keys(options.cacheLife).length > 0;
+  if (hasCacheLifeTypes) {
+    await fs.writeFile(cacheLifePath, generateCacheLifeTypes({ ...options.cacheLife }), "utf-8");
+  }
+  // Like Next.js (route-types-utils.ts), `typedRoutes: true` adds link.d.ts
+  // next to the route types, so Route<T>, next/link, next/navigation and
+  // next/form only accept the app's routes.
+  const linkTypesPath = path.join(path.dirname(outPath), "link.d.ts");
+  if (options.typedRoutes === true) {
+    await fs.writeFile(
+      linkTypesPath,
+      generateLinkTypesFile(await collectLinkTypesManifest(root, appDir, pagesDir, options)),
+      "utf-8",
+    );
+  } else {
+    await fs.rm(linkTypesPath, { force: true });
+  }
+  const typeImports = [
+    ...(hasCacheLifeTypes ? ['import "./cache-life.d.ts";'] : []),
+    ...(options.typedRoutes === true ? ['import "./link.d.ts";'] : []),
+  ];
+  await fs.writeFile(
+    outPath,
+    typeImports.length > 0 ? `${typeImports.join("\n")}\n${content}` : content,
+    "utf-8",
+  );
   const nextEnv = await ensureNextEnvFile(root, appDir !== null);
   return {
     routeTypesPath: outPath,
     nextEnvPath: nextEnv.path,
     nextEnvStatus: nextEnv.status,
   };
+}
+
+/**
+ * The routes typed links accept, collected as Next.js's route types manifest
+ * is (route-types-utils.ts): App Router pages and route handlers, Pages
+ * Router pages, and every route a redirect or rewrite source can match.
+ * Pages Router API routes are keyed by their file path relative to the
+ * project, as Next.js keys them.
+ */
+async function collectLinkTypesManifest(
+  root: string,
+  appDir: string | null,
+  pagesDir: string | null,
+  options: GenerateRouteTypesOptions,
+): Promise<LinkTypesManifest> {
+  const manifest: LinkTypesManifest = {
+    appRoutes: {},
+    pageRoutes: {},
+    redirectRoutes: {},
+    rewriteRoutes: {},
+    appRouteHandlerRoutes: {},
+    pageApiRoutes: [],
+  };
+  if (appDir) {
+    const graph = await appRouteGraph(appDir, options.pageExtensions);
+    for (const route of graph.routes) {
+      const nextRoute = patternToNextFormat(route.pattern);
+      if (route.pagePath) {
+        manifest.appRoutes[nextRoute] ??= { path: path.relative(root, route.pagePath) };
+      } else if (route.routePath) {
+        manifest.appRouteHandlerRoutes[nextRoute] ??= {
+          path: path.relative(root, route.routePath),
+        };
+      }
+    }
+  }
+  if (pagesDir) {
+    const [pageRoutes, apiRoutes] = await Promise.all([
+      pagesRouter(pagesDir, options.pageExtensions),
+      apiRouter(pagesDir, options.pageExtensions),
+    ]);
+    for (const route of pageRoutes) {
+      manifest.pageRoutes[patternToNextFormat(route.pattern)] ??= {
+        path: path.relative(root, route.filePath),
+      };
+    }
+    manifest.pageApiRoutes = apiRoutes.map((route) => path.relative(root, route.filePath));
+  }
+  for (const redirect of options.redirects ?? []) {
+    for (const route of convertCustomRouteSource(redirect.source)) {
+      manifest.redirectRoutes[route] = { path: route };
+    }
+  }
+  const rewrites = options.rewrites;
+  for (const rewrite of rewrites
+    ? [...rewrites.beforeFiles, ...rewrites.afterFiles, ...rewrites.fallback]
+    : []) {
+    for (const route of convertCustomRouteSource(rewrite.source)) {
+      manifest.rewriteRoutes[route] = { path: route };
+    }
+  }
+  return manifest;
 }
 
 async function ensureNextEnvFile(
@@ -127,6 +238,43 @@ async function hasNextPackage(root: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Whether the installed `next` package predates the `ParamMatching` type
+ * (vercel/next.js#97393), so the generated types add it to the `next` module.
+ * Without `next` installed there is no module to add it to.
+ */
+async function nextLacksParamMatchingType(root: string): Promise<boolean> {
+  let typesPath: string;
+  try {
+    const packageJsonPath = createRequire(path.join(root, "package.json")).resolve(
+      "next/package.json",
+    );
+    typesPath = path.join(path.dirname(packageJsonPath), "dist", "types.d.ts");
+  } catch {
+    return false;
+  }
+  try {
+    return !(await fs.readFile(typesPath, "utf-8")).includes("ParamMatching");
+  } catch {
+    return false;
+  }
+}
+
+// The modes `unstable_paramMatching` accepts, as Next.js's `ParamMatching`:
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/types.ts
+const PARAM_MATCHING_TYPE_DECLARATION = `
+declare module "next" {
+  /**
+   * Optional contextual typing for parameter matching exports. Use
+   * \`satisfies ParamMatching\` to check modes without widening the object's keys,
+   * or provide parameter names for an explicit type annotation.
+   */
+  export type ParamMatching<ParamName extends string = string> = Partial<
+    Record<ParamName, "not-found" | "blocking" | "fallback" | "dynamic">
+  >;
+}
+`;
 
 type RouteTypeModel = {
   pageRoutes: string[];
@@ -220,7 +368,11 @@ async function collectRouteTypeModel(
   return model;
 }
 
-function renderRouteTypes(model: RouteTypeModel, hasPagesCompat: boolean): string {
+function renderRouteTypes(
+  model: RouteTypeModel,
+  hasPagesCompat: boolean,
+  declareParamMatching = false,
+): string {
   const allRoutes = uniqueSorted([
     ...model.pageRoutes,
     ...model.layoutRoutes,
@@ -277,7 +429,7 @@ ${renderLayoutSlotMap(model.layoutRoutes, model.layoutSlots)}
   }
 }
 
-${navigationCompat}
+${navigationCompat}${declareParamMatching ? PARAM_MATCHING_TYPE_DECLARATION : ""}
 
 export {};
 `;

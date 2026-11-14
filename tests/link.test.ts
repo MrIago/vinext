@@ -462,6 +462,17 @@ describe("Link App Router prefetch mode", () => {
     expect(resolveLinkPrefetchMode(true, true)).toBe("disabled");
   });
 
+  // Ported from Next.js: navigation-stage Link prefetching. Without Partial
+  // Prefetching, "navigation" behaves like `true`; "shell" and "prefetch" are
+  // aliases for the automatic and full stages.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/app-dir/link.tsx
+  it("maps the stage aliases onto the automatic and full prefetch modes", () => {
+    expect(resolveLinkPrefetchMode("shell", false)).toBe("auto");
+    expect(resolveLinkPrefetchMode("prefetch", false)).toBe("full");
+    expect(resolveLinkPrefetchMode("navigation", false)).toBe("navigation");
+    expect(resolveLinkPrefetchMode("navigation", true)).toBe("disabled");
+  });
+
   it("allows automatic full RSC prefetch for routes that do not require fresh navigation", () => {
     const originalWindow = globalThis.window;
     (globalThis as any).window = {

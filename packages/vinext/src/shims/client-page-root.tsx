@@ -139,10 +139,22 @@ function useBrowserSearchParams(
  */
 function useCanonicalSearchParams(emptySearchParams: boolean): Promise<ClientPageSearchParams> {
   const urlSearchParams = useSearchParams();
-  return useMemo(
-    () => createClientPageSearchParams(emptySearchParams ? null : urlSearchParams),
-    [emptySearchParams, urlSearchParams],
-  );
+  return useMemo(() => {
+    const searchParams = createClientPageSearchParams(emptySearchParams ? null : urlSearchParams);
+    // This promise is rebuilt whenever the URL's query changes, including on
+    // a shallow history.pushState/replaceState, which React applies as a sync
+    // update. A fresh untracked promise makes use() suspend there, and the
+    // nearest Suspense fallback hides the page (a focused input loses focus
+    // and drops keystrokes). The query is already known, so mark it fulfilled
+    // the way React does once it has tracked a promise, as Next.js does in
+    // search-params.browser.ts (vercel/next.js#99611). `status` and `value`
+    // are reserved, so these writes reach the promise, not a query key.
+    Reflect.set(searchParams, "status", "fulfilled");
+    Reflect.set(searchParams, "value", {
+      ...searchParamsToRecord(emptySearchParams ? null : urlSearchParams),
+    });
+    return searchParams;
+  }, [emptySearchParams, urlSearchParams]);
 }
 
 /* oxlint-disable eslint-plugin-react-hooks/rules-of-hooks -- isServer and Cache Components are fixed per build. */

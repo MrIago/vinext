@@ -609,3 +609,21 @@ describe("create-vinext-app CLI", () => {
     expect(fs.existsSync(appPath)).toBe(false);
   });
 });
+
+// https://github.com/cloudflare/vinext/issues/3322: Corepack rejects a bare
+// `"packageManager": "pnpm"`, which Windows produced because `pnpm --version`
+// only resolves through a shell there.
+describe("getPackageManagerVersion", () => {
+  it("reads the version from the running package manager's user agent", async () => {
+    const { getPackageManagerVersion } = await import("../packages/create-vinext-app/src/index.js");
+    expect(
+      getPackageManagerVersion("pnpm", "pnpm/11.1.1 npm/? node/v22.21.1 win32 x64", "win32"),
+    ).toBe("11.1.1");
+  });
+
+  it("ignores another package manager's user agent", async () => {
+    const { getPackageManagerVersion } = await import("../packages/create-vinext-app/src/index.js");
+    const version = getPackageManagerVersion("pnpm", "npm/10.9.0 node/v22.21.1 linux x64");
+    expect(version === null || /^\d+\.\d+\.\d+/.test(version)).toBe(true);
+  });
+});
