@@ -106,6 +106,55 @@ describe("static export with a custom distDir", () => {
     }
   });
 
+  // Next.js copies all of public/ into the export, build metadata names
+  // included; only the files the build generated are left out
+  // (cloudflare/vinext#4697 keeps public/.vite/ the same way).
+  it("keeps public files at build metadata paths in the copied export", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-export-public-"));
+    cleanup.push(root);
+    const exportDir = path.join(root, "dist", "client");
+    const publicDir = path.join(root, "public");
+    for (const [dir, file] of [
+      [exportDir, ".vite/manifest.json"],
+      [exportDir, ".vite/kept.txt"],
+      [exportDir, ".assetsignore"],
+      [exportDir, "index.html"],
+      [publicDir, ".vite/kept.txt"],
+    ] as const) {
+      fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+      fs.writeFileSync(path.join(dir, file), file);
+    }
+
+    copyStaticExportToDistDir({
+      root,
+      exportDir,
+      buildOutDir: path.join(root, "dist"),
+      distDir: "out",
+      publicDir,
+    });
+
+    expect(listFiles(path.join(root, "out")).sort()).toEqual([".vite/kept.txt", "index.html"]);
+  });
+
+  it("drops an emptied .vite directory from the copied export", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-export-novite-"));
+    cleanup.push(root);
+    const exportDir = path.join(root, "dist", "client");
+    fs.mkdirSync(path.join(exportDir, ".vite"), { recursive: true });
+    fs.writeFileSync(path.join(exportDir, ".vite", "manifest.json"), "{}");
+    fs.writeFileSync(path.join(exportDir, "index.html"), "");
+
+    copyStaticExportToDistDir({
+      root,
+      exportDir,
+      buildOutDir: path.join(root, "dist"),
+      distDir: "out",
+      publicDir: null,
+    });
+
+    expect(fs.readdirSync(path.join(root, "out"))).toEqual(["index.html"]);
+  });
+
   // Reported in cloudflare/vinext#3743: with the export source inside the
   // destination, clearing the destination deleted the source before the copy.
   it("refuses a distDir that contains the export source, leaving the source intact", () => {

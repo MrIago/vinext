@@ -312,6 +312,7 @@ async function finalizeBuild(builder: ViteBuilder, context: BuildLifecycleContex
       concurrency: context.prerenderConcurrency,
       nextConfig: context.nextConfig,
       routeRootConfig: buildOutput,
+      publicDir: builder.environments.client?.config.publicDir || null,
     });
     if (context.nextConfig.output !== "export") {
       await finalizeCacheAdapterPrerenderOutput(context.cacheConfig, context.root, {

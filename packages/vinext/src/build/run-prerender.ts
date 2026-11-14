@@ -117,6 +117,11 @@ type RunPrerenderOptions = {
    * Defaults to prerenderApp/prerenderPages internal defaults when omitted.
    */
   concurrency?: number;
+  /**
+   * The client environment's `publicDir`, whose files the client output keeps
+   * under the same paths. Defaults to `<root>/public`; `null` for none.
+   */
+  publicDir?: string | null;
 };
 
 /**
@@ -157,14 +162,20 @@ export function assertNoFatalPrerenderRoutes(routes: readonly PrerenderRouteResu
   );
 }
 
-/** Build metadata in the client output directory that is not part of the site. */
-function isClientBuildMetadata(relativePath: string): boolean {
-  return (
-    relativePath === ".vite" ||
+/**
+ * Build metadata in the client output directory that is not part of the site.
+ * A file `publicDir` holds at the same path is the app's own and stays, as
+ * Next.js copies all of `public/` into the export (and as the build's own
+ * `.vite/` cleanup keeps `public/.vite/`, cloudflare/vinext#4697).
+ */
+function isClientBuildMetadata(relativePath: string, publicDir: string | null): boolean {
+  if (relativePath === ".vite") return false;
+  const isMetadataPath =
     relativePath.startsWith(".vite/") ||
     relativePath === VINEXT_CLIENT_ENTRY_MANIFEST ||
-    relativePath === ".assetsignore"
-  );
+    relativePath === ".assetsignore";
+  if (!isMetadataPath) return false;
+  return !publicDir || !fs.existsSync(path.join(publicDir, relativePath));
 }
 
 /**
@@ -182,8 +193,11 @@ export function copyStaticExportToDistDir(options: {
   exportDir: string;
   buildOutDir: string;
   distDir: string;
+  /** See RunPrerenderOptions.publicDir. */
+  publicDir?: string | null;
 }): void {
   const { root, exportDir, buildOutDir, distDir } = options;
+  const publicDir = options.publicDir === undefined ? path.join(root, "public") : options.publicDir;
   if (distDir === ".next") return;
   const destination = path.resolve(root, distDir);
   const overlaps = (a: string, b: string) => {
@@ -207,8 +221,13 @@ export function copyStaticExportToDistDir(options: {
   fs.rmSync(destination, { recursive: true, force: true });
   fs.cpSync(exportDir, destination, {
     recursive: true,
-    filter: (source) => !isClientBuildMetadata(path.relative(exportDir, source)),
+    filter: (source) => !isClientBuildMetadata(path.relative(exportDir, source), publicDir),
   });
+  // `.vite/` itself is walked so public files under it are kept; drop it when
+  // nothing of the app's ended up there.
+  try {
+    fs.rmdirSync(path.join(destination, ".vite"));
+  } catch {}
 }
 
 /**
@@ -455,7 +474,13 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
   }
 
   if (mode === "export") {
-    copyStaticExportToDistDir({ root, exportDir: outDir, buildOutDir, distDir: config.distDir });
+    copyStaticExportToDistDir({
+      root,
+      exportDir: outDir,
+      buildOutDir,
+      distDir: config.distDir,
+      publicDir: options.publicDir,
+    });
   }
 
   injectPregeneratedConcretePaths(root, rscBundlePath, manifestDir, [configuredRscServerDir]);
