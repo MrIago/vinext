@@ -194,7 +194,11 @@ export function copyStaticExportToDistDir(options: {
     overlaps(destination, root) ||
     overlaps(destination, buildOutDir) ||
     overlaps(buildOutDir, destination) ||
-    overlaps(exportDir, destination)
+    overlaps(exportDir, destination) ||
+    // The export source inside the destination (exportDir "site/assets",
+    // distDir "site"): rmSync(destination) below would delete the source
+    // before cpSync reads it.
+    overlaps(destination, exportDir)
   ) {
     throw new Error(
       `distDir "${distDir}" cannot be used as the static export destination: it overlaps the project root or vinext's build output (${path.relative(root, buildOutDir) || "."}/). Choose a separate directory, such as "out".`,

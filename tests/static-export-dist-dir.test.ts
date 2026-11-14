@@ -105,4 +105,24 @@ describe("static export with a custom distDir", () => {
       );
     }
   });
+
+  // Reported in cloudflare/vinext#3743: with the export source inside the
+  // destination, clearing the destination deleted the source before the copy.
+  it("refuses a distDir that contains the export source, leaving the source intact", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-export-nested-"));
+    cleanup.push(root);
+    const exportDir = path.join(root, "site", "assets");
+    fs.mkdirSync(exportDir, { recursive: true });
+    fs.writeFileSync(path.join(exportDir, "index.html"), "<p>export</p>");
+
+    expect(() =>
+      copyStaticExportToDistDir({
+        root,
+        exportDir,
+        buildOutDir: path.join(root, "build"),
+        distDir: "site",
+      }),
+    ).toThrow(/cannot be used as the static export destination/);
+    expect(fs.readFileSync(path.join(exportDir, "index.html"), "utf8")).toBe("<p>export</p>");
+  });
 });
