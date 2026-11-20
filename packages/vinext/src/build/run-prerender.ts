@@ -200,6 +200,15 @@ export function copyStaticExportToDistDir(options: {
   const publicDir = options.publicDir === undefined ? path.join(root, "public") : options.publicDir;
   if (distDir === ".next") return;
   const destination = path.resolve(root, distDir);
+  // Next.js reserves these two as export destinations.
+  // Ported from Next.js: packages/next/src/export/index.ts (exportAppImpl)
+  for (const reserved of ["public", "static"]) {
+    if (destination === path.join(root, reserved)) {
+      throw new Error(
+        `The '${reserved}' directory is reserved in Next.js and can not be used as the export out directory. https://nextjs.org/docs/messages/can-not-output-to-${reserved}`,
+      );
+    }
+  }
   const overlaps = (a: string, b: string) => {
     const relative = path.relative(a, b);
     return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));

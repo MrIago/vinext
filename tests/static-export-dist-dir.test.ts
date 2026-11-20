@@ -155,6 +155,29 @@ describe("static export with a custom distDir", () => {
     expect(fs.readdirSync(path.join(root, "out"))).toEqual(["index.html"]);
   });
 
+  // Ported from Next.js: packages/next/src/export/index.ts (exportAppImpl)
+  it("refuses the reserved public and static directories as the export destination", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-export-reserved-"));
+    cleanup.push(root);
+    const publicFile = path.join(root, "public", "robots.txt");
+    fs.mkdirSync(path.dirname(publicFile), { recursive: true });
+    fs.writeFileSync(publicFile, "User-agent: *");
+    const options = {
+      root,
+      exportDir: path.join(root, "dist", "client"),
+      buildOutDir: path.join(root, "dist"),
+      publicDir: null,
+    };
+
+    expect(() => copyStaticExportToDistDir({ ...options, distDir: "public" })).toThrow(
+      "The 'public' directory is reserved in Next.js and can not be used as the export out directory.",
+    );
+    expect(() => copyStaticExportToDistDir({ ...options, distDir: "./static" })).toThrow(
+      "The 'static' directory is reserved in Next.js",
+    );
+    expect(fs.existsSync(publicFile)).toBe(true);
+  });
+
   // Reported in cloudflare/vinext#3743: with the export source inside the
   // destination, clearing the destination deleted the source before the copy.
   it("refuses a distDir that contains the export source, leaving the source intact", () => {
