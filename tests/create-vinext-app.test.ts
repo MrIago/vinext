@@ -245,7 +245,7 @@ describe("createVinextApp", () => {
       vite: "8.3.0",
       "@vitejs/plugin-react": "latest",
       "@vitejs/plugin-rsc": "latest",
-      "@cloudflare/vite-plugin": "beta",
+      "@cloudflare/vite-plugin": "^2.0.0-rc.0",
       cf: "latest",
     });
   });
@@ -291,7 +291,7 @@ describe("createVinextApp", () => {
       'pnpm add "vinext" "react-server-dom-webpack" "@vinext/cloudflare" "@cloudflare/workers-response-store"',
     );
     expect(calls).toContain(
-      'pnpm add -D "vite@8.3.0" "@vitejs/plugin-react" "@vitejs/plugin-rsc" "@cloudflare/vite-plugin@beta" "cf@latest"',
+      'pnpm add -D "vite@8.3.0" "@vitejs/plugin-react" "@vitejs/plugin-rsc" "@cloudflare/vite-plugin@^2.0.0-rc.0" "cf@latest"',
     );
     expect(calls.some((command) => command.split(/\s+/).includes('"next"'))).toBe(false);
     expect(calls.some((command) => command.includes("typegen"))).toBe(false);
@@ -547,7 +547,7 @@ describe("create-vinext-app CLI", () => {
           "cf deploy --prebuilt --mode production --worker cf-app-response-store",
       });
       expect(pkg.devDependencies).toMatchObject({
-        "@cloudflare/vite-plugin": "beta",
+        "@cloudflare/vite-plugin": "^2.0.0-rc.0",
         cf: "latest",
         vite: "8.3.0",
       });
@@ -607,5 +607,23 @@ describe("create-vinext-app CLI", () => {
       ),
     ).rejects.toThrow("--legacy-wrangler-cloudflare-init requires --platform=cloudflare");
     expect(fs.existsSync(appPath)).toBe(false);
+  });
+});
+
+// https://github.com/cloudflare/vinext/issues/3322: Corepack rejects a bare
+// `"packageManager": "pnpm"`, which Windows produced because `pnpm --version`
+// only resolves through a shell there.
+describe("getPackageManagerVersion", () => {
+  it("reads the version from the running package manager's user agent", async () => {
+    const { getPackageManagerVersion } = await import("../packages/create-vinext-app/src/index.js");
+    expect(
+      getPackageManagerVersion("pnpm", "pnpm/11.1.1 npm/? node/v22.21.1 win32 x64", "win32"),
+    ).toBe("11.1.1");
+  });
+
+  it("ignores another package manager's user agent", async () => {
+    const { getPackageManagerVersion } = await import("../packages/create-vinext-app/src/index.js");
+    const version = getPackageManagerVersion("pnpm", "npm/10.9.0 node/v22.21.1 linux x64");
+    expect(version === null || /^\d+\.\d+\.\d+/.test(version)).toBe(true);
   });
 });

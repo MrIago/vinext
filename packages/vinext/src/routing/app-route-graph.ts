@@ -9,7 +9,8 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { decodeRouteSegment, isInvisibleSegment, sortRoutes } from "./utils.js";
 import { findFileWithExts, scanWithExtensions, type ValidFileMatcher } from "./file-matcher.js";
-import { validateRoutePatterns } from "./route-validation.js";
+import { patternToNextFormat, validateRoutePatterns } from "./route-validation.js";
+import { findPrunedRoutePathnames } from "./strict-route-matching-check.js";
 import { compareStrings } from "../utils/compare.js";
 import { createAppRouteGraphInterceptionId } from "./app-route-ids.js";
 
@@ -993,6 +994,18 @@ function createRouteManifestGraphVersion(segmentGraph: StaticSegmentGraph): Grap
 /**
  * Build the App Router route graph by scanning `appDir`.
  */
+let strictRouteMatchingEnabled = true;
+
+/**
+ * Whether the route graph prunes matchers as Next.js's strict route matching
+ * does. Set from the resolved next.config before routes are scanned;
+ * `deprecated.looseRouteMatching: true` turns it off. The caller invalidates
+ * the cached graph when it changes.
+ */
+export function setStrictRouteMatching(enabled: boolean): void {
+  strictRouteMatchingEnabled = enabled;
+}
+
 export async function buildAppRouteGraph(
   appDir: string,
   matcher: ValidFileMatcher,
@@ -1108,6 +1121,24 @@ export async function buildAppRouteGraph(
   // a route at /parallel-routes/demographics.
   const slotSubRoutes = discoverSlotSubRoutes(routes, scanMatcher, ghostParentRoutes);
   routes.push(...slotSubRoutes);
+
+  // Strict route matching (Next.js's default, vercel/next.js#97397) omits a
+  // page matcher that can only render a permanent not-found tree because a
+  // sibling parallel slot has neither a matching page nor a default. Drop the
+  // page routes Next.js prunes so such a URL falls through as it does there.
+  // Layout-only routes and route handlers are not page matchers in Next.js
+  // and are kept.
+  if (strictRouteMatchingEnabled) {
+    const pruned = findPrunedRoutePathnames(appDir, scanMatcher);
+    if (pruned.size > 0) {
+      for (let index = routes.length - 1; index >= 0; index--) {
+        const route = routes[index]!;
+        if (route.pagePath && pruned.has(patternToNextFormat(route.pattern))) {
+          routes.splice(index, 1);
+        }
+      }
+    }
+  }
 
   // Discover sibling-style interception markers (markers not inside an @slot directory).
   discoverSiblingInterceptingRoutes(routes, appDir, scanMatcher);

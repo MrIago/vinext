@@ -1,15 +1,18 @@
 /**
  * App Router prefetch policy resolution, shared by `<Link>` (`link.tsx`) and
- * `router.prefetch()` (`navigation.ts`).
+ * `router.prefetch()` (`app-router-navigation.ts`).
  *
  * Decides, from the client prefetch route manifest
  * (`__VINEXT_LINK_PREFETCH_ROUTES__`), whether a prefetched RSC payload can be
  * cached for navigation reuse or must stay a learning-only / loading-shell
  * prefetch. Lives in `shims/internal/` because `link.tsx` is a `"use client"`
- * React module while `navigation.ts` must stay importable without React —
+ * React module while `app-router-navigation.ts` must stay importable without React —
  * mirrors the layering of `internal/app-route-detection.ts`.
  */
-import type { VinextLinkPrefetchRoute } from "../../client/vinext-next-data.js";
+import type {
+  VinextLinkPrefetchIntercept,
+  VinextLinkPrefetchRoute,
+} from "../../client/vinext-next-data.js";
 import {
   createRouteTrieCache,
   matchRouteWithTrie,
@@ -60,6 +63,18 @@ export type AppRoutePrefetchPolicy = {
   /** Fetch the route tree before the concrete page segment. */
   requiresRouteTreePrefetch?: true;
   shouldPrefetch: boolean;
+  /**
+   * Fetch the Cache Components page's static shell. It's reused by a
+   * navigation only when it holds the whole page; otherwise a navigation
+   * shows it while the page renders.
+   */
+  staticShell?: true;
+  /**
+   * With `staticShell`, how far a Partial Prefetching route's prefetch goes:
+   * its App Shell, or its prefetch rendered for the request up to the
+   * prefetch or navigation stage. Unset for the static shell.
+   */
+  prefetchStage?: "shell" | "prefetch" | "navigation";
 };
 
 function toSameOriginRouteHref(href: string): string | null {
@@ -104,26 +119,34 @@ function resolveRendersDynamically(
   interceptionContext: string | null,
   pathname: string,
 ): boolean {
-  if (interceptionContext !== null && route.intercepts) {
-    // Raw segments, as the server's intercept gate matches the still-encoded
-    // target and source: `/%70hotos/1` isn't `/photos/:id`, and `/%61dmin`
-    // doesn't claim an `/admin` intercept.
-    const pathParts = splitPathSegments(pathname);
-    const contextParts = splitPathSegments(interceptionContext);
-    const matching = route.intercepts.filter(
-      (intercept) =>
-        matchRoutePatternRaw(pathParts, intercept.targetPatternParts) !== null &&
-        matchRoutePatternPrefix(contextParts, intercept.sourcePatternParts),
+  const matching = findActiveIntercepts(route, interceptionContext, pathname);
+  if (interceptionContext !== null && matching.length > 0) {
+    return (
+      matching.some((intercept) => intercept.rendersDynamically === true) ||
+      matchRouteWithTrieRawPathname(interceptionContext, routes, linkPrefetchRouteTrieCache)?.route
+        .rendersDynamically === true
     );
-    if (matching.length > 0) {
-      return (
-        matching.some((intercept) => intercept.rendersDynamically === true) ||
-        matchRouteWithTrieRawPathname(interceptionContext, routes, linkPrefetchRouteTrieCache)
-          ?.route.rendersDynamically === true
-      );
-    }
   }
   return route.rendersDynamically === true;
+}
+
+/** The route's intercepting pages that the interception context renders instead. */
+function findActiveIntercepts(
+  route: VinextLinkPrefetchRoute,
+  interceptionContext: string | null,
+  pathname: string,
+): VinextLinkPrefetchIntercept[] {
+  if (interceptionContext === null || !route.intercepts) return [];
+  // Raw segments, as the server's intercept gate matches the still-encoded
+  // target and source: `/%70hotos/1` isn't `/photos/:id`, and `/%61dmin`
+  // doesn't claim an `/admin` intercept.
+  const pathParts = splitPathSegments(pathname);
+  const contextParts = splitPathSegments(interceptionContext);
+  return route.intercepts.filter(
+    (intercept) =>
+      matchRoutePatternRaw(pathParts, intercept.targetPatternParts) !== null &&
+      matchRoutePatternPrefix(contextParts, intercept.sourcePatternParts),
+  );
 }
 
 /**
@@ -189,13 +212,32 @@ export function resolveAutoAppRoutePrefetch(
     interceptionContext,
     routeUrl.pathname,
   );
-  const cacheForNavigation =
+  const isReusablePage =
     !hasSearchParams &&
     !hasCacheComponentsLearningOnlyDynamicPath &&
     (requiresRouteTreePrefetch ||
       (!route.canPrefetchLoadingShell &&
         route.requiresDynamicNavigationRequest !== true &&
         !rendersDynamically));
+  // Like Next.js, a Cache Components build prefetches a page's static shell,
+  // so the prefetch never renders the page's dynamic holes. An intercepted
+  // page has none: it's never prerendered.
+  //
+  // A route that prefetches at runtime renders the prefetch with the request's
+  // search params and root params, so those hrefs get one too
+  // (`PrefetchHint.HasRuntimePrefetch`). So does a Partial Prefetching route's
+  // App Shell, which keeps the root params concrete and leaves the others to
+  // holes (vercel/next.js@643e34a).
+  const staticShell =
+    (isReusablePage ||
+      (route.instant === "runtime" && !hasCacheComponentsLearningOnlyDynamicPath)) &&
+    (!requiresRouteTreePrefetch ||
+      route.instant === "runtime" ||
+      route.partialPrefetching === true) &&
+    interceptionContext === null &&
+    process.env.NODE_ENV === "production" &&
+    String(process.env.__NEXT_CACHE_COMPONENTS) === "true";
+  const cacheForNavigation = isReusablePage && !staticShell;
   return {
     // Vinext does not yet have Next.js's per-segment runtime-prefetch hints.
     // Routes with loading boundaries prefetch a shell first so navigation can
@@ -218,7 +260,113 @@ export function resolveAutoAppRoutePrefetch(
     ...(rendersDynamically ? { rendersDynamically: true } : {}),
     ...(requiresRouteTreePrefetch ? { requiresRouteTreePrefetch: true } : {}),
     shouldPrefetch: true,
+    ...(staticShell ? { staticShell: true } : {}),
+    // Like Next.js with Partial Prefetching, a link's automatic prefetch gets
+    // only the App Shell (vercel/next.js#94510).
+    ...(staticShell && route.partialPrefetching === true
+      ? { prefetchStage: "shell" as const }
+      : {}),
   };
+}
+
+/**
+ * A prefetch past the shell stage (`<Link prefetch={true}>`,
+ * `prefetch="navigation"`, `router.prefetch(href, { kind: "full" })`) of a
+ * route that opts into Partial Prefetching. Like Next.js's segment cache
+ * scheduler, it's never a legacy full prefetch with the page's dynamic data:
+ * the server renders the page for the request up to `stage`, leaving dynamic
+ * data at its Suspense fallbacks, and a navigation shows it while the rest
+ * renders. Null when the route doesn't opt in, or has no such prefetch here.
+ */
+export function resolvePartialAppRoutePrefetch(
+  href: string,
+  interceptionContext: string | null,
+  stage: "prefetch" | "navigation",
+): AppRoutePrefetchPolicy | null {
+  if (
+    typeof window === "undefined" ||
+    interceptionContext !== null ||
+    process.env.NODE_ENV !== "production" ||
+    String(process.env.__NEXT_CACHE_COMPONENTS) !== "true"
+  ) {
+    return null;
+  }
+  if (readAppRoutePartialPrefetching(href) !== true) return null;
+  return {
+    cacheForNavigation: false,
+    dynamicStaleTime: "ignore",
+    fallbackTtl: "static",
+    prefetchShellFirst: true,
+    shouldPrefetch: true,
+    staticShell: true,
+    prefetchStage: stage,
+  };
+}
+
+/**
+ * Whether the href's App route opts into Partial Prefetching, or null when
+ * the manifest has no route for it.
+ */
+export function readAppRoutePartialPrefetching(href: string): boolean | null {
+  if (typeof window === "undefined") return null;
+  const routes = window.__VINEXT_LINK_PREFETCH_ROUTES__;
+  if (!routes) return null;
+  const routeHref = toSameOriginRouteHref(href);
+  if (routeHref === null) return null;
+  const match = matchRouteWithTrie(routeHref, routes, linkPrefetchRouteTrieCache);
+  if (!match || match.route.documentOnly === true) return null;
+  return match.route.partialPrefetching === true;
+}
+
+/**
+ * The dev error for a navigation from a `<Link>` that asks for more than the
+ * shell to a route without Partial Prefetching, whose prefetch includes the
+ * route's dynamic data.
+ *
+ * Ported from Next.js: packages/next/src/shared/lib/instant-messages.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/instant-messages.ts
+ */
+export function createLinkPrefetchPartialError(pathname: string): Error {
+  return new Error(
+    `Next.js encountered dynamic data during prefetching for "${pathname}".\n\n` +
+      `This will lead to slower, more expensive prefetches.\n\n` +
+      `Ways to fix this:\n` +
+      `  - [upgrade] Opt into Partial Prefetching by exporting \`const prefetch = 'partial'\` from the page or layout, or by setting \`partialPrefetching: true\` in next.config to opt the whole app in\n` +
+      `  - [disable] Remove \`prefetch={true}\` or \`prefetch="navigation"\` from the <Link> to use the default prefetch\n` +
+      `  - [ignore] Set \`export const instant = false\` to opt the route out of instant-navigation validation\n\n` +
+      `Learn more: https://nextjs.org/docs/messages/instant-link-prefetch-partial`,
+  );
+}
+
+/**
+ * Whether the page the href renders sets an `unstable_instant` config. Next.js
+ * ignores a full prefetch of such a page (`SubtreeHasInstant` in the segment
+ * cache's `scheduler.ts`): its instant config decides what's prefetched, so
+ * the prefetch is an automatic one. Under an interception context that one of
+ * the route's intercepting pages matches, that page's tree counts instead,
+ * with the route the context resolves to.
+ */
+export function hasAppRouteInstantConfig(
+  href: string,
+  interceptionContext: string | null = null,
+): boolean {
+  if (typeof window === "undefined") return false;
+  const routes = window.__VINEXT_LINK_PREFETCH_ROUTES__;
+  if (!routes) return false;
+  const routeHref = toSameOriginRouteHref(href);
+  if (routeHref === null) return false;
+  const match = matchRouteWithTrie(routeHref, routes, linkPrefetchRouteTrieCache);
+  if (!match) return false;
+  const pathname = new URL(routeHref, "http://vinext.local").pathname;
+  const matching = findActiveIntercepts(match.route, interceptionContext, pathname);
+  if (interceptionContext !== null && matching.length > 0) {
+    return (
+      matching.some((intercept) => intercept.instant !== undefined) ||
+      matchRouteWithTrieRawPathname(interceptionContext, routes, linkPrefetchRouteTrieCache)?.route
+        .instant !== undefined
+    );
+  }
+  return match.route.instant !== undefined;
 }
 
 export function resolveFullAppRoutePrefetch(): AppRoutePrefetchPolicy {

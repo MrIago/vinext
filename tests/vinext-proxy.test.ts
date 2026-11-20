@@ -202,6 +202,10 @@ export default { plugins: [vinext()] };
     });
     expect(fs.existsSync(path.join(root, "postcss.config.cjs"))).toBe(true);
     expect(fs.existsSync(path.join(root, "postcss.config.js"))).toBe(false);
+    // `vinext check` lists a missing "type": "module" as a step to take, so the
+    // build must say when it edits package.json on the user's behalf.
+    expect(result.stderr).toContain('Added "type": "module" to package.json');
+    expect(result.stderr).toContain("Renamed postcss.config.js → postcss.config.cjs");
   }, 120_000);
 
   it("respects an explicit CommonJS package boundary", () => {

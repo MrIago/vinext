@@ -152,7 +152,7 @@ describe("app page response helpers", () => {
         revalidateSeconds: Infinity,
       }),
     ).toEqual({
-      cacheControl: "s-maxage=31536000, stale-while-revalidate",
+      cacheControl: "no-store",
       cacheState: "STATIC",
     });
   });
@@ -239,7 +239,7 @@ describe("app page response helpers", () => {
         revalidateSeconds: 60,
       }),
     ).toEqual({
-      cacheControl: "s-maxage=60, stale-while-revalidate",
+      cacheControl: "no-store",
       cacheState: undefined,
       shouldWriteToCache: false,
     });
@@ -275,7 +275,7 @@ describe("app page response helpers", () => {
         revalidateSeconds: Infinity,
       }),
     ).toEqual({
-      cacheControl: "s-maxage=31536000, stale-while-revalidate",
+      cacheControl: "no-store",
       cacheState: "STATIC",
       shouldWriteToCache: false,
     });
@@ -333,7 +333,7 @@ describe("app page response helpers", () => {
         revalidateSeconds: null,
       }),
     ).toEqual({
-      cacheControl: "s-maxage=31536000, stale-while-revalidate",
+      cacheControl: "no-store",
       cacheState: "STATIC",
       shouldWriteToCache: false,
     });
@@ -359,7 +359,7 @@ describe("app page response helpers", () => {
     });
   });
 
-  it("keeps dev's no-store header for known-dynamic responses", () => {
+  it("sends dev's bare no-store header for known-dynamic responses", () => {
     const base = {
       isDraftMode: false,
       isDynamicError: false,
@@ -381,7 +381,7 @@ describe("app page response helpers", () => {
           ...base,
           ...overrides,
         }),
-      ).toEqual({ cacheControl: "no-store, must-revalidate" });
+      ).toEqual({ cacheControl: "no-store" });
     }
     expect(
       resolveAppPageHtmlResponsePolicy({
@@ -390,7 +390,7 @@ describe("app page response helpers", () => {
         hasScriptNonce: false,
         isForceDynamic: false,
       }),
-    ).toEqual({ cacheControl: "no-store, must-revalidate", shouldWriteToCache: false });
+    ).toEqual({ cacheControl: "no-store", shouldWriteToCache: false });
   });
 
   it("treats revalidate = 0 as no-store in RSC response policy", () => {

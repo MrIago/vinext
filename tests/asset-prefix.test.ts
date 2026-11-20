@@ -145,6 +145,20 @@ describe("renderVinextBuiltUrl", () => {
     ).toBe("/_next/static/test-image.png?dpl=dpl_123");
   });
 
+  it("keeps font files referenced from CSS query-free", () => {
+    // Fonts are content-hashed and preloaded by their bare URL (see
+    // tests/app-router-font-google-prod.test.ts); a deployment query on the
+    // `@font-face` url() would make the browser download them twice.
+    for (const ext of ["woff2", "woff", "ttf", "otf", "eot"]) {
+      expect(
+        renderVinextBuiltUrl(`_next/static/media/font.abcd1234.${ext}`, "", "dpl_123", "css"),
+      ).toBe(`/_next/static/media/font.abcd1234.${ext}`);
+    }
+    expect(renderVinextBuiltUrl("_next/static/media/bg.abcd1234.png", "", "dpl_123", "css")).toBe(
+      "/_next/static/media/bg.abcd1234.png?dpl=dpl_123",
+    );
+  });
+
   it("combines path asset prefixes and deployment IDs", () => {
     expect(renderVinextBuiltUrl("cdn/_next/static/chunk.js", "/cdn", "dpl_123")).toBe(
       "/cdn/_next/static/chunk.js?dpl=dpl_123",

@@ -1,7 +1,16 @@
 import { createElement, isValidElement, Suspense, type ReactNode } from "react";
 import { isUnknownRecord } from "../utils/record.js";
 import { stripBasePath } from "../utils/base-path.js";
-import { decodeMatchedParams, splitPathnameForRouteMatch } from "../routing/utils.js";
+import {
+  decodeMatchedParams,
+  splitPathnameForRouteMatch,
+  splitPathSegments,
+} from "../routing/utils.js";
+import {
+  buildRouteTrie as buildRequestRouteTrie,
+  trieMatchRaw,
+  type TrieNode as RequestRouteTrieNode,
+} from "../routing/route-trie.js";
 import {
   buildOptimisticRouteTrie,
   matchOptimisticRouteTrie,
@@ -60,6 +69,10 @@ type OptimisticNavigationPayload = {
 };
 
 const routeTrieCache = new WeakMap<BrowserRouteManifest, OptimisticRouteTrieNode>();
+const renderedRouteTrieCache = new WeakMap<
+  BrowserRouteManifest,
+  RequestRouteTrieNode<BrowserRouteManifestRoute>
+>();
 // Shared never-settling thenable used to suspend optimistic page segments until
 // the real RSC payload replaces them.
 const OPTIMISTIC_ROUTE_SEGMENT_SUSPENSE_TRIGGER = new Promise<never>(() => {});
@@ -83,7 +96,7 @@ export function getOptimisticPrefetchSourceKey(options: {
 function buildRouteTrie(routeManifest: BrowserRouteManifest): OptimisticRouteTrieNode {
   return buildOptimisticRouteTrie(
     routeManifest.segmentGraph.routes.values(),
-    import.meta.env.DEV
+    process.env.NODE_ENV !== "production"
       ? (existingParamName, part) =>
           console.warn(
             `[vinext] Optimistic route trie found conflicting dynamic segments at the same level: :${existingParamName} vs ${part}`,
@@ -134,6 +147,25 @@ export function matchOptimisticRouteManifestRoute(options: {
 
   decodeMatchedParams(match.params);
   return match;
+}
+
+/**
+ * The manifest route that rendered a payload, read from its route id, which
+ * holds the pathname the server matched (after rewrites, without basePath),
+ * already decoded once. It is matched like the server matches a request: the
+ * manifest keeps the server's route order, and the server's trie falls back
+ * from a static dead end to a dynamic or catch-all sibling, which the
+ * optimistic trie deliberately doesn't.
+ */
+function matchRenderedRouteId(routeId: string, routeManifest: BrowserRouteManifest): string | null {
+  const parsed = AppElementsWire.parseElementKey(routeId);
+  if (parsed?.kind !== "route") return null;
+  let trie = renderedRouteTrieCache.get(routeManifest);
+  if (trie === undefined) {
+    trie = buildRequestRouteTrie(Array.from(routeManifest.segmentGraph.routes.values()));
+    renderedRouteTrieCache.set(routeManifest, trie);
+  }
+  return trieMatchRaw(trie, splitPathSegments(parsed.path))?.route.id ?? null;
 }
 
 function mergeParams(
@@ -391,6 +423,13 @@ export function createOptimisticRouteTemplate(options: {
 
   const metadata = AppElementsWire.readMetadata(options.elements);
   if (metadata.interception !== null || metadata.interceptionContext !== null) return null;
+  // A payload rendered by another route than the one the URL matches came
+  // through a rewrite (middleware, or a config rewrite), so it says nothing
+  // about the URL's route. Like Next.js's discoverKnownRoutePart, learn
+  // nothing from it.
+  if (matchRenderedRouteId(metadata.routeId, options.routeManifest) !== match.route.id) {
+    return null;
+  }
 
   const routeElement = options.elements[metadata.routeId];
   // Full-prefetch learning is intentionally heuristic: legacy full prefetches
@@ -495,13 +534,50 @@ export function keepOptimisticStreamingMetadata(
   if (id === null || optimisticId === null) return elements;
   const optimisticMetadata = optimisticElements[optimisticId];
   if (optimisticMetadata == null) return elements;
+  // A static shell's metadata may itself still be streaming. It then shows
+  // nothing rather than suspend this fallback and hold the commit after all.
+  const fallback = createElement(Suspense, { fallback: null }, optimisticMetadata as ReactNode);
   return {
     ...elements,
-    [id]: createElement(
-      Suspense,
-      { fallback: optimisticMetadata as ReactNode, key: navigationKey },
-      elements[id] as ReactNode,
-    ),
+    [id]: createElement(Suspense, { fallback, key: navigationKey }, elements[id] as ReactNode),
+  };
+}
+
+/**
+ * Keeps the shell a navigation committed, optimistic or static, so its streamed
+ * metadata stays up while the page's own streams. A static shell decodes on its
+ * own: it's read once the page's payload decodes, and never awaited.
+ */
+export function createShellMetadataKeeper(navigationKey: string): {
+  keep(payload: Promise<AppElements> | AppElements): Promise<AppElements> | AppElements;
+  setShell(elements: AppElements): void;
+  trackShell(payload: Promise<AppElements>): void;
+} {
+  let shellElements: AppElements | null = null;
+  let isShellDecoding = false;
+  const keepShellMetadata = (elements: AppElements): AppElements =>
+    shellElements === null
+      ? elements
+      : keepOptimisticStreamingMetadata(elements, shellElements, navigationKey);
+  return {
+    keep(payload) {
+      if (shellElements === null && !isShellDecoding) return payload;
+      return payload instanceof Promise
+        ? payload.then(keepShellMetadata)
+        : keepShellMetadata(payload);
+    },
+    setShell(elements) {
+      shellElements = elements;
+    },
+    trackShell(payload) {
+      isShellDecoding = true;
+      void payload.then(
+        (elements) => {
+          shellElements = elements;
+        },
+        () => {},
+      );
+    },
   };
 }
 

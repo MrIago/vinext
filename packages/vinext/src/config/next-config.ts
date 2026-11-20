@@ -352,6 +352,10 @@ export type NextConfig = {
   headers?: () => Promise<NextHeader[]> | NextHeader[];
   /** Image optimization config */
   images?: {
+    /** Image loader. Defaults to "default"; only "default" and "custom" can be combined with `loaderFile`. */
+    loader?: "default" | "imgix" | "cloudinary" | "akamai" | "custom";
+    /** Path (relative to the project root) to a module whose default export is the image loader. */
+    loaderFile?: string;
     remotePatterns?: Array<
       | URL
       | {
@@ -390,6 +394,18 @@ export type NextConfig = {
     contentDispositionType?: "inline" | "attachment";
     /** Content-Security-Policy header for image responses. Defaults to "script-src 'none'; frame-src 'none'; sandbox;" */
     contentSecurityPolicy?: string;
+    /**
+     * Formats the optimizer may serve, chosen from the Accept header in this
+     * order. Defaults to `["image/webp"]`, as in Next.js.
+     */
+    formats?: Array<"image/avif" | "image/webp">;
+    /**
+     * Bytes of optimized images the Node.js server keeps in
+     * `<outDir>/cache/images`. `0` disables the cache, as in Next.js.
+     */
+    maximumDiskCacheSize?: number;
+    /** Redirects the Node.js server follows for a remote image source. Defaults to 3. */
+    maximumRedirects?: number;
     /** Least max-age, in seconds, of an image the endpoint serves as-is. Defaults to 14400. */
     minimumCacheTTL?: number;
     /**
@@ -410,6 +426,12 @@ export type NextConfig = {
   reactStrictMode?: boolean | null;
   /** Build output mode: 'export' for full static export, 'standalone' for single server */
   output?: "export" | "standalone";
+  /**
+   * Next.js build directory (default `.next`). vinext builds into `dist/`, so
+   * the option only matters with `output: "export"`, where a custom value names
+   * the export destination, like Next.js.
+   */
+  distDir?: string;
   /** File extensions treated as routable pages/routes (Next.js pageExtensions) */
   pageExtensions?: string[];
   /** Turbopack-compatible module resolution options. */
@@ -444,6 +466,13 @@ export type NextConfig = {
    */
   cacheComponents?: boolean;
   /**
+   * Partial Prefetching (Next.js 16): with Cache Components, a `<Link>`
+   * prefetches only the App Shell of its target, and `<Link prefetch={true}>`
+   * prefetches the page's cached content without its dynamic data. A segment
+   * opts in alone with `export const prefetch = "partial"`.
+   */
+  partialPrefetching?: boolean;
+  /**
    * Enables source maps while generating static pages.
    * Helps with errors during the prerender phase in `vite build`.
    * Defaults to `true`. Set to `false` to disable.
@@ -477,6 +506,14 @@ export type NextConfig = {
      * Mirrors Next.js `compiler.defineServer`.
      */
     defineServer?: Record<string, string | number | boolean>;
+  };
+  /** Temporary opt-outs Next.js keeps for deprecated behavior. */
+  deprecated?: {
+    /**
+     * Restore loose App Router matching instead of requiring every URL to
+     * build a complete parallel route tree. Only `true` is accepted.
+     */
+    looseRouteMatching?: true;
   };
   experimental?: {
     /** Enables hard-navigation recovery when App Router navigation rendering fails. */
@@ -571,6 +608,8 @@ export type ResolvedNextConfig = {
   skipProxyUrlNormalize: boolean;
   typescript: { tsconfigPath?: string };
   output: "" | "export" | "standalone";
+  /** Configured `distDir`, as written by the user (default `.next`). */
+  distDir: string;
   pageExtensions: string[];
   resolveExtensions: string[] | null;
   serverResolveExtensions: string[] | null;
@@ -579,7 +618,31 @@ export type ResolvedNextConfig = {
   instrumentationClientRouteManifest: string | undefined;
   /** Server globals injected into instrumentation.ts by wrapped webpack configs. */
   instrumentationServerValueInjections: Record<string, unknown>;
+  /**
+   * Server instrumentation modules adapters and config wrappers contribute,
+   * run before the project's instrumentation file (vercel/next.js#100658).
+   */
+  instrumentationInject: string[];
   cacheComponents: boolean;
+  /**
+   * Strict App Router route matching (Next.js's default since
+   * vercel/next.js#97397): on unless `deprecated.looseRouteMatching` is set or
+   * `experimental.explicitParallelRouteChildren` is `false`.
+   */
+  strictRouteMatching: boolean;
+  /**
+   * `typedRoutes` (or its moved `experimental.typedRoutes` alias): typegen also
+   * writes typed links (`link.d.ts`).
+   */
+  typedRoutes: boolean;
+  /**
+   * Only include `children` in a parallel route layout when an ordinary
+   * branch declares content for it (`experimental.explicitParallelRouteChildren`,
+   * default `true`).
+   */
+  explicitParallelRouteChildren: boolean;
+  /** `partialPrefetching`, which only takes effect with `cacheComponents`. */
+  partialPrefetching: boolean;
   /**
    * `experimental.cachedNavigations`: lets the client cache the static stage of
    * navigation responses. Requires `cacheComponents`.
@@ -655,6 +718,11 @@ export type ResolvedNextConfig = {
    * requires the segment-cache architecture which is not yet implemented.
    */
   appShells: boolean;
+  /**
+   * `experimental.prepareNavigation`: exposes `router.experimental_prepare()`
+   * (vercel/next.js#101050).
+   */
+  prepareNavigation: boolean;
   /** Resolved build ID (from generateBuildId, or a random UUID if not provided). */
   buildId: string;
   /** Resolved deployment ID from next.config.js or NEXT_DEPLOYMENT_ID. */
@@ -1139,7 +1207,12 @@ function warnDeprecatedConfigOptions(config: NextConfig, root: string): void {
   }
   // Next.js drops nullish nested values before warning about a moved key.
   const experimental = readOptionalRecord(config.experimental);
-  for (const key of ["skipTrailingSlashRedirect", "cacheComponents", "cacheLife"] as const) {
+  for (const key of [
+    "skipTrailingSlashRedirect",
+    "cacheComponents",
+    "cacheLife",
+    "typedRoutes",
+  ] as const) {
     if (experimental?.[key] != null) {
       warnConfigOnce(
         `\`experimental.${key}\` has been moved to \`${key}\`. Please update your ${configFileName} file accordingly.`,
@@ -2001,6 +2074,63 @@ function processedRouteSources(
  * Resolve a NextConfig into a fully-resolved ResolvedNextConfig.
  * Awaits async functions for redirects/rewrites/headers.
  */
+const EXPERIMENTAL_REACT_FLAGS = [
+  "blockingSSR",
+  "taint",
+  "transitionIndicator",
+  "gestureTransition",
+  "hydrationChangeEvent",
+  "externalBrowserRuntime",
+  "useExperimentalReact",
+] as const;
+
+/**
+ * The enabled `experimental` flags that need React's experimental channel.
+ * Ported from Next.js: packages/next/src/lib/needs-experimental-react.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/needs-experimental-react.ts
+ */
+export function getExperimentalReactFlags(
+  experimental: Record<string, unknown> | undefined,
+): string[] {
+  if (!experimental) return [];
+  return EXPERIMENTAL_REACT_FLAGS.filter((flag) => Boolean(experimental[flag]));
+}
+
+function readInstalledReactVersion(root: string): string | null {
+  try {
+    const require = createRequire(path.join(root, "package.json"));
+    const pkg = require("react/package.json") as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Next.js resolves strict route matching from two settings
+ * (server/config.ts): it is on unless `deprecated.looseRouteMatching` is
+ * `true`, and the legacy implicit `children` slot
+ * (`experimental.explicitParallelRouteChildren: false`) turns it off, since
+ * pruning assumes `children` exists only when an ordinary branch backs it.
+ * The config schema accepts only `true` for `looseRouteMatching`.
+ */
+export function resolveStrictRouteMatching(
+  config: Pick<NextConfig, "deprecated">,
+  experimental: Record<string, unknown> | undefined,
+): { strictRouteMatching: boolean; explicitParallelRouteChildren: boolean } {
+  const looseRouteMatching = config.deprecated?.looseRouteMatching;
+  if (looseRouteMatching !== undefined && looseRouteMatching !== true) {
+    throw new Error(
+      `Invalid next.config option "deprecated.looseRouteMatching": expected \`true\`, received ${JSON.stringify(looseRouteMatching)}. Remove it to keep strict route matching.`,
+    );
+  }
+  const explicitParallelRouteChildren = experimental?.explicitParallelRouteChildren !== false;
+  return {
+    explicitParallelRouteChildren,
+    strictRouteMatching: looseRouteMatching !== true && explicitParallelRouteChildren,
+  };
+}
+
 export async function resolveNextConfig(
   config: NextConfig | null,
   root: string = toSlash(process.cwd()),
@@ -2019,10 +2149,15 @@ export async function resolveNextConfig(
       skipProxyUrlNormalize: false,
       typescript: {},
       output: "",
+      distDir: ".next",
       pageExtensions: normalizePageExtensions(),
       resolveExtensions: null,
       serverResolveExtensions: null,
       cacheComponents: false,
+      strictRouteMatching: true,
+      explicitParallelRouteChildren: true,
+      typedRoutes: false,
+      partialPrefetching: false,
       cachedNavigations: false,
       appNavFailHandling: false,
       gestureTransition: false,
@@ -2053,6 +2188,7 @@ export async function resolveNextConfig(
       cacheMaxMemorySize: undefined,
       enablePrerenderSourceMaps: true,
       appShells: false,
+      prepareNavigation: false,
       hashSalt: process.env.NEXT_HASH_SALT ?? "",
       buildId,
       deploymentId,
@@ -2067,6 +2203,7 @@ export async function resolveNextConfig(
       instrumentationClientInject: [],
       instrumentationClientRouteManifest: undefined,
       instrumentationServerValueInjections: {},
+      instrumentationInject: [],
       clientTraceMetadata: undefined,
       staleTimes: { ...DEFAULT_STALE_TIMES },
       cacheLife: resolveCacheLifeProfiles(
@@ -2319,6 +2456,22 @@ export async function resolveNextConfig(
     );
   }
 
+  // Next.js switches its bundled React to the experimental channel for these
+  // flags (lib/needs-experimental-react.ts). vinext renders with the app's own
+  // React, so it can only check that the installed copy is experimental and say
+  // how to get it (#2109, #4390). `useExperimentalReact` is the legacy switch.
+  const experimentalReactFlags = getExperimentalReactFlags(experimental);
+  if (experimentalReactFlags.length > 0) {
+    const reactVersion = readInstalledReactVersion(root);
+    if (reactVersion !== null && !/-(?:experimental|canary)-/.test(reactVersion)) {
+      console.warn(
+        `[vinext] next.config ${experimentalReactFlags.map((flag) => `"experimental.${flag}"`).join(", ")} ` +
+          `needs React's experimental channel, but react@${reactVersion} is installed. ` +
+          "Install react@experimental and react-dom@experimental to use it.",
+      );
+    }
+  }
+
   // `next/root-params` is now stable — no longer requires an experimental flag.
   if (experimental?.rootParams !== undefined) {
     console.warn(
@@ -2457,6 +2610,7 @@ export async function resolveNextConfig(
         ? { tsconfigPath: config.typescript.tsconfigPath }
         : {},
     output: output === "export" || output === "standalone" ? output : "",
+    distDir: typeof config.distDir === "string" && config.distDir.trim() ? config.distDir : ".next",
     pageExtensions,
     resolveExtensions: resolveExtensions ?? webpackProbe.resolveExtensions,
     serverResolveExtensions: resolveExtensions ?? webpackProbe.serverResolveExtensions,
@@ -2467,7 +2621,14 @@ export async function resolveNextConfig(
       : [],
     instrumentationClientRouteManifest: webpackProbe.instrumentationClientRouteManifest,
     instrumentationServerValueInjections: webpackProbe.instrumentationServerValueInjections,
+    instrumentationInject: readStringArray(config.instrumentationInject),
     cacheComponents,
+    ...resolveStrictRouteMatching(config, experimental),
+    // Next.js copies a moved `experimental.typedRoutes` over the top-level key
+    // (warnOptionHasBeenMovedOutOfExperimental).
+    typedRoutes:
+      (experimental?.typedRoutes ?? (config as { typedRoutes?: unknown }).typedRoutes) === true,
+    partialPrefetching: cacheComponents && config.partialPrefetching === true,
     cachedNavigations: cacheComponents && experimental?.cachedNavigations === true,
     appNavFailHandling: experimental?.appNavFailHandling === true,
     gestureTransition: experimental?.gestureTransition === true,
@@ -2506,6 +2667,7 @@ export async function resolveNextConfig(
     cacheMaxMemorySize,
     enablePrerenderSourceMaps: config.enablePrerenderSourceMaps ?? true,
     appShells,
+    prepareNavigation: experimental?.prepareNavigation === true,
     hashSalt,
     buildId,
     deploymentId,

@@ -1,5 +1,6 @@
 import {
   buildRevalidateCacheControl,
+  DEV_DOCUMENT_CACHE_CONTROL,
   NEVER_CACHE_CONTROL,
   NO_STORE_CACHE_CONTROL,
   STATIC_CACHE_CONTROL,
@@ -54,6 +55,11 @@ type ResolveAppPageResponsePolicyBaseOptions = {
   isDynamicError: boolean;
   isForceDynamic: boolean;
   isForceStatic: boolean;
+  /**
+   * A build-time prerender renders with `isProduction: false` but produces
+   * the production response, so it keeps the route's caching policy.
+   */
+  isPrerender?: boolean;
   isProduction: boolean;
   /**
    * `false` for routes Next.js classifies as dynamic (ƒ). Their responses are
@@ -168,7 +174,31 @@ export function resolveUncacheableCacheControl(isProduction: boolean): string {
   return isProduction ? NEVER_CACHE_CONTROL : NO_STORE_CACHE_CONTROL;
 }
 
+/**
+ * Next.js answers every App page document and RSC payload with
+ * `Cache-Control: no-store` in development, whatever the route's caching
+ * config. Browsers reuse a stored response for a history navigation without
+ * revalidating it, so anything storable would let a back navigation restore
+ * output from before the latest edit. The cache state is kept so dev still
+ * reports `x-vinext-cache: STATIC` for static routes.
+ *
+ * Mirrors app-page-runtime.ts from vercel/next.js#97505.
+ */
+function applyDevNoStore<T extends AppPageResponsePolicy>(
+  options: { isPrerender?: boolean; isProduction: boolean },
+  policy: T,
+): T {
+  if (options.isProduction || options.isPrerender === true) return policy;
+  return { ...policy, cacheControl: DEV_DOCUMENT_CACHE_CONTROL };
+}
+
 export function resolveAppPageRscResponsePolicy(
+  options: ResolveAppPageRscResponsePolicyOptions,
+): AppPageResponsePolicy {
+  return applyDevNoStore(options, resolveAppPageRscCachePolicy(options));
+}
+
+function resolveAppPageRscCachePolicy(
   options: ResolveAppPageRscResponsePolicyOptions,
 ): AppPageResponsePolicy {
   if (options.isDraftMode) {
@@ -227,6 +257,12 @@ export function resolveAppPageRscResponsePolicy(
 }
 
 export function resolveAppPageHtmlResponsePolicy(
+  options: ResolveAppPageHtmlResponsePolicyOptions,
+): AppPageHtmlResponsePolicy {
+  return applyDevNoStore(options, resolveAppPageHtmlCachePolicy(options));
+}
+
+function resolveAppPageHtmlCachePolicy(
   options: ResolveAppPageHtmlResponsePolicyOptions,
 ): AppPageHtmlResponsePolicy {
   if (options.isDraftMode) {

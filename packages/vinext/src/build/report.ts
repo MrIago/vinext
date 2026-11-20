@@ -241,6 +241,34 @@ function findExportedConstInitializerInProgram(program: Program, name: string): 
 }
 
 /**
+ * Reads a segment's `export const unstable_instant` config: "runtime" when it
+ * sets `prefetch: "runtime"`, "static" for any other object, and null when the
+ * segment sets none.
+ */
+export function extractInstantPrefetchConfig(code: string): "runtime" | "static" | null {
+  const initializer = findExportedConstInitializer(code, "unstable_instant");
+  if (initializer === null) return null;
+  const config = unwrapStaticExpression(initializer);
+  if (config.type !== "ObjectExpression") return null;
+  const prefetch = objectPropertyValue(config, "prefetch");
+  return prefetch !== null && extractStringFromConstInitializer(prefetch) === "runtime"
+    ? "runtime"
+    : "static";
+}
+
+/**
+ * Whether a segment opts into Partial Prefetching with
+ * `export const prefetch = "partial"`, or Next.js's earlier
+ * `export const unstable_prefetch = "partial"`.
+ */
+export function hasPartialPrefetchingConfig(code: string): boolean {
+  return (
+    extractExportConstString(code, "prefetch") === "partial" ||
+    extractExportConstString(code, "unstable_prefetch") === "partial"
+  );
+}
+
+/**
  * Extracts the string value of `export const <name> = "value"`.
  * Handles TypeScript annotations/assertions and no-substitution template literals.
  * Returns null if the export is absent or not a string literal.

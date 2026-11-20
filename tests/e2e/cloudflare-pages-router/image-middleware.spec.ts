@@ -2,8 +2,9 @@ import { expect, test } from "@playwright/test";
 
 const imagePath = (source: string) => `/_next/image?url=${encodeURIComponent(source)}&w=64&q=75`;
 
-// Next.js answers a local source that yields no image with this 400.
-const INVALID_IMAGE = "The requested resource isn't a valid image.";
+// Next.js keeps the status the application answered a source with, 500 in
+// place of a redirect (fetchInternalImage, https://github.com/vercel/next.js/pull/97957).
+const INVALID_INTERNAL = '"url" parameter is valid but internal response is invalid';
 
 // Next.js' image optimizer fetches a local source through the router as a GET
 // without the caller's headers (fetchInternalImage in
@@ -19,8 +20,8 @@ test.describe("image optimization source behind middleware", () => {
         imagePath("/vinext-image.png?members-only"),
         cookie ? { headers: { cookie } } : undefined,
       );
-      expect(image.status(), cookie).toBe(400);
-      expect(await image.text(), cookie).toBe(INVALID_IMAGE);
+      expect(image.status(), cookie).toBe(403);
+      expect(await image.text(), cookie).toBe(INVALID_INTERNAL);
       expect(image.headers()["content-type"] ?? "", cookie).not.toContain("image/");
     }
   });
@@ -31,15 +32,15 @@ test.describe("image optimization source behind middleware", () => {
     const image = await request.get(
       imagePath("/_next/static/%252E%252E/%252E%252E/vinext-image.png?members-only"),
     );
-    expect(image.status()).toBe(400);
-    expect(await image.text()).toBe(INVALID_IMAGE);
+    expect(image.status()).toBe(404);
+    expect(await image.text()).toBe(INVALID_INTERNAL);
     expect(image.headers()["content-type"] ?? "").not.toContain("image/");
   });
 
   test("does not follow a redirect middleware answers the source with", async ({ request }) => {
     const image = await request.get(imagePath("/vinext-image.png?redirect"));
-    expect(image.status()).toBe(400);
-    expect(await image.text()).toBe(INVALID_IMAGE);
+    expect(image.status()).toBe(500);
+    expect(await image.text()).toBe(INVALID_INTERNAL);
     expect(image.headers()["content-type"] ?? "").not.toContain("image/");
   });
 

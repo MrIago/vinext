@@ -23,11 +23,18 @@ import {
   isDraftModeEnabled,
   markDynamicUsage as _markDynamic,
 } from "./headers.js";
+import { getCacheScopeKind } from "./internal/headers-state.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
 import { sha256Hex } from "../utils/hash.js";
 import { isInsideUnifiedScope, getRequestContext } from "./unified-request-context.js";
 import { workUnitAsyncStorage } from "./internal/work-unit-async-storage.js";
 import { makeHangingPromise } from "./internal/make-hanging-promise.js";
+import {
+  createPprFallbackShellSuspensePromise,
+  createPprFallbackShellSuspensePromiseForState,
+  getPprFallbackShellState,
+  reachesPprFallbackShellPrefetchStage,
+} from "./ppr-fallback-shell.js";
 import { isInsideWorkStoreScope } from "./internal/work-store-scope.js";
 import { encodeCacheTag, encodeCacheTags } from "../utils/encode-cache-tag.js";
 import {
@@ -36,6 +43,10 @@ import {
   type CacheHandlerValue,
 } from "./cache-handler.js";
 import { getRequestExecutionContext } from "./request-context.js";
+import {
+  collectFetchResumeDataCacheEntry,
+  readFetchResumeDataCacheEntry,
+} from "./resume-data-cache.js";
 import { isStagedCacheabilityProbeActive } from "./cacheability-classification.js";
 import { isPathKnownNotEdgeCached } from "./cdn-purge-routes.js";
 import {
@@ -57,7 +68,7 @@ import {
   getRegisteredCacheContext,
   markActionRevalidation,
   runWithDetachedCacheObservations,
-  shouldServeStaleUnstableCacheEntry,
+  shouldRevalidateStaleCacheEntryInForeground,
   type CacheLifeConfig,
 } from "./cache-request-state.js";
 
@@ -94,6 +105,19 @@ function scheduleRevalidation(promise: Promise<void>): undefined {
 // Public API — what app code imports from 'next/cache'
 // ---------------------------------------------------------------------------
 
+// Next.js rejects revalidation inside `generateStaticParams`, also from a
+// cached function the generator calls.
+function throwIfGeneratingStaticParams(expression: string): void {
+  if (!isInsideUnifiedScope()) return;
+  const route = getRequestContext().headersContext?.staticParamsRoute;
+  if (route === undefined) return;
+  throw new Error(
+    `Route ${route} used "${expression}" inside \`generateStaticParams\` which is unsupported. ` +
+      "To ensure revalidation is performed consistently it must always happen outside of renders and cached functions. " +
+      "See more info here: https://nextjs.org/docs/app/building-your-application/rendering/static-and-dynamic#dynamic-rendering",
+  );
+}
+
 /**
  * Revalidate cached data associated with a specific cache tag.
  *
@@ -108,6 +132,7 @@ function scheduleRevalidation(promise: Promise<void>): undefined {
  * @param profile - cacheLife profile name (e.g. 'max', 'hours') or inline { expire: number }
  */
 export function revalidateTag(tag: string, profile?: string | { expire?: number }): undefined {
+  throwIfGeneratingStaticParams(`revalidateTag ${tag}`);
   if (isStagedCacheabilityProbeActive()) {
     _markDynamic();
     return undefined;
@@ -178,6 +203,7 @@ async function invalidateDataCacheTag(
  * layout/page hierarchy tags, so only no-type invalidation applies there.
  */
 export function revalidatePath(path: string, type?: "page" | "layout"): undefined {
+  throwIfGeneratingStaticParams(`revalidatePath ${path}`);
   if (isStagedCacheabilityProbeActive()) {
     _markDynamic();
     return undefined;
@@ -299,17 +325,23 @@ export function io(): Promise<void> {
   if (workUnitStore) {
     switch (workUnitStore.type) {
       case "request":
-        return _resolvedIOPromise;
+        // Like Next.js's prerender, a shell render leaves what follows
+        // `io()` to its Suspense fallback, as it does for `connection()`.
+        return createPprFallbackShellSuspensePromise<void>("`io()`") ?? _resolvedIOPromise;
       case "prerender":
       case "prerender-client":
       case "prerender-runtime":
         // Prevent execution past the IO boundary during prerendering.
         // The hanging promise suspends React's render indefinitely until
-        // the prerender is aborted or completed.
-        return makeHangingPromise(
-          workUnitStore.renderSignal,
-          /* route */ workUnitStore.route ?? "unknown",
-          "`io()`",
+        // the prerender is aborted or completed. A shell render's lets the
+        // shell settle and abort around it.
+        return (
+          createPprFallbackShellSuspensePromise<void>("`io()`") ??
+          makeHangingPromise(
+            workUnitStore.renderSignal,
+            /* route */ workUnitStore.route ?? "unknown",
+            "`io()`",
+          )
         );
       case "cache":
       case "private-cache":
@@ -341,6 +373,86 @@ export function unstable_io(): Promise<void> {
 }
 
 let _unstableIoWarned = false;
+
+// ---------------------------------------------------------------------------
+// prefetch / navigation — Cache Components render stage boundaries
+// ---------------------------------------------------------------------------
+
+/**
+ * What follows `await prefetch()` or `await navigation()` renders only in a
+ * render that reaches that stage, as Next.js's `cache-stages.ts` decides:
+ *
+ * - a request, and a static shell (the whole static prerender, which a static
+ *   prefetch and the document's prelude share), render both: static output is
+ *   shared across clients, so there's no per-request cost to save;
+ * - an App Shell renders neither;
+ * - a runtime prefetch renders what follows `prefetch()`, and what follows
+ *   `navigation()` only when it was asked for the navigation stage.
+ *
+ * A boundary left unrendered is a hole in the shell, with its Suspense
+ * fallback, but unlike `connection()` it doesn't make the route dynamic:
+ * what follows stays cacheable.
+ *
+ * Ported from Next.js: packages/next/src/server/request/cache-stages.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/cache-stages.ts
+ */
+function cacheStageBoundary(api: "prefetch" | "navigation"): Promise<void> {
+  if (typeof window !== "undefined") {
+    throw new Error(`\`${api}\` is only available in a Server Component.`);
+  }
+  const state = getPprFallbackShellState();
+  const route = state?.routePattern;
+  const usedBy = route === undefined ? "A route" : `Route ${route}`;
+  if (String(process.env.__NEXT_CACHE_COMPONENTS) !== "true") {
+    throw new Error(
+      `${usedBy} used \`${api}()\`, which requires Cache Components to be enabled. Learn more: https://nextjs.org/docs/app/api-reference/config/next-config-js/cacheComponents`,
+    );
+  }
+  const purpose =
+    api === "prefetch"
+      ? "must not run in the app shell"
+      : "must only run during an actual navigation";
+  const scope = getCacheScopeKind();
+  if (scope === "use cache" || scope === "use cache: private") {
+    throw new Error(
+      `${usedBy} used \`${api}()\` inside "${scope}". This is not currently supported. Instead, move the "use cache" directive to a function that's called below \`await ${api}()\`, so that the cached content is deferred to the ${api} without caching the stage boundary itself. See more info here: https://nextjs.org/docs/messages/next-request-in-use-cache`,
+    );
+  }
+  if (scope === "unstable_cache") {
+    throw new Error(
+      `${usedBy} used \`${api}()\` inside a function cached with \`unstable_cache()\`. The \`${api}()\` function is used to indicate the subsequent code ${purpose}, but \`unstable_cache()\` caches must be able to be produced before a ${api}, so this function is not allowed in this scope. See more info here: https://nextjs.org/docs/app/api-reference/functions/unstable_cache`,
+    );
+  }
+  if (workUnitAsyncStorage.getStore()?.type === "generate-static-params") {
+    throw new Error(
+      `${usedBy} used \`${api}()\` inside \`generateStaticParams\`. This is not supported because \`generateStaticParams\` runs at build time without a ${api}. Read more: https://nextjs.org/docs/messages/next-dynamic-api-wrong-context`,
+    );
+  }
+  if (state === null || reachesPprFallbackShellPrefetchStage(state.prefetchStage, api)) {
+    return _resolvedIOPromise;
+  }
+  return createPprFallbackShellSuspensePromiseForState<void>(state, `\`${api}()\``);
+}
+
+/**
+ * Leaves what follows out of an App Shell: it renders in a static prefetch, a
+ * prefetch (`<Link prefetch={true}>`) and a navigation. Unlike `navigation()`,
+ * request data read after it still makes the route request-dependent.
+ * Requires Cache Components.
+ */
+export function prefetch(): Promise<void> {
+  return cacheStageBoundary("prefetch");
+}
+
+/**
+ * Defers what follows to an actual navigation: it's left out of App Shells
+ * and runtime prefetches, which are rendered per user and per link, but it
+ * renders in the static prerender, which is shared. Requires Cache
+ * Components.
+ */
+export function navigation(): Promise<void> {
+  return cacheStageBoundary("navigation");
+}
 
 // ---------------------------------------------------------------------------
 // cacheLife / cacheTag — Next.js 15+ "use cache" APIs
@@ -649,7 +761,11 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
   tags: string[],
   revalidateSeconds: number | false | undefined,
   staleEntry: CacheHandlerValue | undefined,
+  cacheRead: object,
   deferWrite: boolean,
+  // A background revalidation writes only to the cache handler: the render's
+  // resume data cache keeps the stale value it served.
+  collectsResumeData = true,
 ): Promise<Result> {
   // As in Next.js, the callback gets the caller's arguments, which are keyed
   // when the cached function is called but read only after the cache is.
@@ -673,6 +789,7 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
     // Next.js behavior for unstable_cache without explicit revalidate.
     revalidate: typeof revalidateSeconds === "number" ? revalidateSeconds : false,
   };
+  if (collectsResumeData) collectFetchResumeDataCacheEntry(cacheKey, cacheValue.data);
 
   // A failed write skips caching but must not replace a successful result with
   // an error, matching fetch() caching here and Next.js's IncrementalCache.set.
@@ -684,7 +801,9 @@ async function refreshUnstableCacheResult<Args extends unknown[], Result>(
         fetchCache: true,
         tags,
         revalidate: revalidateSeconds,
-        // The stale entry this write refreshes, so a handler can tell a refresh from a write.
+        // The token its read was passed, and the stale entry it found, so a handler can
+        // tell a fill of what that read missed, or a refresh, from a write.
+        cacheRead,
         ...(staleEntry ? { staleEntry } : {}),
       }),
     );
@@ -752,6 +871,25 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
 
     const isDraftMode = isDraftModeEnabled();
     let staleEntry: CacheHandlerValue | undefined;
+    // Like Next.js's IncrementalCache.get, a render with a resume data cache
+    // reads its entry first, so a resumed shell or a prerender's final pass
+    // reuses what the shell or the warmup pass computed. An on-demand
+    // revalidation reads it too, before it bypasses the stored entry. Only a
+    // tag this request revalidated bypasses it.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/incremental-cache/index.ts
+    if (
+      !isDraftMode &&
+      !isNestedUnstableCacheCall() &&
+      !_hasPendingRevalidatedTag([...tags, ...getCurrentFetchSoftTags()])
+    ) {
+      const resumeEntry = readFetchResumeDataCacheEntry(cacheKey);
+      const resumed = resumeEntry && tryDeserializeUnstableCacheResult(resumeEntry.body);
+      if (resumeEntry && resumed?.ok) {
+        collectFetchResumeDataCacheEntry(cacheKey, resumeEntry);
+        return resumed.value;
+      }
+    }
+    const cacheRead = {};
     // Like Next.js, an unstable_cache nested in another's callback skips the
     // read and reruns, so regenerating the outer entry also refreshes what it
     // calls, and so does an on-demand revalidation (`res.revalidate()`). The
@@ -767,13 +905,15 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
             kind: "FETCH",
             tags,
             softTags,
+            cacheRead,
           });
       if (existing?.value && existing.value.kind === "FETCH") {
         const cached = tryDeserializeUnstableCacheResult(existing.value.data.body);
         if (existing.cacheState === "stale") staleEntry = existing;
         if (cached.ok) {
           if (existing.cacheState === "stale") {
-            if (shouldServeStaleUnstableCacheEntry()) {
+            if (!shouldRevalidateStaleCacheEntryInForeground()) {
+              collectFetchResumeDataCacheEntry(cacheKey, existing.value.data);
               scheduleUnstableCacheBackgroundRevalidation(cacheKey, () =>
                 refreshUnstableCacheResult(
                   fn,
@@ -783,12 +923,15 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
                   tags,
                   revalidateSeconds,
                   staleEntry,
+                  cacheRead,
+                  false,
                   false,
                 ),
               );
               return cached.value;
             }
           } else {
+            collectFetchResumeDataCacheEntry(cacheKey, existing.value.data);
             return cached.value;
           }
         }
@@ -814,6 +957,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
       tags,
       revalidateSeconds,
       staleEntry,
+      cacheRead,
       !staleEntry && isInsideWorkStoreScope(),
     );
   };

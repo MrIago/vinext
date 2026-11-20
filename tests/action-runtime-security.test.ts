@@ -383,7 +383,7 @@ export default function Page() {
 
   it("fails closed for unknown action ids", async () => {
     const response = await handler(actionRequest("/", "000000000000#missing", []));
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(409);
   });
 
   it("forwards dynamic-route owners through middleware using a concrete pathname", async () => {

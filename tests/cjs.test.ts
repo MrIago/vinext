@@ -196,6 +196,51 @@ describe("CJS interop (Pages Router)", () => {
   });
 });
 
+describe("CJS interop (Pages Router node_modules)", () => {
+  let root: string;
+  let server: ViteDevServer;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    root = await mkdtemp(path.join(import.meta.dirname, ".pages-cjs-node-modules-"));
+    await Promise.all([
+      writeFixtureFile(root, "package.json", JSON.stringify({ private: true, type: "module" })),
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-node-package/package.json",
+        JSON.stringify({ name: "cjs-node-package", version: "1.0.0", main: "index.js" }),
+      ),
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-node-package/index.js",
+        `const core = require("./core.js");\nmodule.exports = { value: core.value };`,
+      ),
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-node-package/core.js",
+        `module.exports = { value: "from-cjs-package" };`,
+      ),
+      writeFixtureFile(
+        root,
+        "pages/index.tsx",
+        `import dep from "cjs-node-package";\nexport default function Page() { return <div data-testid="cjs-node-modules">{dep.value}</div>; }`,
+      ),
+    ]);
+    ({ server, baseUrl } = await startFixtureServer(root));
+  }, 60000);
+
+  afterAll(async () => {
+    await server?.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("renders a page that imports a CommonJS package from node_modules", async () => {
+    const { res, html } = await fetchHtml(baseUrl, "/");
+    expect(res.status).toBe(200);
+    expect(visibleTextByTestId(html, "cjs-node-modules")).toBe("from-cjs-package");
+  });
+});
+
 // Ported from Next.js: test/e2e/app-dir/client-module-with-package-type/index.test.ts
 // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/client-module-with-package-type/index.test.ts
 const CONDITIONAL_EXPORT_CASES = [
@@ -325,4 +370,100 @@ describe("conditional package exports", () => {
       await expectConditionalExport(prodBaseUrl, route, label, expected);
     },
   );
+});
+
+// Regression for #237. TypeScript compiles `import Script from "next/script"`
+// in a CommonJS package (next-runtime-env, for one) to
+// `__importDefault(require("next/script"))`, which only unwraps `.default`
+// when the required module says `__esModule`. Next.js's client module proxy
+// answers `__esModule: true`, and so does Rolldown's ESM-to-CJS interop in
+// our production build, so dev must hand the same shape to the require().
+describe("CJS __importDefault(require()) of an ESM module", () => {
+  let root: string;
+  let server: ViteDevServer;
+  let devBaseUrl: string;
+  let prodServer: Server;
+  let prodBaseUrl: string;
+  let buildOutDir: string;
+
+  beforeAll(async () => {
+    root = await mkdtemp(path.join(import.meta.dirname, ".cjs-import-default-"));
+    await Promise.all([
+      writeFixtureFile(root, "package.json", JSON.stringify({ private: true, type: "module" })),
+      writeFixtureFile(
+        root,
+        "app/layout.tsx",
+        `import { InlineScript } from "cjs-next-script-lib";
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return <html><head><InlineScript value="ok" /></head><body>{children}</body></html>;
+}`,
+      ),
+      writeFixtureFile(
+        root,
+        "app/page.tsx",
+        `export default function Page() { return <p data-testid="cjs-import-default">page</p>; }`,
+      ),
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-next-script-lib/package.json",
+        JSON.stringify({ name: "cjs-next-script-lib", main: "index.js" }),
+      ),
+      // Same shape as next-runtime-env@3.3.0 build/script/env-script.js.
+      writeFixtureFile(
+        root,
+        "node_modules/cjs-next-script-lib/index.js",
+        `"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+  return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.InlineScript = void 0;
+const jsx_runtime_1 = require("react/jsx-runtime");
+const script_1 = __importDefault(require("next/script"));
+const InlineScript = ({ value }) => (0, jsx_runtime_1.jsx)(script_1.default, {
+  id: "cjs-next-script",
+  strategy: "beforeInteractive",
+  dangerouslySetInnerHTML: { __html: "window.__CJS_NEXT_SCRIPT = " + JSON.stringify(value) },
+});
+exports.InlineScript = InlineScript;
+`,
+      ),
+    ]);
+    ({ server, baseUrl: devBaseUrl } = await startFixtureServer(root));
+
+    const rscBundlePath = await buildAppFixture(root);
+    buildOutDir = path.dirname(path.dirname(rscBundlePath));
+    const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+    ({ server: prodServer } = await startProdServer({
+      port: 0,
+      outDir: buildOutDir,
+      noCompression: true,
+      silent: true,
+    }));
+    const address = prodServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Production server did not bind");
+    }
+    prodBaseUrl = `http://localhost:${address.port}`;
+  }, 120000);
+
+  afterAll(async () => {
+    await server?.close();
+    await new Promise<void>((resolve, reject) => {
+      if (!prodServer) return resolve();
+      prodServer.close((error) => (error ? reject(error) : resolve()));
+    });
+    await rm(buildOutDir, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["dev", () => devBaseUrl],
+    ["production", () => prodBaseUrl],
+  ])("renders next/script as the default export in %s", async (_mode, baseUrl) => {
+    const { res, html } = await fetchHtml(baseUrl(), "/");
+    expect(res.status).toBe(200);
+    expect(visibleTextByTestId(html, "cjs-import-default")).toBe("page");
+    expect(html).toContain('window.__CJS_NEXT_SCRIPT = "ok"');
+  });
 });

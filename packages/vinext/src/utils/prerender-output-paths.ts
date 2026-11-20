@@ -1,13 +1,35 @@
+import path from "pathslash";
+
+/**
+ * A prerendered URL with a `.` or `..` segment, which `posix.normalize` would
+ * resolve to another path; a `..` segment can climb out of the output
+ * directory. Next.js's `normalizePagePath` throws the same message, which
+ * fails `next build` in every output mode.
+ */
+export class PagePathMismatchError extends Error {}
+
 /**
  * Map a prerendered URL to the file path its artifacts are written under, as
  * Next.js's `normalizePagePath` does. `/index` becomes `/index/index` (and
  * `/index/foo` becomes `/index/index/foo`) so it never shares `/`'s files.
  * Unlike Next.js, dynamic fallback-shell paths such as `/index/[slug]` are
  * also prefixed; build and seed both use this mapping, so they stay in step.
+ * Throws a {@link PagePathMismatchError} for a path with a dot segment.
  * Source: https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/page-path/normalize-page-path.ts
  */
 function toOutputUrlPath(urlPath: string): string {
-  return /^\/index(?:\/|$)/.test(urlPath) ? `/index${urlPath}` : urlPath;
+  const outputUrlPath = /^\/index(?:\/|$)/.test(urlPath) ? `/index${urlPath}` : urlPath;
+  if (outputUrlPath.split("/").some((segment) => segment === "." || segment === "..")) {
+    throw new PagePathMismatchError(
+      `Requested and resolved page mismatch: ${outputUrlPath} ${path.posix.normalize(outputUrlPath)}`,
+    );
+  }
+  return outputUrlPath;
+}
+
+/** Throw a {@link PagePathMismatchError} when `urlPath` has a dot segment. */
+export function assertNormalizedPagePath(urlPath: string): void {
+  toOutputUrlPath(urlPath);
 }
 
 /**
@@ -49,6 +71,15 @@ export function getRscOutputPath(
 
   if (urlPath === "/") return "index.rsc";
   return toOutputUrlPath(urlPath).replace(/^\//, "") + ".rsc";
+}
+
+/**
+ * Determine the private resume data cache path for a prerendered fallback
+ * shell, which the shell entry's `postponed` value is seeded from.
+ */
+export function getPostponedOutputPath(urlPath: string): string {
+  if (urlPath === "/") return "index.postponed";
+  return toOutputUrlPath(urlPath).replace(/^\//, "") + ".postponed";
 }
 
 /** Determine the binary artifact path for a prerendered App Route response. */

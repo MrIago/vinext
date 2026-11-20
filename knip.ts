@@ -85,6 +85,7 @@ export default {
         "src/server/app-page-head.ts",
         "src/server/app-page-ppr-runtime.ts",
         "src/server/app-prerender-static-params.ts",
+        "src/server/app-route-handler-dispatch.ts",
         "src/server/app-route-module-loader.ts",
         "src/server/nitro-public-files.ts",
         "src/server/nitro-public-files-plugin.ts",
@@ -108,6 +109,7 @@ export default {
         // so knip cannot trace the import statically.
         "src/server/prerender-work-unit-setup.ts",
         "src/server/app-page-element-builder.ts",
+        "src/server/app-page-request.ts",
         "src/server/app-hook-warning-suppression.ts",
         "src/server/app-post-middleware-context.ts",
         "src/server/app-route-handler-middleware-context.ts",

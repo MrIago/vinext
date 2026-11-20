@@ -21,8 +21,13 @@
  */
 
 import { isAnimatedImage } from "./image-animation.js";
-import { ImageSourceReader, ImageSourceTooLargeError } from "./image-source-reader.js";
+import {
+  HELD_SOURCE_LIMIT,
+  ImageSourceReader,
+  ImageSourceTooLargeError,
+} from "./image-source-reader.js";
 import { hasLocalMatch, type LocalPattern } from "./image-local-patterns.js";
+import { hasRemoteMatch, type RemotePattern } from "vinext/shims/image-config";
 import { setCacheStateHeaders } from "./cache-headers.js";
 import { badRequestResponse } from "./http-error-responses.js";
 
@@ -98,6 +103,25 @@ export type ImageConfig = {
   contentDispositionType?: "inline" | "attachment";
   /** Content-Security-Policy header value. Default: "script-src 'none'; frame-src 'none'; sandbox;" */
   contentSecurityPolicy?: string;
+  /**
+   * Output formats the optimizer may choose from the Accept header, in
+   * preference order. Default: ["image/webp"], as in Next.js.
+   */
+  formats?: string[];
+  /**
+   * Remote sources the Node.js server may fetch and optimize, as in Next.js.
+   * Workers serve local sources only.
+   */
+  remotePatterns?: RemotePattern[];
+  /** Deprecated Next.js allow-list of remote hostnames. */
+  domains?: string[];
+  /** Redirects a remote source may follow. Default: 3. */
+  maximumRedirects?: number;
+  /**
+   * Bytes of optimized images the Node.js server keeps on disk; 0 disables
+   * the cache, as in Next.js.
+   */
+  maximumDiskCacheSize?: number;
   /** Least max-age, in seconds, of an image served as-is. Default: 14400. */
   minimumCacheTTL?: number;
   /**
@@ -119,6 +143,11 @@ const DEV_BLUR_QUALITY = 70;
 
 export type ParseImageParamsOptions = {
   isDev?: boolean;
+  /**
+   * Accept an absolute http(s) source these patterns allow, as Next.js does.
+   * Only hosts that fetch remote sources safely (the Node.js server) pass it.
+   */
+  remote?: { remotePatterns?: RemotePattern[]; domains?: string[] };
   /** `images.localPatterns`; DEFAULT_LOCAL_PATTERNS when unset. */
   localPatterns?: LocalPattern[];
 };
@@ -131,6 +160,9 @@ export function resolveDevImageRedirect(
 ): string | null {
   const params = parseImageParams(requestUrl, allowedWidths, allowedQualities, options);
   if (!params) return null;
+  // A remote source images.remotePatterns allows: hosts that optimize remote
+  // images (the Node.js server) answer the signal, and the rest redirect.
+  if (options.remote && /^https?:\/\//i.test(params.imageUrl)) return params.imageUrl;
   if (
     params.imageUrl.startsWith("/@") ||
     params.imageUrl.startsWith("/__vite") ||
@@ -279,8 +311,63 @@ export function isImageSourceBodyStatus(status: number): boolean {
  */
 export const INVALID_IMAGE_SOURCE_MESSAGE = "The requested resource isn't a valid image.";
 
+const IMAGE_SOURCE_ERROR = Symbol.for("vinext.imageSourceError");
+
+function markImageSourceError(response: Response): Response {
+  Reflect.set(response, IMAGE_SOURCE_ERROR, true);
+  return response;
+}
+
+/** The image endpoint's error for a source, answered as-is by the handler. */
+export function imageSourceErrorResponse(status: number, message: string): Response {
+  return markImageSourceError(new Response(message, { status }));
+}
+
+/** Whether a source fetch already answered with the image endpoint's error. */
+export function isImageSourceErrorResponse(response: Response): boolean {
+  return Reflect.get(response, IMAGE_SOURCE_ERROR) === true;
+}
+
 export function invalidImageSourceResponse(): Response {
-  return new Response(INVALID_IMAGE_SOURCE_MESSAGE, { status: 400 });
+  return markImageSourceError(new Response(INVALID_IMAGE_SOURCE_MESSAGE, { status: 400 }));
+}
+
+/** Body Next.js answers for a local source the application did not serve. */
+export const INVALID_INTERNAL_IMAGE_RESPONSE_MESSAGE =
+  '"url" parameter is valid but internal response is invalid';
+
+/**
+ * The status Next.js answers for a local source the application answered
+ * with `status` and no file, as `fetchInternalImage` in
+ * packages/next/src/server/image-optimizer.ts throws it: the source's own
+ * error status, 500 in place of any status below 400 (`ImageError`), and 400
+ * for a success without a body. A success with a body that is no image is
+ * rejected later, with {@link invalidImageSourceResponse}.
+ */
+export function internalImageSourceErrorStatus(status: number): number {
+  if (status >= 200 && status < 300) return 400;
+  return status >= 400 ? status : 500;
+}
+
+/**
+ * Next.js' answer for a local source the application answered with `status`
+ * instead of a file. See {@link internalImageSourceErrorStatus}.
+ */
+export function imageSourceStatusResponse(status: number): Response {
+  if (isImageSourceBodyStatus(status)) return invalidImageSourceResponse();
+  return markImageSourceError(
+    new Response(INVALID_INTERNAL_IMAGE_RESPONSE_MESSAGE, {
+      status: internalImageSourceErrorStatus(status),
+    }),
+  );
+}
+
+/** The image endpoint's answer for a source fetch without an image body. */
+function failedImageSourceResponse(source: Response): Response {
+  if (isImageSourceErrorResponse(source)) return source;
+  source.body?.cancel().catch(() => {});
+  // A success without a body is an empty response, like a 204.
+  return imageSourceStatusResponse(source.ok ? 204 : source.status);
 }
 
 const RECURSIVE_IMAGE_URL_RE = /\/_(?:next|vinext)\/image(?:$|\/)/;
@@ -338,6 +425,24 @@ export function parseImageParams(
     return null;
   }
 
+  // Like Next.js' validateUrlParam, an absolute source must be http(s) and
+  // match images.remotePatterns (or images.domains).
+  if (options.remote && /^https?:\/\//i.test(imageUrl)) {
+    let remoteUrl: URL;
+    try {
+      remoteUrl = new URL(imageUrl);
+    } catch {
+      return null;
+    }
+    if (remoteUrl.protocol !== "http:" && remoteUrl.protocol !== "https:") return null;
+    if (
+      !hasRemoteMatch(options.remote.domains ?? [], options.remote.remotePatterns ?? [], remoteUrl)
+    ) {
+      return null;
+    }
+    return { imageUrl: remoteUrl.href, width, quality };
+  }
+
   // Prevent open redirect / SSRF — only allow path-relative URLs.
   // Normalize backslashes to forward slashes first: browsers and the URL
   // constructor treat /\evil.com as protocol-relative (//evil.com).
@@ -384,20 +489,73 @@ export function parseImageParams(
   return { imageUrl: normalizedUrl, width, quality };
 }
 
-/**
- * Negotiate the best output format based on the Accept header.
- * Returns an IANA media type.
- */
-export function negotiateImageFormat(acceptHeader: string | null): string {
-  if (!acceptHeader) return "image/jpeg";
-  if (acceptHeader.includes("image/avif")) return "image/avif";
-  if (acceptHeader.includes("image/webp")) return "image/webp";
-  return "image/jpeg";
+/** Next.js's default `images.formats`. */
+export const DEFAULT_IMAGE_FORMATS: readonly string[] = ["image/webp"];
+
+/** The q-value an Accept header gives a media type, or 0 when it names none. */
+function acceptQuality(acceptHeader: string, mediaType: string): number {
+  let best = 0;
+  for (const range of acceptHeader.split(",")) {
+    const [name, ...params] = range.split(";");
+    if (name.trim().toLowerCase() !== mediaType) continue;
+    let quality = 1;
+    for (const param of params) {
+      const [key, value] = param.split("=", 2);
+      if (key.trim().toLowerCase() === "q") quality = Number.parseFloat(value ?? "");
+    }
+    if (Number.isFinite(quality)) best = Math.max(best, quality);
+  }
+  return best;
 }
 
 /**
- * Standard Cache-Control header for optimized images.
- * Optimized images are immutable because the URL encodes the transform params.
+ * The `images.formats` entry the Accept header prefers, or "" when it accepts
+ * none, like Next.js' getSupportedMimeType (part of its image cache key).
+ */
+export function supportedImageFormat(
+  acceptHeader: string | null,
+  formats: readonly string[] = DEFAULT_IMAGE_FORMATS,
+): string {
+  let selected = "";
+  let selectedQuality = 0;
+  for (const format of formats) {
+    const quality = acceptHeader ? acceptQuality(acceptHeader, format) : 0;
+    if (quality > selectedQuality) {
+      selected = format;
+      selectedQuality = quality;
+    }
+  }
+  return selected;
+}
+
+/**
+ * Negotiate the output format like Next.js: the `images.formats` entry the
+ * Accept header prefers (listed order breaks ties), else the source's own
+ * type, with a WebP or AVIF source sent as JPEG to a client that accepts
+ * neither. Next.js only names an `images.formats` entry the Accept header
+ * spells out, so a wildcard alone selects none. Returns an IANA media type.
+ *
+ * Ported from Next.js: packages/next/src/server/image-optimizer.ts
+ * (getSupportedMimeType) and image-optimizer/transform.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/image-optimizer/transform.ts
+ */
+export function negotiateImageFormat(
+  acceptHeader: string | null,
+  formats: readonly string[] = DEFAULT_IMAGE_FORMATS,
+  sourceMediaType: string | null = null,
+): string {
+  const selected = supportedImageFormat(acceptHeader, formats);
+  if (selected) return selected;
+  if (!sourceMediaType || sourceMediaType === "image/webp" || sourceMediaType === "image/avif") {
+    return "image/jpeg";
+  }
+  return sourceMediaType;
+}
+
+/**
+ * Cache-Control of an image made from a `_next/static` build asset, whose
+ * hashed URL never changes content. Other sources, optimized or not, follow
+ * {@link sourceImageCacheControl}, as in Next.js.
  */
 export const IMAGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
@@ -467,77 +625,223 @@ function imageMediaType(contentType: string | null): string {
   return contentType?.split(";")[0].trim().toLowerCase() ?? "";
 }
 
+/** An ISOBMFF `ftyp` box with the given major brand, as Next.js' `hasFtypBox`. */
+type FtypBrand = { readonly ftypBrand: readonly [number, number, number, number] };
+
 /**
  * Next.js's image signatures (`detectContentType` in
- * packages/next/src/server/image-optimizer.ts); a null byte matches any value.
+ * packages/next/src/server/image-optimizer/detect-content-type.ts); a null
+ * byte matches any value.
  */
-const IMAGE_SIGNATURES: ReadonlyArray<readonly [string, ReadonlyArray<number | null>]> = [
-  ["image/jpeg", [0xff, 0xd8, 0xff]],
-  ["image/png", [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
-  ["image/gif", [0x47, 0x49, 0x46, 0x38]],
-  ["image/webp", [0x52, 0x49, 0x46, 0x46, null, null, null, null, 0x57, 0x45, 0x42, 0x50]],
-  ["image/svg+xml", [0x3c, 0x3f, 0x78, 0x6d, 0x6c]],
-  ["image/svg+xml", [0x3c, 0x73, 0x76, 0x67]],
-  ["image/avif", [null, null, null, null, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66]],
-  ["image/x-icon", [0x00, 0x00, 0x01, 0x00]],
-  ["image/x-icns", [0x69, 0x63, 0x6e, 0x73]],
-  ["image/tiff", [0x49, 0x49, 0x2a, 0x00]],
-  ["image/bmp", [0x42, 0x4d]],
-  ["image/jxl", [0xff, 0x0a]],
-  ["image/jxl", [0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]],
-  ["image/heic", [null, null, null, null, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]],
-];
+const IMAGE_SIGNATURES: ReadonlyArray<readonly [string, ReadonlyArray<number | null> | FtypBrand]> =
+  [
+    ["image/jpeg", [0xff, 0xd8, 0xff]],
+    ["image/png", [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+    ["image/gif", [0x47, 0x49, 0x46, 0x38]],
+    ["image/webp", [0x52, 0x49, 0x46, 0x46, null, null, null, null, 0x57, 0x45, 0x42, 0x50]],
+    ["image/svg+xml", [0x3c, 0x3f, 0x78, 0x6d, 0x6c]],
+    ["image/svg+xml", [0x3c, 0x73, 0x76, 0x67]],
+    ["image/avif", { ftypBrand: [0x61, 0x76, 0x69, 0x66] }],
+    ["image/x-icon", [0x00, 0x00, 0x01, 0x00]],
+    ["image/x-icns", [0x69, 0x63, 0x6e, 0x73]],
+    ["image/tiff", [0x49, 0x49, 0x2a, 0x00]],
+    ["image/bmp", [0x42, 0x4d]],
+    ["image/jxl", [0xff, 0x0a]],
+    ["image/jxl", [0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]],
+    ["image/heic", { ftypBrand: [0x68, 0x65, 0x69, 0x63] }],
+  ];
+
+/** The bytes every signature fits in. */
 const IMAGE_SIGNATURE_LENGTH = 12;
 
-/** The image type Next.js detects from a source's first bytes, or null. */
-export function sniffImageContentType(bytes: Uint8Array): string | null {
+/**
+ * The most of a source read to identify it: Next.js looks for an SVG root
+ * element in the first 1000 bytes.
+ */
+export const IMAGE_DETECTION_LENGTH = 1000;
+
+/**
+ * Whether `text` has an SVG root element, as Next.js' image detector checks
+ * with image-size's `/<svg\s([^>"']|"[^"]*"|'[^']*')*>/`. Its alternatives
+ * start with distinct characters, so a single scan from each `<svg` matches
+ * what the expression matches, without its backtracking.
+ */
+function hasSvgRootElement(text: string): boolean {
+  for (let start = text.indexOf("<svg"); start !== -1; start = text.indexOf("<svg", start + 1)) {
+    if (!/\s/.test(text.charAt(start + 4))) continue;
+    for (let i = start + 5; i < text.length; i++) {
+      const char = text[i];
+      if (char === ">") return true;
+      if (char === '"' || char === "'") {
+        const end = text.indexOf(char, i + 1);
+        if (end === -1) break;
+        i = end;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether `bytes`, the first of a source `length` bytes long, start with an
+ * `ftyp` box of `brand`: a big-endian box size of at least 16 that the source
+ * holds, then `ftyp` and the major brand. The size keeps text from matching
+ * the brand at offset 4.
+ */
+function hasFtypBox(bytes: Uint8Array, brand: FtypBrand["ftypBrand"], length: number): boolean {
+  const boxSize = ftypBoxSize(bytes, brand);
+  return boxSize !== null && boxSize <= length;
+}
+
+/** The declared size of an `ftyp` box of `brand` that `bytes` start with, or null. */
+function ftypBoxSize(bytes: Uint8Array, brand: FtypBrand["ftypBrand"]): number | null {
+  if (bytes.byteLength < IMAGE_SIGNATURE_LENGTH) return null;
+  const boxSize = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0);
+  return boxSize >= 16 &&
+    [0x66, 0x74, 0x79, 0x70].every((byte, i) => bytes[i + 4] === byte) &&
+    brand.every((byte, i) => bytes[i + 8] === byte)
+    ? boxSize
+    : null;
+}
+
+/**
+ * The image type Next.js detects from a source's first bytes, or null, given
+ * the source's length.
+ */
+export function sniffImageContentType(
+  bytes: Uint8Array,
+  length: number = bytes.byteLength,
+): string | null {
   for (const [type, signature] of IMAGE_SIGNATURES) {
-    if (signature.every((byte, i) => byte === null || bytes[i] === byte)) return type;
+    if (
+      "ftypBrand" in signature
+        ? hasFtypBox(bytes, signature.ftypBrand, length)
+        : signature.every((byte, i) => byte === null || bytes[i] === byte)
+    ) {
+      return type;
+    }
   }
   return null;
 }
 
 /**
- * Label a source that arrives without an image Content-Type by its first
- * bytes, as Next.js types every source. Workers static assets have no type for
- * some formats Next.js serves, such as ICNS.
+ * How many of a source's first bytes detection reads, given the first
+ * `IMAGE_SIGNATURE_LENGTH`: those for a signature, enough to know the source
+ * holds a whole `ftyp` box, as Next.js checks it against the source it read
+ * whole, and otherwise enough to find an SVG root element. Never more than
+ * `maxLength`, and never an `ftyp` box past `HELD_SOURCE_LIMIT`, since the bytes
+ * read are held to replay: such a source is checked for markup, then typed by
+ * its label.
  */
-async function withSniffedImageContentType(source: Response): Promise<Response> {
-  if (
-    !source.ok ||
-    !source.body ||
-    imageMediaType(source.headers.get("Content-Type")).startsWith("image/")
-  ) {
-    return source;
+function imageDetectionLength(bytes: Uint8Array, maxLength: number): number {
+  for (const [, signature] of IMAGE_SIGNATURES) {
+    if ("ftypBrand" in signature) {
+      const boxSize = ftypBoxSize(bytes, signature.ftypBrand);
+      if (boxSize !== null && boxSize <= HELD_SOURCE_LIMIT) return Math.min(boxSize, maxLength);
+    } else if (signature.every((byte, i) => byte === null || bytes[i] === byte)) {
+      return IMAGE_SIGNATURE_LENGTH;
+    }
   }
+  return Math.min(IMAGE_DETECTION_LENGTH, maxLength);
+}
+
+/**
+ * Whether `bytes` are text markup: they start with `<` after a UTF-8 byte
+ * order mark and whitespace, or with a UTF-16 byte order mark.
+ */
+function startsWithMarkup(bytes: Uint8Array): boolean {
+  if ((bytes[0] === 0xfe && bytes[1] === 0xff) || (bytes[0] === 0xff && bytes[1] === 0xfe)) {
+    return true;
+  }
+  let i = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
+  while (bytes[i] === 0x20 || bytes[i] === 0x09 || bytes[i] === 0x0a || bytes[i] === 0x0d) i++;
+  return bytes[i] === 0x3c;
+}
+
+/**
+ * The type of a source `length` bytes long from its first
+ * `IMAGE_DETECTION_LENGTH` bytes, as Next.js types every source by its bytes
+ * rather than its label, so an SVG is an SVG whatever its name or
+ * Content-Type. Bytes that match no signature keep `label`, since Next.js
+ * identifies formats these signatures don't, except markup, which is never
+ * an image unless it is an SVG (null).
+ */
+export function detectImageContentType(
+  bytes: Uint8Array,
+  label: string | null,
+  length: number = bytes.byteLength,
+): string | null {
+  const type = sniffImageContentType(bytes, length);
+  if (type !== null) return type;
+  if (hasSvgRootElement(new TextDecoder().decode(bytes.subarray(0, IMAGE_DETECTION_LENGTH)))) {
+    return "image/svg+xml";
+  }
+  return startsWithMarkup(bytes) ? null : label;
+}
+
+/** The first `length` bytes of `chunks`, which hold at least that many. */
+function concatBytes(chunks: Uint8Array[], length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset === length) break;
+    const part = chunk.subarray(0, length - offset);
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  return bytes;
+}
+
+/**
+ * Type a source by its first bytes, replacing its Content-Type, as Next.js
+ * types every source. Workers static assets have no type for some formats
+ * Next.js serves, such as ICNS, and label any file by its name.
+ */
+async function withDetectedImageContentType(
+  source: Response,
+  maxLength: number,
+): Promise<Response> {
+  if (!source.ok || !source.body) return source;
   const reader = source.body.getReader();
-  // Replay the chunks read, copying only the signature's bytes.
+  // Replay the chunks read, copying only the bytes detection reads.
   const head: Uint8Array[] = [];
-  const signature = new Uint8Array(IMAGE_SIGNATURE_LENGTH);
   let length = 0;
-  while (length < IMAGE_SIGNATURE_LENGTH) {
+  let target = IMAGE_SIGNATURE_LENGTH;
+  while (length < target) {
     const { done, value } = await reader.read();
     if (done) break;
     head.push(value);
-    signature.set(value.subarray(0, IMAGE_SIGNATURE_LENGTH - length), length);
-    length += Math.min(value.byteLength, IMAGE_SIGNATURE_LENGTH - length);
+    length += value.byteLength;
+    if (target === IMAGE_SIGNATURE_LENGTH && length >= target) {
+      target = imageDetectionLength(concatBytes(head, IMAGE_SIGNATURE_LENGTH), maxLength);
+    }
   }
-  const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      for (const chunk of head) controller.enqueue(chunk);
+  // Detect from no more than detection asked for, however the source is
+  // chunked: a box past it, or past `maxLength`, is never whole. Copy only what
+  // the SVG scan reads, since a whole `ftyp` box needs only its length.
+  const known = Math.min(length, target, maxLength);
+  const detected = concatBytes(head, Math.min(known, IMAGE_DETECTION_LENGTH));
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        for (const chunk of head) controller.enqueue(chunk);
+      },
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
     },
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) controller.close();
-      else controller.enqueue(value);
-    },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
-  });
+    // Read the source only as the body is read.
+    { highWaterMark: 0 },
+  );
   const headers = new Headers(source.headers);
-  const type = sniffImageContentType(signature.subarray(0, length));
-  if (type !== null) headers.set("Content-Type", type);
+  const type = detectImageContentType(detected, source.headers.get("Content-Type"), known);
+  if (type === null) headers.delete("Content-Type");
+  else headers.set("Content-Type", type);
   return new Response(body, { status: source.status, statusText: source.statusText, headers });
 }
 
@@ -604,7 +908,7 @@ function setImageResponseHeaders(
 }
 
 /** The `s-maxage` or `max-age` of a Cache-Control value, like Next.js' getMaxAge. */
-function cacheControlMaxAge(cacheControl: string | null): number {
+export function cacheControlMaxAge(cacheControl: string | null): number {
   const directives = new Map<string, string | undefined>();
   for (const directive of cacheControl?.split(",") ?? []) {
     const [key, value] = directive.trim().split("=", 2);
@@ -666,6 +970,75 @@ function createPassthroughImageResponse(
   return new Response(body, { status: 200, headers });
 }
 
+const DEFAULT_IMAGE_MAXIMUM_REDIRECTS = 3;
+
+const IMAGE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const TOO_MANY_INTERNAL_REDIRECTS_MESSAGE =
+  '"url" parameter is valid but internal response is invalid';
+
+/**
+ * Fetch a source, following the redirects an internal source answers with,
+ * as Next.js' `fetchInternalImage` does (packages/next/src/server/image-optimizer.ts,
+ * vercel/next.js#100005), for #4564:
+ *
+ * - Only 301, 302, 303, 307 and 308 with a parseable Location are followed;
+ *   any other response is the source's answer, as before.
+ * - With no redirects left, the endpoint answers 508.
+ * - The Location is validated like a `url` parameter, without matching
+ *   localPatterns/remotePatterns again (Next.js' `isRedirect`); an invalid
+ *   one answers 400.
+ * - A relative Location is fetched again through the internal path; an
+ *   absolute one goes through the remote fetch, which the Node.js server
+ *   guards against SSRF and DNS rebinding. Workers can't pin a fetch to the
+ *   address they checked, so they serve local sources only and answer 400
+ *   for an absolute redirect target instead of fetching it unguarded.
+ */
+export async function fetchImageSourceFollowingRedirects(
+  handlers: Pick<ImageHandlers, "allowRemote" | "fetchAsset">,
+  imageUrl: string,
+  request: Request,
+  maximumRedirects: number,
+): Promise<Response> {
+  let response = await handlers.fetchAsset(imageUrl, request);
+  let remaining = maximumRedirects;
+  while (IMAGE_REDIRECT_STATUSES.has(response.status)) {
+    const location = response.headers.get("Location");
+    if (!location || !URL.canParse(location, "http://n")) return response;
+    response.body?.cancel().catch(() => {});
+    if (remaining === 0) {
+      return imageSourceErrorResponse(508, TOO_MANY_INTERNAL_REDIRECTS_MESSAGE);
+    }
+    remaining--;
+    const target = validateImageRedirectLocation(location);
+    if (target === null) return imageSourceErrorResponse(400, '"url" parameter is invalid');
+    if (target.isAbsolute && !handlers.allowRemote) {
+      return imageSourceErrorResponse(400, '"url" parameter is not allowed');
+    }
+    response = await handlers.fetchAsset(target.href, request);
+  }
+  return response;
+}
+
+/**
+ * Next.js' `validateUrlParam` for a redirect Location: a path starting with
+ * a single `/`, or an http(s) URL. Pattern lists are not consulted again.
+ */
+function validateImageRedirectLocation(
+  location: string,
+): { href: string; isAbsolute: boolean } | null {
+  if (location.startsWith("/")) {
+    if (location.startsWith("//") || location.startsWith("/\\")) return null;
+    return { href: location, isAbsolute: false };
+  }
+  try {
+    const url = new URL(location);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return { href: url.href, isAbsolute: true };
+  } catch {
+    return null;
+  }
+}
+
 /** Whether a source's Content-Length is more than `limit` bytes. */
 function declaresMoreThan(source: Response, limit: number): boolean {
   return Number(source.headers.get("Content-Length") ?? Number.NaN) > limit;
@@ -683,6 +1056,11 @@ function sourceTooLargeResponse(): Response {
  * Workers provide these callbacks to adapt their specific bindings.
  */
 export type ImageHandlers = {
+  /**
+   * Accept absolute sources images.remotePatterns allows, which `fetchAsset`
+   * then fetches. Only for hosts that pin the connection to checked addresses.
+   */
+  allowRemote?: boolean;
   /** Fetch the source image from storage (e.g., Cloudflare ASSETS binding). */
   fetchAsset: (path: string, request: Request) => Promise<Response>;
   /** Optional: Transform the image (resize, format, quality). */
@@ -708,6 +1086,9 @@ export async function handleImageOptimization(
   const url = new URL(request.url);
   const params = parseImageParams(url, allowedWidths, imageConfig?.qualities, {
     localPatterns: imageConfig?.localPatterns,
+    remote: handlers.allowRemote
+      ? { remotePatterns: imageConfig?.remotePatterns, domains: imageConfig?.domains }
+      : undefined,
   });
 
   if (!params) {
@@ -717,22 +1098,32 @@ export async function handleImageOptimization(
   const { imageUrl, width, quality } = params;
 
   // Fetch source image
-  const fetchedSource = await handlers.fetchAsset(imageUrl, request);
+  const fetchedSource = await fetchImageSourceFollowingRedirects(
+    handlers,
+    imageUrl,
+    request,
+    imageConfig?.maximumRedirects ?? DEFAULT_IMAGE_MAXIMUM_REDIRECTS,
+  );
   const isBuildAsset = isImageBuildAsset(fetchedSource);
-  const source = await withSniffedImageContentType(fetchedSource);
+  const limit = imageConfig?.maximumResponseBody ?? DEFAULT_MAXIMUM_RESPONSE_BODY;
+  const source = await withDetectedImageContentType(fetchedSource, limit);
   if (!source.ok || !source.body) {
-    return invalidImageSourceResponse();
+    return failedImageSourceResponse(source);
   }
-
-  // Negotiate output format from Accept header
-  const format = negotiateImageFormat(request.headers.get("Accept"));
 
   // Block unsafe Content-Types (e.g., SVG which can contain embedded scripts).
   // Check the source Content-Type before any processing. SVG is only allowed
-  // when dangerouslyAllowSVG is explicitly enabled in next.config.js.
+  // when dangerouslyAllowSVG is explicitly enabled in next.config.js. Like
+  // Next.js, a source of no detected type isn't an image at all.
   const sourceContentType = source.headers.get("Content-Type");
-  if (!isSafeImageContentType(sourceContentType, imageConfig?.dangerouslyAllowSVG)) {
-    return imageTypeNotAllowedResponse();
+  if (
+    sourceContentType === null ||
+    !isSafeImageContentType(sourceContentType, imageConfig?.dangerouslyAllowSVG)
+  ) {
+    source.body.cancel().catch(() => {});
+    return sourceContentType === null
+      ? invalidImageSourceResponse()
+      : imageTypeNotAllowedResponse();
   }
 
   // Like Next.js, serve a format it does not optimize as-is, SVG included
@@ -758,8 +1149,14 @@ export async function handleImageOptimization(
     return response;
   }
 
+  // Negotiate the output format from the Accept header and images.formats.
+  const format = negotiateImageFormat(
+    request.headers.get("Accept"),
+    imageConfig?.formats,
+    sourceMediaType,
+  );
+
   // Transform if handler provided, otherwise serve original
-  const limit = imageConfig?.maximumResponseBody ?? DEFAULT_MAXIMUM_RESPONSE_BODY;
   let reader: ImageSourceReader | null = null;
   if (handlers.transformImage) {
     try {
@@ -779,7 +1176,7 @@ export async function handleImageOptimization(
         if (!sourceBody) {
           reader.cancel();
           const refetched = await handlers.fetchAsset(imageUrl, request);
-          if (!refetched.ok || !refetched.body) return invalidImageSourceResponse();
+          if (!refetched.ok || !refetched.body) return failedImageSourceResponse(refetched);
           reader = new ImageSourceReader(refetched.body, limit);
           sourceBody = reader.body()!;
         }
@@ -800,7 +1197,7 @@ export async function handleImageOptimization(
         quality,
       });
       const headers = new Headers(transformed.headers);
-      setImageResponseHeaders(headers, IMAGE_CACHE_CONTROL, imageConfig);
+      setImageResponseHeaders(headers, sourceCacheControl, imageConfig);
 
       // Verify the transformed response also has a safe Content-Type.
       // A malicious or buggy transform handler could return HTML.
@@ -837,16 +1234,23 @@ export async function handleImageOptimization(
   } catch (e) {
     console.error("[vinext] Image fallback error, refetching source image:", e);
     reader?.cancel();
-    const refetchedSource = await withSniffedImageContentType(
+    const refetchedSource = await withDetectedImageContentType(
       await handlers.fetchAsset(imageUrl, request),
+      limit,
     );
     if (!refetchedSource.ok || !refetchedSource.body) {
-      return invalidImageSourceResponse();
+      return failedImageSourceResponse(refetchedSource);
     }
 
     const refetchedContentType = refetchedSource.headers.get("Content-Type");
-    if (!isSafeImageContentType(refetchedContentType, imageConfig?.dangerouslyAllowSVG)) {
-      return imageTypeNotAllowedResponse();
+    if (
+      refetchedContentType === null ||
+      !isSafeImageContentType(refetchedContentType, imageConfig?.dangerouslyAllowSVG)
+    ) {
+      refetchedSource.body.cancel().catch(() => {});
+      return refetchedContentType === null
+        ? invalidImageSourceResponse()
+        : imageTypeNotAllowedResponse();
     }
 
     // A source that was bound for the optimizer stays within the limit.

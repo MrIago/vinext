@@ -379,6 +379,37 @@ describe("generateRouteTypes", () => {
     });
   });
 
+  // Ported from Next.js: test/e2e/app-dir/param-matching-types/param-matching-types.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/param-matching-types/param-matching-types.test.ts
+  it("declares ParamMatching for an installed Next.js that predates it", async () => {
+    await withTempProject(async (root) => {
+      await writeProjectFile(root, "app/page.tsx", EMPTY_PAGE);
+      await writeProjectFile(root, "node_modules/next/package.json", '{"name":"next"}\n');
+      await writeProjectFile(root, "node_modules/next/dist/types.d.ts", "export {};\n");
+      await writeProjectFile(
+        root,
+        "package.json",
+        '{"private":true,"dependencies":{"vinext":"*","next":"*"}}\n',
+      );
+
+      await generateRouteTypes({ root });
+      const generated = await readFile(path.join(root, ".next/types/routes.d.ts"), "utf-8");
+      expect(generated).toContain('declare module "next" {');
+      expect(generated).toContain("export type ParamMatching<ParamName extends string = string>");
+
+      // A Next.js that exports the type keeps its own declaration.
+      await writeProjectFile(
+        root,
+        "node_modules/next/dist/types.d.ts",
+        "export type ParamMatching = {};\n",
+      );
+      await generateRouteTypes({ root });
+      expect(await readFile(path.join(root, ".next/types/routes.d.ts"), "utf-8")).not.toContain(
+        'declare module "next" {',
+      );
+    });
+  });
+
   it("ignores a resolvable Next.js package that the project does not declare", async () => {
     await withTempProject(async (root) => {
       await writeProjectFile(root, "app/page.tsx", EMPTY_PAGE);

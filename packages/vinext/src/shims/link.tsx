@@ -7,6 +7,7 @@
  * On click, prevents full page reload and triggers client-side
  * page swap via the router's navigation system.
  */
+import { addNavigationTransitionTypes } from "./internal/navigation-transition-types.js";
 import React, {
   forwardRef,
   useCallback,
@@ -37,6 +38,11 @@ import {
   type LinkPrefetchRouterMode,
 } from "./link-prefetch.js";
 import {
+  beginPrefetchSetup,
+  endPrefetchSetup,
+  toAppPrefetchDestination,
+} from "./internal/app-prefetch-setup.js";
+import {
   isAbsoluteOrProtocolRelativeUrl,
   normalizePathTrailingSlash,
   toCanonicalBrowserNavigationHref,
@@ -60,8 +66,12 @@ import { interpolateDynamicRouteHref, resolveDynamicRouteHref } from "./internal
 import { markAppRouteDetectedOnPrefetch } from "./internal/app-route-detection.js";
 import {
   canAutoPrefetchFullAppRoute,
+  hasAppRouteInstantConfig,
   resolveAutoAppRoutePrefetch,
   resolveFullAppRoutePrefetch,
+  createLinkPrefetchPartialError,
+  readAppRoutePartialPrefetching,
+  resolvePartialAppRoutePrefetch,
 } from "./internal/app-route-prefetch-policy.js";
 import { RouterContext } from "./internal/router-context.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
@@ -93,8 +103,8 @@ const HAS_PAGES_ROUTER = process.env.__VINEXT_HAS_PAGES_ROUTER !== "false";
 const isServer = typeof window === "undefined";
 const HAS_CLIENT_REWRITES = process.env.__VINEXT_HAS_CLIENT_REWRITES !== "false";
 
-type NavigationModule = typeof import("./navigation.js");
-type PrefetchCacheEntry = import("./navigation.js").PrefetchCacheEntry;
+type NavigationModule = typeof import("./app-router-navigation.js");
+type PrefetchCacheEntry = import("./app-router-navigation.js").PrefetchCacheEntry;
 type HybridClientRouteOwnerModule = typeof import("./internal/hybrid-client-route-owner.js");
 
 let loadedNavigationModule: NavigationModule | null = null;
@@ -103,7 +113,7 @@ let loadedHybridClientRouteOwnerModule: HybridClientRouteOwnerModule | null = nu
 let hybridClientRouteOwnerModulePromise: Promise<HybridClientRouteOwnerModule> | null = null;
 
 function loadNavigationModule(): Promise<NavigationModule> {
-  return (navigationModulePromise ??= import("./navigation.js").then((module) => {
+  return (navigationModulePromise ??= import("./app-router-navigation.js").then((module) => {
     loadedNavigationModule = module;
     return module;
   }));
@@ -117,32 +127,40 @@ function loadHybridClientRouteOwnerModule(): Promise<HybridClientRouteOwnerModul
     }));
 }
 
+type AppElementsModule = typeof import("../server/app-elements.js");
 type AppRscCacheBustingModule = typeof import("../server/app-rsc-cache-busting.js");
 type AppPrefetchModules = [
-  typeof import("../server/app-elements.js"),
+  AppElementsModule,
   AppRscCacheBustingModule,
   typeof import("./internal/app-prefetch-rsc-request.js"),
   typeof import("../server/app-rsc-render-mode.js"),
   typeof import("../server/headers.js"),
+  typeof import("./internal/app-static-shell-vary-params.js"),
 ];
 
+let appElementsModulePromise: Promise<AppElementsModule> | null = null;
 let appRscCacheBustingModulePromise: Promise<AppRscCacheBustingModule> | null = null;
 let appPrefetchModulesPromise: Promise<AppPrefetchModules> | null = null;
 
 // Production builds wrap each dynamic import() in Vite's preload helper, which
 // queries the document for a CSP nonce on every call. Cache the promises so
 // each Link prefetch reuses them instead of paying that DOM scan again.
+function loadAppElementsModule(): Promise<AppElementsModule> {
+  return (appElementsModulePromise ??= import("../server/app-elements.js"));
+}
+
 function loadAppRscCacheBustingModule(): Promise<AppRscCacheBustingModule> {
   return (appRscCacheBustingModulePromise ??= import("../server/app-rsc-cache-busting.js"));
 }
 
 function loadAppPrefetchModules(): Promise<AppPrefetchModules> {
   return (appPrefetchModulesPromise ??= Promise.all([
-    import("../server/app-elements.js"),
+    loadAppElementsModule(),
     loadAppRscCacheBustingModule(),
     import("./internal/app-prefetch-rsc-request.js"),
     import("../server/app-rsc-render-mode.js"),
     import("../server/headers.js"),
+    import("./internal/app-static-shell-vary-params.js"),
   ]));
 }
 
@@ -152,8 +170,14 @@ export type LinkProps<_RouteInferType = unknown> = {
   as?: string | UrlObject;
   /** Replace the current history entry instead of pushing */
   replace?: boolean;
-  /** Prefetch the page in the background (App Router default: auto, Pages Router default: true) */
-  prefetch?: boolean | "auto" | null;
+  /**
+   * Prefetch the page in the background (App Router default: auto, Pages
+   * Router default: true). In the App Router, "shell" is an alias for "auto"
+   * and "prefetch" for `true`. "navigation" prefetches up to where
+   * `navigation()` resolves; without Partial Prefetching that is the same as
+   * `true`, matching Next.js.
+   */
+  prefetch?: boolean | "auto" | "shell" | "prefetch" | "navigation" | null;
   /**
    * Unstable App Router option matching Next.js canary: an automatic prefetch
    * is upgraded to a full prefetch when the user shows navigation intent.
@@ -186,7 +210,12 @@ export type LinkProps<_RouteInferType = unknown> = {
   children?: React.ReactNode;
 } & Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "href">;
 
-type LinkPrefetchMode = "disabled" | "auto" | "full" | "full-after-shell";
+/**
+ * "navigation" is a full prefetch to the Navigation stage
+ * (`prefetch="navigation"`), which only differs from "full" for a route that
+ * opts into Partial Prefetching.
+ */
+type LinkPrefetchMode = "disabled" | "auto" | "full" | "navigation" | "full-after-shell";
 
 declare global {
   // Window is an ambient interface from lib.dom; interface merging is required
@@ -216,13 +245,6 @@ export function useLinkStatus(): LinkStatusContextValue {
   return useContext(LinkStatusContext);
 }
 
-let linkPrefetchNavigationEpoch = 0;
-
-function notifyLinkNavigationStartAndCancelPrefetchSetup(): void {
-  linkPrefetchNavigationEpoch += 1;
-  notifyLinkNavigationStart();
-}
-
 // Register the link-status reset hook on the navigation runtime as soon as this
 // module evaluates on the client. `navigateClientSide` calls it at the start of
 // every App Router navigation (including router.push and shallow routing), so a
@@ -231,7 +253,7 @@ function notifyLinkNavigationStartAndCancelPrefetchSetup(): void {
 // it can be unit-tested without rendering a <Link>.
 if (typeof window !== "undefined") {
   registerNavigationRuntimeFunctions({
-    notifyLinkNavigationStart: notifyLinkNavigationStartAndCancelPrefetchSetup,
+    notifyLinkNavigationStart,
   });
 }
 
@@ -306,7 +328,11 @@ export function resolveLinkPrefetchMode(
   isDangerous: boolean,
 ): LinkPrefetchMode {
   if (isDangerous || prefetchProp === false) return "disabled";
-  if (prefetchProp === true) return "full";
+  // Next.js maps true/"prefetch" to the Prefetch stage and "navigation" to the
+  // Navigation stage. Without Partial Prefetching both are a full prefetch;
+  // "auto"/"shell"/null stay on the automatic (shell) stage.
+  if (prefetchProp === true || prefetchProp === "prefetch") return "full";
+  if (prefetchProp === "navigation") return "navigation";
   return "auto";
 }
 
@@ -380,7 +406,6 @@ function prefetchUrl(
   owner?: LinkPrefetchInstance,
 ): void {
   if (typeof window === "undefined") return;
-  const navigationEpoch = linkPrefetchNavigationEpoch;
 
   const prefetchHref = getLinkPrefetchHref({
     href,
@@ -432,6 +457,14 @@ function prefetchUrl(
   }
 
   const runPrefetch = () => {
+    // Registered before the first await, so a navigation to this destination
+    // or a cache invalidation that happens while the modules below load
+    // cancels this setup (shared with router.prefetch(); see
+    // internal/app-prefetch-setup.ts).
+    const prefetchDestination = hasLinkAppNavigationRuntime()
+      ? toAppPrefetchDestination(prefetchHref)
+      : null;
+    const setup = prefetchDestination === null ? null : beginPrefetchSetup(prefetchDestination);
     void (async () => {
       if (hasLinkAppNavigationRuntime()) {
         if (isBotUserAgent(window.navigator?.userAgent ?? "")) return;
@@ -445,8 +478,10 @@ function prefetchUrl(
             {
               APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL,
               APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+              getStaticShellPrefetchRenderMode,
             },
             headersModule,
+            { createVaryingStaticShellResolver },
           ],
           hybridRouteOwner,
           routeManifestLoaded,
@@ -462,7 +497,8 @@ function prefetchUrl(
         // A pointer-intent prefetch and its click navigation can start in the
         // same event turn. If navigation won the module-loading race, do not
         // begin a second request after it consumes an equivalent cached route.
-        if (navigationEpoch !== linkPrefetchNavigationEpoch) return;
+        // A cache invalidation (router.refresh()) also voids this setup.
+        if (setup?.cancelled) return;
         const {
           getPrefetchInterceptionContext,
           getPrefetchCache,
@@ -478,6 +514,8 @@ function prefetchUrl(
           prepareNavigationPrefetchSnapshot,
           promotePrefetchCacheEntryForNavigation,
           seedFullPrefetchFromVisitedResponse,
+          hasCoveringStaticShellPrefetch,
+          seedStaticShellPrefetchFromVaryingShell,
           hasNavigationFreshVisitedResponse,
           DYNAMIC_NAVIGATION_CACHE_TTL,
           PREFETCH_CACHE_TTL,
@@ -507,26 +545,59 @@ function prefetchUrl(
         const prefetchPolicyHref = rewrittenPrefetchHref ?? prefetchHref;
         const interceptionContext = getPrefetchInterceptionContext(fullHref);
         const mountedSlotsHeader = getMountedSlotsHeader();
-        const autoPrefetch =
+        // Like Next.js's segment cache scheduler, a route that opts into
+        // Partial Prefetching never gets a legacy full prefetch: a link asking
+        // for more than the shell is prefetched like the shell, up to the
+        // stage it asks for.
+        const partialPrefetch =
           mode === "auto"
+            ? null
+            : resolvePartialAppRoutePrefetch(
+                prefetchPolicyHref,
+                interceptionContext,
+                mode === "navigation" ? "navigation" : "prefetch",
+              );
+        if (mode === "navigation") mode = "full";
+        // Like Next.js, a route with an `unstable_instant` config ignores a
+        // full prefetch: it's prefetched as an automatic one.
+        if (
+          partialPrefetch !== null ||
+          (mode !== "auto" && hasAppRouteInstantConfig(prefetchPolicyHref, interceptionContext))
+        ) {
+          mode = "auto";
+        }
+        const autoPrefetch =
+          partialPrefetch ??
+          (mode === "auto"
             ? resolveAutoAppRoutePrefetch(prefetchPolicyHref, interceptionContext)
-            : resolveFullAppRoutePrefetch();
+            : resolveFullAppRoutePrefetch());
         if (!autoPrefetch.shouldPrefetch) return;
 
         const isOptimisticRouteShellPrefetch = !autoPrefetch.cacheForNavigation;
         const hasSearchParams = new URL(fullHref, window.location.href).search !== "";
+        // A static shell with search params is a runtime prefetch, which
+        // renders them.
         const isAutomaticSearchParamShell =
-          mode === "auto" && isOptimisticRouteShellPrefetch && hasSearchParams;
-        // A prefetch never renders the page of a route that renders
-        // dynamically, so its search-param href fetches the loading shell.
-        const hasSearchAgnosticShell =
+          mode === "auto" &&
+          isOptimisticRouteShellPrefetch &&
+          hasSearchParams &&
+          autoPrefetch.staticShell !== true;
+        // Only the Cache Components dynamic shell renders the page, with empty
+        // search params. Without Cache Components, Next.js's automatic
+        // prefetch never renders a page that may read searchParams
+        // (walkTreeWithFlightRouterState()), and no prefetch renders the page
+        // of a route that renders dynamically. Those hrefs, and one whose
+        // route a search-agnostic shell already covers, fetch the loading
+        // shell.
+        const fetchesDynamicShell =
           isAutomaticSearchParamShell &&
-          (autoPrefetch.rendersDynamically === true ||
-            hasSearchAgnosticPrefetchShellForRoute(
-              await createRscRequestUrl(fullHref, new Headers()),
-              interceptionContext,
-              mountedSlotsHeader,
-            ));
+          String(process.env.__NEXT_CACHE_COMPONENTS) === "true" &&
+          autoPrefetch.rendersDynamically !== true &&
+          !hasSearchAgnosticPrefetchShellForRoute(
+            await createRscRequestUrl(fullHref, new Headers()),
+            interceptionContext,
+            mountedSlotsHeader,
+          );
         const headers = createAppPrefetchRequestHeaders({
           interceptionContext,
           fetchPriority: priority,
@@ -534,9 +605,9 @@ function prefetchUrl(
           // its first, loading-shell request is not.
           prefetchKind: mode === "full" || mode === "full-after-shell" ? "full" : "auto",
           renderMode: isOptimisticRouteShellPrefetch
-            ? hasSearchAgnosticShell
-              ? APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
-              : isAutomaticSearchParamShell
+            ? autoPrefetch.staticShell === true
+              ? getStaticShellPrefetchRenderMode(autoPrefetch.prefetchStage)
+              : fetchesDynamicShell
                 ? APP_RSC_RENDER_MODE_PREFETCH_DYNAMIC_SHELL
                 : APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL
             : undefined,
@@ -562,7 +633,7 @@ function prefetchUrl(
           headers,
           rewrittenPrefetchHref,
         });
-        if (navigationEpoch !== linkPrefetchNavigationEpoch) return;
+        if (setup?.cancelled) return;
         const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
         const prefetched = getPrefetchedUrls();
         // The exact request is still fresh as a learning-only prefetch,
@@ -582,15 +653,7 @@ function prefetchUrl(
         const fetchFullRscPayload = () =>
           scheduleOwnedLinkPrefetch(
             owned,
-            (signal) =>
-              fetch(rscUrl, {
-                headers,
-                credentials: "include",
-                priority,
-                signal,
-                // @ts-expect-error — purpose is a valid fetch option in some browsers
-                purpose: "prefetch",
-              }),
+            (signal) => fetchAppPrefetch(rscUrl, { headers, priority, signal }),
             priority,
           );
         const fetchLoadingShellForReuse = async (): Promise<void> => {
@@ -617,14 +680,7 @@ function prefetchUrl(
             const shellFetchPromise = scheduleOwnedLinkPrefetch(
               shellOwned,
               (signal) =>
-                fetch(shellRscUrl, {
-                  headers: shellHeaders,
-                  credentials: "include",
-                  priority,
-                  signal,
-                  // @ts-expect-error — purpose is a valid fetch option in some browsers
-                  purpose: "prefetch",
-                }),
+                fetchAppPrefetch(shellRscUrl, { headers: shellHeaders, priority, signal }),
               priority,
             );
             trackOwnedLinkPrefetch(shellOwned, shellFetchPromise);
@@ -663,13 +719,10 @@ function prefetchUrl(
           if (owner && owner.leaveCount !== ownerLeaveCount) {
             throw new DOMException("Prefetch is no longer wanted", "AbortError");
           }
-          return fetch(probeRscUrl, {
+          return fetchAppPrefetch(probeRscUrl, {
             method: "HEAD",
             headers: probeHeaders,
-            credentials: "include",
             priority,
-            // @ts-expect-error — purpose is a valid fetch option in some browsers
-            purpose: "prefetch",
           });
         };
         // A visible Link that reuses a pending request becomes one of its owners.
@@ -735,6 +788,37 @@ function prefetchUrl(
         ) {
           return;
         }
+        // A fresh shell of this URL from a stage at least as deep serves the
+        // prefetch, as Next.js's segment cache serves a shallower one.
+        if (
+          autoPrefetch.staticShell === true &&
+          !autoPrefetch.cacheForNavigation &&
+          hasCoveringStaticShellPrefetch(
+            rscUrl,
+            interceptionContext,
+            mountedSlotsHeader,
+            autoPrefetch.prefetchStage,
+            additionalRscUrls,
+          )
+        ) {
+          return;
+        }
+        // Another URL's shell serves this one when they agree on the params it
+        // read. A client rewrite's target isn't the URL the shell keys on.
+        if (
+          autoPrefetch.staticShell === true &&
+          rewrittenPrefetchHref === null &&
+          seedStaticShellPrefetchFromVaryingShell(
+            rscUrl,
+            interceptionContext,
+            mountedSlotsHeader,
+            createVaryingStaticShellResolver(fullHref),
+            undefined,
+            autoPrefetch.prefetchStage,
+          )
+        ) {
+          return;
+        }
         prefetched.add(cacheKey);
         // Next's `prefetchInlining` Segment Cache path fetches a route tree
         // and then one inlined segment payload. Vinext still caches the unified
@@ -766,13 +850,10 @@ function prefetchUrl(
                     scheduleOwnedLinkPrefetch(
                       owned,
                       (signal) =>
-                        fetch(routeTreeRscUrl, {
+                        fetchAppPrefetch(routeTreeRscUrl, {
                           headers: routeTreeHeaders,
-                          credentials: "include",
                           priority,
                           signal,
-                          // @ts-expect-error — purpose is a valid fetch option in some browsers
-                          purpose: "prefetch",
                         }),
                       priority,
                     ),
@@ -808,11 +889,21 @@ function prefetchUrl(
                 : PREFETCH_CACHE_TTL,
             dynamicStaleTime: autoPrefetch.dynamicStaleTime,
             optimisticRouteShell: isOptimisticRouteShellPrefetch,
-            prefetchKind: isOptimisticRouteShellPrefetch ? "loading-shell" : "navigation",
-            prepareSnapshot: autoPrefetch.cacheForNavigation
-              ? prepareNavigationPrefetchSnapshot
-              : undefined,
-            searchAgnosticShell: isAutomaticSearchParamShell && !hasSearchAgnosticShell,
+            prefetchKind:
+              autoPrefetch.staticShell === true
+                ? "static-shell"
+                : isOptimisticRouteShellPrefetch
+                  ? "loading-shell"
+                  : "navigation",
+            // A static shell that turns out to be the whole page is reused too.
+            prepareSnapshot:
+              autoPrefetch.cacheForNavigation || autoPrefetch.staticShell === true
+                ? prepareNavigationPrefetchSnapshot
+                : undefined,
+            searchAgnosticShell: fetchesDynamicShell,
+            ...(autoPrefetch.prefetchStage === undefined
+              ? {}
+              : { stage: autoPrefetch.prefetchStage }),
           },
         );
       } else if (HAS_PAGES_ROUTER && window.__NEXT_DATA__) {
@@ -853,9 +944,13 @@ function prefetchUrl(
           document.head.appendChild(link);
         }
       }
-    })().catch((error) => {
-      console.error("[vinext] RSC prefetch setup error:", error);
-    });
+    })()
+      .catch((error) => {
+        console.error("[vinext] RSC prefetch setup error:", error);
+      })
+      .finally(() => {
+        if (setup !== null) endPrefetchSetup(setup);
+      });
   };
 
   if (priority === "high" || hasLinkAppNavigationRuntime()) {
@@ -878,7 +973,12 @@ async function promotePrefetchEntriesForNavigation(href: string): Promise<void> 
       promotePrefetchCacheEntryForNavigation,
     },
     { parseRscRequestPath, stripRscCacheBustingSearchParam },
-  ] = await Promise.all([loadNavigationModule(), loadAppRscCacheBustingModule()]);
+    { AppElementsWire },
+  ] = await Promise.all([
+    loadNavigationModule(),
+    loadAppRscCacheBustingModule(),
+    loadAppElementsModule(),
+  ]);
 
   let target: URL;
   const fullHref = toCanonicalBrowserNavigationHref(
@@ -901,10 +1001,8 @@ async function promotePrefetchEntriesForNavigation(href: string): Promise<void> 
     if (entry.prefetchKind === "route-tree") continue;
     if ((entry.mountedSlotsHeader ?? null) !== mountedSlotsHeader) continue;
 
-    const separatorIndex = cacheKey.indexOf("\0");
-    const rscUrl = separatorIndex === -1 ? cacheKey : cacheKey.slice(0, separatorIndex);
-    const cacheKeyInterceptionContext =
-      separatorIndex === -1 ? null : cacheKey.slice(separatorIndex + 1);
+    const { interceptionContext: cacheKeyInterceptionContext, rscUrl } =
+      AppElementsWire.decodeCacheKey(cacheKey);
     if (cacheKeyInterceptionContext !== interceptionContext) continue;
     let cached: URL;
     try {
@@ -970,6 +1068,19 @@ type OwnedLinkPrefetch = {
 };
 
 const ownedLinkPrefetches = new WeakMap<Promise<Response>, OwnedLinkPrefetch>();
+
+/** Send an App Router prefetch request with the credentials and hints all stages share. */
+function fetchAppPrefetch(
+  url: string,
+  init: { headers: Headers; method?: "HEAD"; priority: "low" | "high"; signal?: AbortSignal },
+): Promise<Response> {
+  return fetch(url, {
+    ...init,
+    credentials: "include",
+    // @ts-expect-error — purpose is a valid fetch option in some browsers
+    purpose: "prefetch",
+  });
+}
 
 function createOwnedLinkPrefetch(
   owner: LinkPrefetchInstance | undefined,
@@ -1264,6 +1375,17 @@ function resolveConcreteRouteHref(href: string, as: string | undefined): string 
   return projection?.href || null;
 }
 
+/** Point Link's internal anchor ref and the user's ref at the same node. */
+function setAnchorRefs(
+  internalRef: React.RefObject<HTMLAnchorElement | null>,
+  ref: React.Ref<HTMLAnchorElement> | undefined,
+  node: HTMLAnchorElement | null,
+): void {
+  internalRef.current = node;
+  if (typeof ref === "function") ref(node);
+  else if (ref) ref.current = node;
+}
+
 const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   {
     href,
@@ -1280,7 +1402,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     unstable_dynamicOnHover = false,
     legacyBehavior = false,
     passHref = false,
-    transitionTypes: _transitionTypes,
+    transitionTypes,
     locale,
     ...anchorProps
   },
@@ -1417,12 +1539,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   });
 
   const setRefs = useCallback(
-    (node: HTMLAnchorElement | null) => {
-      internalRef.current = node;
-      if (typeof forwardedRef === "function") forwardedRef(node);
-      else if (forwardedRef)
-        (forwardedRef as React.MutableRefObject<HTMLAnchorElement | null>).current = node;
-    },
+    (node: HTMLAnchorElement | null) => setAnchorRefs(internalRef, forwardedRef, node),
     [forwardedRef],
   );
 
@@ -1638,6 +1755,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
         const navEvent: NavigateEvent = {
           url: navUrl,
           preventDefault() {
+            // False positive: https://github.com/oxc-project/oxc/issues/28401
+            // oxlint-disable-next-line react/immutability -- This flag is local to each click.
             prevented = true;
           },
           get defaultPrevented() {
@@ -1689,6 +1808,22 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     // hash-only changes, RSC fetch, and two-phase URL commit.
     if (hasAppNavigationRuntime) {
       const { navigateClientSide } = loadedNavigationModule ?? (await loadNavigationModule());
+      // Like Next.js in development with Cache Components, warn when a link
+      // that asks for more than the shell navigates to a route without
+      // Partial Prefetching: its prefetch is a legacy full one, with the
+      // route's dynamic data. It fires at navigation rather than prefetch
+      // time, so a page full of such links isn't one warning per link, and
+      // dev doesn't prefetch anyway (vercel/next.js#94672).
+      if (
+        process.env.NODE_ENV !== "production" &&
+        String(process.env.__NEXT_CACHE_COMPONENTS) === "true" &&
+        (prefetchMode === "full" || prefetchMode === "navigation") &&
+        readAppRoutePartialPrefetching(navigateHref) === false
+      ) {
+        console.error(
+          createLinkPrefetchPartialError(new URL(navigateHref, window.location.href).pathname),
+        );
+      }
       const setter = setPendingRef.current;
       // Register this link as the one driving the current navigation. This
       // resets any previously-pending link (e.g. a different link clicked
@@ -1696,6 +1831,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       if (setter) setLinkForCurrentNavigation(setter);
       setPending(true);
       React.startTransition(() => {
+        addNavigationTransitionTypes(transitionTypes);
         void navigateClientSide(navigateHref, replace ? "replace" : "push", scroll, false).finally(
           () => {
             setPending(false);
@@ -1763,14 +1899,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       }>;
       const childOnClick = child.props.onClick;
       const childRef = child.props.ref;
-      const setDangerousRefs = (node: HTMLAnchorElement | null): void => {
-        internalRef.current = node;
-        if (typeof childRef === "function") {
-          childRef(node);
-        } else if (childRef) {
-          (childRef as React.MutableRefObject<HTMLAnchorElement | null>).current = node;
-        }
-      };
+      const setDangerousRefs = (node: HTMLAnchorElement | null): void =>
+        setAnchorRefs(internalRef, childRef, node);
       // Next.js also clones the legacy child and merges its ref during render.
       // oxlint-disable-next-line react/refs -- preserve the Next.js legacy Link contract
       const dangerousChild = React.cloneElement(child, {
@@ -1844,14 +1974,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     // `ref` is a regular prop on the element. Merge with our intersection
     // observer ref via `setRefs` so prefetching still works.
     const childRef = childPropsExisting.ref;
-    const setLegacyRefs = (node: HTMLAnchorElement | null): void => {
-      internalRef.current = node;
-      if (typeof childRef === "function") {
-        childRef(node);
-      } else if (childRef) {
-        (childRef as React.MutableRefObject<HTMLAnchorElement | null>).current = node;
-      }
-    };
+    const setLegacyRefs = (node: HTMLAnchorElement | null): void =>
+      setAnchorRefs(internalRef, childRef, node);
     const clonedProps: Record<string, unknown> = {
       ref: setLegacyRefs,
       onClick: (event: MouseEvent<HTMLAnchorElement>) => {

@@ -31,7 +31,7 @@ function printHelp(commandName?: string): void {
 
   Commands:
     deploy                          Deploy to Cloudflare Workers
-    previews deploy [preview-name]  Deploy a Cloudflare Worker Preview
+    previews deploy                 Deploy a Cloudflare Worker Preview
 
   Options:
     -h, --help     Show this help
@@ -50,7 +50,10 @@ async function deployCommand(): Promise<void> {
     root: process.cwd(),
     preview: parsed.preview,
     env: parsed.env,
+    mode: parsed.mode,
     config: parsed.config,
+    message: parsed.message,
+    tag: parsed.tag,
     viteConfig: parsed.viteConfig,
     skipBuild: parsed.skipBuild,
     dryRun: parsed.dryRun,
@@ -60,6 +63,7 @@ async function deployCommand(): Promise<void> {
     prerenderConcurrency: parsed.prerenderConcurrency,
     warmCdnCache: parsed.warmCdnCache,
     warmCdnTarget: parsed.warmCdnTarget,
+    warmCdnHeaders: parsed.warmCdnHeaders,
     warmCdnConcurrency: parsed.warmCdnConcurrency,
     warmCdnTimeout: parsed.warmCdnTimeout,
     warmCdnRetries: parsed.warmCdnRetries,

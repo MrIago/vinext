@@ -15,6 +15,7 @@ import {
   MIDDLEWARE_SET_COOKIE_HEADER,
 } from "../server/headers.js";
 import { encodeMiddlewareRequestHeaders } from "../utils/middleware-request-headers.js";
+import { headersProxyTarget } from "./internal/headers-proxy-target.js";
 import { validateCookieAttributeValue, validateCookieName } from "./internal/cookie-serialize.js";
 import { parseEdgeRequestCookieHeader } from "../utils/parse-cookie.js";
 import { getRequestExecutionContext } from "./request-context.js";
@@ -25,6 +26,7 @@ import {
   queueAfterCallback,
   trackAfterPromise,
 } from "./unified-request-context.js";
+import { createPprFallbackShellSuspensePromise } from "./ppr-fallback-shell.js";
 import { assertSafeNavigationUrl } from "./url-safety.js";
 import { hasBasePath, removeTrailingSlash, stripBasePath } from "../utils/base-path.js";
 import { trustProxy } from "../server/proxy-trust.js";
@@ -1009,16 +1011,21 @@ class ReadonlyRequestHeadersError extends Error {
 }
 
 export function sealRequestHeaders(headers: Headers): Headers {
-  return new Proxy<Headers>(headers, {
-    get(target, prop) {
-      if (typeof prop === "string" && REQUEST_HEADERS_MUTATING_METHODS.has(prop)) {
-        return ReadonlyRequestHeadersError.callable;
-      }
+  // The target is not `headers` itself so util.inspect doesn't hit undici's
+  // brand check; see headersProxyTarget.
+  return new Proxy<Headers>(
+    headersProxyTarget(() => headers),
+    {
+      get(_target, prop) {
+        if (typeof prop === "string" && REQUEST_HEADERS_MUTATING_METHODS.has(prop)) {
+          return ReadonlyRequestHeadersError.callable;
+        }
 
-      const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+        const value = Reflect.get(headers, prop, headers);
+        return typeof value === "function" ? value.bind(headers) : value;
+      },
     },
-  });
+  );
 }
 
 export function sealRequestCookies(cookies: RequestCookies): RequestCookies {
@@ -1449,9 +1456,11 @@ export function after<T>(task: Promise<T> | (() => T | Promise<T>)): void {
       requestContext,
       Promise.resolve(task).catch((error) => {
         console.error("[vinext] after() task failed:", error);
+        requestContext.afterContext.onTaskError?.(error);
       }),
     );
-    getRequestExecutionContext()?.waitUntil(guarded);
+    if (requestContext.afterContext.waitUntil) requestContext.afterContext.waitUntil(guarded);
+    else getRequestExecutionContext()?.waitUntil(guarded);
     return;
   }
 
@@ -1471,11 +1480,24 @@ export async function connection(): Promise<void> {
     suspendConnectionProbe,
     throwIfInsideCacheScope,
   } = await import("./headers.js");
-  if (getHeadersContext()?.forceStatic) {
+  const headersContext = getHeadersContext();
+  if (headersContext?.staticParamsRoute !== undefined && headersContext.accessError) {
+    // A cache scope still fails to store what it computed after the error.
+    throwIfInsideCacheScope("connection()");
+    throw headersContext.accessError;
+  }
+  if (headersContext?.forceStatic) {
     return;
   }
   markRenderRequestApiUsage("connection");
   throwIfInsideCacheScope("connection()");
+  // Like Next.js's prerender, a shell render leaves what follows
+  // `connection()` to its Suspense fallback, a hole each request resumes, so
+  // it doesn't make the shell itself dynamic.
+  const fallbackShellPromise = createPprFallbackShellSuspensePromise<void>("`connection()`");
+  if (fallbackShellPromise) {
+    await fallbackShellPromise;
+  }
   markDynamicUsage();
   const pendingProbe = suspendConnectionProbe();
   if (pendingProbe) {
@@ -1485,14 +1507,23 @@ export async function connection(): Promise<void> {
 
 /**
  * URLPattern re-export — used in middleware for route matching.
- * Available natively in Node 20+, Cloudflare Workers, Deno.
- * Falls back to urlpattern-polyfill if the global is not available.
+ *
+ * Like Next.js, this re-exports the runtime's global URLPattern. It is native
+ * in Cloudflare Workers, Deno and Node.js >= 23.8. On older Node (vinext
+ * supports Node 22) there is no global, so the fallback is a class whose
+ * constructor throws an actionable error. It must be a class: an arrow
+ * function fallback makes `new URLPattern()` fail with the opaque
+ * "URLPattern is not a constructor" before any message can be shown.
  */
-export const URLPattern: typeof globalThis.URLPattern =
-  globalThis.URLPattern ??
-  (() => {
+class MissingURLPattern {
+  constructor() {
     throw new Error(
-      "URLPattern is not available in this runtime. " +
-        "Install the `urlpattern-polyfill` package or upgrade to Node 20+.",
+      "URLPattern is not available in this runtime. It is built into Node.js >= 23.8 " +
+        "and Cloudflare Workers; on older Node.js, load a polyfill such as " +
+        "`urlpattern-polyfill` before your middleware runs.",
     );
-  });
+  }
+}
+
+export const URLPattern: typeof globalThis.URLPattern =
+  globalThis.URLPattern ?? (MissingURLPattern as unknown as typeof globalThis.URLPattern);

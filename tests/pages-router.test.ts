@@ -183,6 +183,13 @@ function getStylesheetHrefs(html: string): string[] {
     .filter((href): href is string => href !== null);
 }
 
+// Vite escapes `&` in attribute values, so decode the src like a browser would.
+function getHtmlProxyScriptPath(html: string): string | undefined {
+  return html
+    .match(/<script type="module" src="([^"]*html-proxy[^"]*)"/)?.[1]
+    ?.replaceAll("&amp;", "&");
+}
+
 function writePagesAppGlobalCssFixture(rootDir: string): PagesAppGlobalCssFixture {
   const pagesDir = path.join(rootDir, "pages");
   const libDir = path.join(rootDir, "lib");
@@ -996,14 +1003,14 @@ describe("Pages Router integration", () => {
     const first = await fetch(`${baseUrl}/isr-test`);
     expect(first.status).toBe(200);
     expect(first.headers.get("x-vinext-cache")).toBeNull();
-    expect(first.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(first.headers.get("cache-control")).toBe("no-store");
     const firstHtml = await first.text();
     expect(firstHtml).not.toContain("nonce=");
 
     const repeated = await fetch(`${baseUrl}/isr-test`);
     expect(repeated.status).toBe(200);
     expect(repeated.headers.get("x-vinext-cache")).toBeNull();
-    expect(repeated.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(repeated.headers.get("cache-control")).toBe("no-store");
     await repeated.text();
 
     const second = await fetch(`${baseUrl}/isr-test?mw-csp-nonce=pages-isr`);
@@ -1011,7 +1018,7 @@ describe("Pages Router integration", () => {
     expect(second.headers.get("content-security-policy")).toBe(
       "script-src 'nonce-pages-isr' 'strict-dynamic';",
     );
-    expect(second.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(second.headers.get("cache-control")).toBe("no-store");
     expect(second.headers.get("x-vinext-cache")).toBeNull();
     const secondHtml = await second.text();
     expect(secondHtml).toContain(
@@ -1096,13 +1103,25 @@ describe("Pages Router integration", () => {
     expect(setCookie).toContain("gssp_token=abc123");
   });
 
+  // Ported from Next.js: test/development/dev-cache-control/dev-cache-control.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/development/dev-cache-control/dev-cache-control.test.ts
+  // A stored dev document would be restored by a back navigation without
+  // revalidation, showing output from before the latest edit.
+  it("sends no-store for Pages Router documents and data in development", async () => {
+    const page = await fetch(`${baseUrl}/ssr`);
+    expect(page.headers.get("cache-control")).toBe("no-store");
+    const data = await fetch(`${baseUrl}/_next/data/test-build-id/ssr.json`);
+    expect(data.status).toBe(200);
+    expect(data.headers.get("cache-control")).toBe("no-store");
+  });
+
   // Regression for #1461: gSSP responses must carry the default Cache-Control
   // header that Next.js applies for getServerSideProps pages so CDNs and
   // browsers do not cache the per-request payload.
   it("sets the default Cache-Control header on getServerSideProps responses", async () => {
     const res = await fetch(`${baseUrl}/ssr`);
     expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 
   // Next.js development always overrides authored cache lifetimes.
@@ -1110,7 +1129,7 @@ describe("Pages Router integration", () => {
   it("uses the development Cache-Control even when getServerSideProps sets one", async () => {
     const res = await fetch(`${baseUrl}/ssr-cache-control`);
     expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 
   it("getServerSideProps calling res.end() short-circuits the response", async () => {
@@ -1237,7 +1256,7 @@ describe("Pages Router integration", () => {
     // The document 404 is a rendered page, which Next.js dev never caches.
     const notFoundDocument = await fetch(`${baseUrl}/gssp-not-found?hiding=true`);
     expect(notFoundDocument.status).toBe(404);
-    expect(notFoundDocument.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(notFoundDocument.headers.get("cache-control")).toBe("no-store");
   });
 
   it("keeps a getServerSideProps Cache-Control on redirects", async () => {
@@ -1321,7 +1340,7 @@ describe("Pages Router integration", () => {
       ]) {
         const notFoundDocument = await fetch(`${baseUrl}/gssp-not-found?${search}`);
         expect(notFoundDocument.status).toBe(404);
-        expect(notFoundDocument.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+        expect(notFoundDocument.headers.get("cache-control")).toBe("no-store");
       }
     },
   );
@@ -1473,6 +1492,31 @@ describe("Pages Router integration", () => {
     expect(JSON.parse(nextDataMatch![1]).buildId).toBe("test-build-id");
   });
 
+  // Ported from Next.js: test/integration/404-page/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/404-page/test/index.test.ts
+  it("answers a direct /404 request with 404 in dev", async () => {
+    const res = await fetch(`${baseUrl}/404`);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain("404 - Page Not Found");
+  });
+
+  // Ported from Next.js: test/integration/500-page/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/500-page/test/index.test.ts
+  it("answers a direct /500 request with 500 in dev", async () => {
+    const res = await fetch(`${baseUrl}/500`);
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain("custom pages/500");
+  });
+
+  // Next.js pages-handler.ts: "if we are rendering the error page it's not a
+  // data request anymore", so /500 answers its HTML document with 500.
+  it("answers a /500 data request with the 500 page in dev", async () => {
+    const res = await fetch(`${baseUrl}/_next/data/test-build-id/500.json`);
+    expect(res.status).toBe(500);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("custom pages/500");
+  });
+
   // Ported from Next.js: test/e2e/not-found-revalidate/not-found-revalidate.test.ts
   // https://github.com/vercel/next.js/blob/canary/test/e2e/not-found-revalidate/not-found-revalidate.test.ts
   it("runs custom 404 getStaticProps for getStaticProps notFound in dev", async () => {
@@ -1529,7 +1573,7 @@ export async function getStaticPaths() {
       expect(first.status).toBe(404);
       expect(first.headers.get("x-nextjs-cache")).toBe("HIT");
       expect(first.headers.get("x-vinext-cache")).toBeNull();
-      expect(first.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(first.headers.get("cache-control")).toBe("no-store");
       const firstHtml = await first.text();
       expect(firstHtml).toContain('<p id="not-found">404 page 1</p>');
       expect(firstHtml).toContain('"paramsAreUndefined":true');
@@ -1548,7 +1592,7 @@ export async function getStaticPaths() {
       expect(second.status).toBe(404);
       expect(second.headers.get("x-nextjs-cache")).toBe("HIT");
       expect(second.headers.get("x-vinext-cache")).toBeNull();
-      expect(second.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(second.headers.get("cache-control")).toBe("no-store");
       const secondHtml = await second.text();
       expect(secondHtml).toContain('<p id="not-found">404 page 2</p>');
       expect(secondHtml).toContain('"paramsAreUndefined":true');
@@ -1812,6 +1856,25 @@ export default function Page({ value }: { value: string }) {
     );
   });
 
+  // Ported from Next.js: test/development/pages-dir/client-navigation/rendering-head.test.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/development/pages-dir/client-navigation/rendering-head.test.ts
+  it("replaces the default charset and viewport with unkeyed next/head tags", async () => {
+    const html = await (await fetch(`${baseUrl}/head-priority`)).text();
+    const headContents = html.match(/<head[^>]*>([\s\S]*?)<\/head>/i)?.[1] ?? "";
+
+    // "header helper dedupes tags": only the page's charset and viewport remain.
+    expect(headContents.match(/<meta charset=/g)).toHaveLength(1);
+    expect(headContents.match(/<meta name="viewport" /g)).toHaveLength(1);
+    // "should place charset element at the top of <head>": the next/head tags
+    // lead <head>, ahead of the children of _document's <Head>.
+    const nextHeadTags =
+      '<meta charset="iso-8859-5" data-next-head="" />' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1" data-next-head="" />' +
+      '<meta name="title" content="head title" data-next-head="" />';
+    expect(headContents.trimStart().slice(0, nextHeadTags.length)).toBe(nextHeadTags);
+    expect(headContents.indexOf('<meta name="description"')).toBeGreaterThan(nextHeadTags.length);
+  });
+
   it("rerenders GSP pages without carrying prior render state", async () => {
     const firstRes = await fetch(`${baseUrl}/isr-second-render-state`);
     expect(firstRes.status).toBe(200);
@@ -1916,9 +1979,7 @@ export default function About({ source }) { return <h1>{source}</h1>; }
   it("installs the vinext dev error overlay in the hydration script", async () => {
     const res = await fetch(`${baseUrl}/`);
     const html = await res.text();
-    const hydrationProxyPath = html.match(
-      /<script type="module" src="([^"]*html-proxy[^"]*)"><\/script>/,
-    )?.[1];
+    const hydrationProxyPath = getHtmlProxyScriptPath(html);
     expect(hydrationProxyPath).toBeDefined();
 
     const hydrationProxy = await fetch(new URL(hydrationProxyPath!, baseUrl)).then((response) =>
@@ -2016,9 +2077,7 @@ export default class CustomDocument extends Document {
         const nextData = JSON.parse(nextDataMatch![1]);
         expect(nextData.__vinext.appModuleUrl).toBe("/pages/_app.page.tsx");
 
-        const hydrationProxyPath = html.match(
-          /<script type="module" src="([^"]*html-proxy[^"]*)"><\/script>/,
-        )?.[1];
+        const hydrationProxyPath = getHtmlProxyScriptPath(html);
         expect(hydrationProxyPath).toBeDefined();
         const hydrationProxy = await fetch(new URL(hydrationProxyPath!, started.baseUrl)).then(
           (proxyResponse) => proxyResponse.text(),
@@ -2485,9 +2544,7 @@ export const config = { matcher: "${matcher}" };
           const nextData = JSON.parse(
             html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/)?.[1] ?? "{}",
           );
-          const proxyPath = html.match(
-            /<script type="module" src="([^"]*html-proxy[^"]*)"><\/script>/,
-          )?.[1];
+          const proxyPath = getHtmlProxyScriptPath(html);
           expect(proxyPath).toBeDefined();
           const script = await fetch(new URL(proxyPath!, baseUrl)).then((response) =>
             response.text(),
@@ -2590,9 +2647,7 @@ export const config = { matcher: "${matcher}" };
       const { server: devServer, baseUrl } = await startFixtureServer(tmpRoot);
       try {
         const html = await fetch(baseUrl).then((response) => response.text());
-        const proxyPath = html.match(
-          /<script type="module" src="([^"]*html-proxy[^"]*)"><\/script>/,
-        )?.[1];
+        const proxyPath = getHtmlProxyScriptPath(html);
         expect(proxyPath).toBeDefined();
         await fetch(new URL(proxyPath!, baseUrl));
         const proxyModule = [
@@ -3368,10 +3423,10 @@ export const config = { matcher: "${matcher}" };
     // and verify it contains our hydration code
     const res = await fetch(`${baseUrl}/`);
     const html = await res.text();
-    const proxyMatch = html.match(/src="([^"]*html-proxy[^"]*)"/);
-    expect(proxyMatch).toBeTruthy();
+    const proxyPath = getHtmlProxyScriptPath(html);
+    expect(proxyPath).toBeTruthy();
 
-    const scriptRes = await fetch(`${baseUrl}${proxyMatch![1]}`);
+    const scriptRes = await fetch(`${baseUrl}${proxyPath}`);
     expect(scriptRes.status).toBe(200);
     const scriptContent = await scriptRes.text();
     // The proxy module should contain our hydration imports
@@ -3442,7 +3497,7 @@ export const config = { matcher: "${matcher}" };
     expect(res.status).toBe(200);
     expect(res.headers.get("x-nextjs-cache")).toBe("MISS");
     expect(res.headers.get("x-vinext-cache")).toBeNull();
-    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
     const html = await res.text();
     expect(html).toContain("Loading product...");
     // The full-content branch must NOT render — getStaticProps was skipped.
@@ -3482,7 +3537,7 @@ export const config = { matcher: "${matcher}" };
     const finalRes = await fetch(`${baseUrl}/products/${slug}`);
     expect(finalRes.headers.get("x-nextjs-cache")).toBe("MISS");
     expect(finalRes.headers.get("x-vinext-cache")).toBeNull();
-    expect(finalRes.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(finalRes.headers.get("cache-control")).toBe("no-store");
     const finalHtml = await finalRes.text();
     expect(finalHtml).toContain("Loading product...");
   });
@@ -3854,13 +3909,12 @@ export const config = { matcher: "${matcher}" };
         });
       });
 
-      it("omits the header on the /500 data success response", async () => {
-        // Next.js pages-handler.ts guards the success-path header with
-        // `!isErrorPage && !is500Page`, so /_error and /500 data responses
-        // must not carry it even when a deployment id is configured.
+      it("omits the header on the /500 data response", async () => {
+        // Next.js pages-handler.ts renders /500 as HTML for a data request
+        // and guards the header with `!isErrorPage && !is500Page`.
         await withDeploymentId(async () => {
           const res = await fetch(`${baseUrl}/_next/data/${BUILD_ID}/500.json`);
-          expect(res.status).toBe(200);
+          expect(res.status).toBe(500);
           expect(res.headers.get("x-nextjs-deployment-id")).toBeNull();
         });
       });
@@ -4823,7 +4877,7 @@ describe("Virtual server entry generation", () => {
       const firstHtml = await firstRes.text();
       expect(firstRes.status).toBe(200);
       expect(firstRes.headers.get("x-vinext-cache")).toBeNull();
-      expect(firstRes.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(firstRes.headers.get("cache-control")).toBe("no-store");
       expect(firstHtml).toContain("Global CSS ISR Test");
       for (const href of fixture.isrDevStylesheetHrefs) {
         expect(getStylesheetHrefs(firstHtml)).toContain(href);
@@ -4833,7 +4887,7 @@ describe("Virtual server entry generation", () => {
       const secondHtml = await secondRes.text();
       expect(secondRes.status).toBe(200);
       expect(secondRes.headers.get("x-vinext-cache")).toBeNull();
-      expect(secondRes.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+      expect(secondRes.headers.get("cache-control")).toBe("no-store");
       expect(secondHtml).toContain("Global CSS ISR Test");
       for (const href of fixture.isrDevStylesheetHrefs) {
         expect(getStylesheetHrefs(secondHtml)).toContain(href);
@@ -4868,7 +4922,7 @@ describe("Virtual server entry generation", () => {
       const html = await res.text();
       expect(res.status).toBe(404);
       expect(html).toContain("Global CSS Error Test");
-      const scriptPath = html.match(/<script type="module" src="([^"]+html-proxy[^"]+)"/)?.[1];
+      const scriptPath = getHtmlProxyScriptPath(html);
       expect(scriptPath).toBeTruthy();
       const hydrationScript = await (
         await fetch(`http://localhost:${addr.port}${scriptPath}`)
@@ -8240,6 +8294,14 @@ describe("Production server middleware (Pages Router)", () => {
     await expectRepeatedSlashRedirects(prodUrl);
   });
 
+  // Ported from Next.js: test/integration/500-page/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/500-page/test/index.test.ts
+  it("answers a direct /500 request with 500", async () => {
+    const res = await fetch(`${prodUrl}/500`);
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain("custom pages/500");
+  });
+
   it("never turns a same-origin double-slash middleware redirect protocol-relative", async () => {
     const res = await fetch(`${prodUrl}/mw-redirect-double-slash`, { redirect: "manual" });
     expect(res.status).toBe(307);
@@ -11430,7 +11492,7 @@ describe("custom App optional pageProps envelope parity", () => {
       expect(missResponse.status).toBe(200);
       expect(missResponse.headers.get("x-nextjs-cache")).toBe(mode === "dev" ? "HIT" : "MISS");
       if (mode === "dev") {
-        expect(missResponse.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+        expect(missResponse.headers.get("cache-control")).toBe("no-store");
       }
       const missHtml = await missResponse.text();
       expect(missHtml).toContain(
@@ -11525,7 +11587,7 @@ describe("custom App optional pageProps envelope parity", () => {
   it("keeps the development Cache-Control on a getServerSideProps notFound in dev", async () => {
     const response = await fetch(`${devUrl}/gssp-not-found`);
     expect(response.status).toBe(404);
-    expect(response.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(response.headers.get("cache-control")).toBe("no-store");
     await response.body?.cancel();
 
     // The getServerSideProps default is set before the 404 render, so a

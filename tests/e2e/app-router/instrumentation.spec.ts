@@ -79,7 +79,10 @@ test.describe("instrumentation.ts onRequestError", () => {
     const data = await stateRes.json();
     expect(data.errors.length).toBeGreaterThanOrEqual(1);
 
-    const err = data.errors[data.errors.length - 1];
+    // Other specs (action-error-sanitization) report errors into the same list
+    // in parallel, so the last entry isn't necessarily ours.
+    const err = data.errors.find((e: { path: string }) => e.path === "/api/error-route");
+    expect(err).toBeTruthy();
     // The routePath should be the file-system route pattern, not the concrete URL.
     expect(err.routePath).toContain("error-route");
   });

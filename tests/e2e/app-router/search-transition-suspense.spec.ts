@@ -43,7 +43,17 @@ async function navigateWhileArchivedModuleIsHeld(
   await page.goto(`${BASE}${ROUTE}`);
   await waitForAppRouterHydration(page);
   await expect(page.getByTestId("search-transition-view")).toHaveText("active");
-  await expect(page.locator("html")).toHaveAttribute("data-search-transition-ref-attachments", "1");
+  // React Strict Mode (on by default in the App Router, as in Next.js)
+  // attaches refs twice on mount in dev. What matters is that the
+  // navigation below does not remount the probe, so compare against the
+  // count right after hydration.
+  await expect(page.locator("html")).toHaveAttribute(
+    "data-search-transition-ref-attachments",
+    /^[12]$/,
+  );
+  const refAttachmentsAfterHydration = await page
+    .locator("html")
+    .getAttribute("data-search-transition-ref-attachments");
   await page.evaluate(() => {
     const recordFallback = () => {
       if (document.querySelector('[data-testid="search-transition-layout-fallback"]')) {
@@ -82,7 +92,10 @@ async function navigateWhileArchivedModuleIsHeld(
     "data-search-transition-fallback",
     "shown",
   );
-  await expect(page.locator("html")).toHaveAttribute("data-search-transition-ref-attachments", "1");
+  await expect(page.locator("html")).toHaveAttribute(
+    "data-search-transition-ref-attachments",
+    refAttachmentsAfterHydration!,
+  );
   // The navigation stayed on the client instead of loading a new document.
   expect(documentRequests).toEqual([]);
 }

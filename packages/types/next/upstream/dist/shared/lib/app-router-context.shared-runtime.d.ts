@@ -16,7 +16,7 @@ export interface NavigateOptions {
     transitionTypes?: string[];
 }
 export interface PrefetchOptions {
-    kind: PrefetchKind;
+    kind?: PrefetchKind | 'auto' | 'full' | 'shell' | 'prefetch' | 'navigation';
     onInvalidate?: () => void;
 }
 export interface AppRouterInstance {

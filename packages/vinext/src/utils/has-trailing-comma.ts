@@ -12,7 +12,7 @@
  *
  * Returns "" for an empty / whitespace-only / comment-only fragment.
  */
-export function lastSignificantChar(source: string): string {
+function lastSignificantChar(source: string): string {
   let last = "";
   let i = 0;
   const n = source.length;

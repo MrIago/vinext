@@ -229,6 +229,34 @@ export function isSocketErrorBackstopInstalled(): boolean {
  * errors outside the absorbed set. The flag is process-global and sticky,
  * so it also applies when `index.ts` installed the listeners first.
  */
+/**
+ * The dependency optimizer pre-bundles every CommonJS package it crawls. A
+ * Node-only package (one that requires a directory, or Node built-ins the
+ * client can't have) fails that pre-bundle with a raw Rolldown error, though
+ * the runtime resolver would load it fine. Name the package and the fix so
+ * the error is actionable (#1220). Returns null for any other error.
+ */
+export function describeDependencyOptimizationFailure(err: unknown): string | null {
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  if (!message.includes("Error during dependency optimization")) return null;
+  // Each Rolldown error line names the file that failed (`[CODE] ... in
+  // node_modules/<pkg>/...`); the "imported by" chain that follows lists
+  // innocent packages too, so only the failing files' packages count.
+  const packages = new Set<string>();
+  for (const line of message.split("\n")) {
+    if (!/^\s*\[[A-Z_]+\]/.test(line)) continue;
+    const match = line.match(/node_modules\/((?:@[^/\s]+\/)?[^/\s]+)\//);
+    if (match) packages.add(match[1]!);
+  }
+  if (packages.size === 0) return null;
+  const names = [...packages].map((name) => `"${name}"`).join(", ");
+  return (
+    `[vinext] Vite's dependency optimizer could not pre-bundle ${names}. ` +
+    `If the package only runs on the server, add it to \`serverExternalPackages\` in next.config, ` +
+    `or to \`optimizeDeps.exclude\` in vite.config, so it loads through the runtime resolver instead.`
+  );
+}
+
 export function installSocketErrorBackstop(options: { runningServer?: boolean } = {}): void {
   const proc = process as BackstopProcess;
   if (options.runningServer) proc[RUNNING_SERVER_FLAG] = true;
@@ -271,6 +299,8 @@ export function installSocketErrorBackstop(options: { runningServer?: boolean } 
         );
       return;
     }
+    const optimizerHint = describeDependencyOptimizationFailure(err);
+    if (optimizerHint) console.error(optimizerHint);
     if (proc[RUNNING_SERVER_FLAG]) {
       console.error("[vinext] uncaughtException:", err);
       return;
@@ -280,6 +310,8 @@ export function installSocketErrorBackstop(options: { runningServer?: boolean } 
   process.on("unhandledRejection", (reason: unknown) => {
     if (absorbBenignAssetImport(reason, "unhandledRejection")) return;
     if (process.env.VINEXT_PRERENDER === "1") throw reason;
+    const optimizerHint = describeDependencyOptimizationFailure(reason);
+    if (optimizerHint) console.error(optimizerHint);
     const code = peerDisconnectCode(reason);
     if (code) {
       if (debug) console.warn(`[vinext] absorbed unhandledRejection ${code}`);

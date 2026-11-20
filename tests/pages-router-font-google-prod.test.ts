@@ -1,7 +1,7 @@
 import path from "node:path";
 import fsp from "node:fs/promises";
 import type http from "node:http";
-import { build } from "vite-plus";
+import { createBuilder } from "vite-plus";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import vinext from "../packages/vinext/src/index.js";
 import { startProdServer } from "../packages/vinext/src/server/prod-server.js";
@@ -75,32 +75,16 @@ describe("Pages Router Production server self-hosted next/font/google", () => {
     // https://github.com/vercel/next.js/blob/canary/test/production/deployment-id-handling/deployment-id-handling.test.ts
     const plugins = () => [vinext({ nextConfig: () => ({ deploymentId: "dpl-pages-font-prod" }) })];
     try {
-      // Pages Router only — no RSC pipeline, so separate build() calls work.
-      await build({
+      // Build every environment the way `vinext build` does, so the SSR
+      // bundle names its assets like the client build that serves them.
+      const builder = await createBuilder({
         root: tmpDir,
         configFile: false,
         plugins: plugins(),
         logLevel: "silent",
-        build: {
-          assetsInlineLimit: 0,
-          outDir: path.join(outDir, "server"),
-          ssr: "virtual:vinext-server-entry",
-          rolldownOptions: { output: { entryFileNames: "entry.js" } },
-        },
+        build: { assetsInlineLimit: 0 },
       });
-      await build({
-        root: tmpDir,
-        configFile: false,
-        plugins: plugins(),
-        logLevel: "silent",
-        build: {
-          assetsInlineLimit: 0,
-          outDir: path.join(outDir, "client"),
-          manifest: true,
-          ssrManifest: true,
-          rolldownOptions: { input: "virtual:vinext-client-entry" },
-        },
-      });
+      await builder.buildApp();
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -127,6 +111,21 @@ describe("Pages Router Production server self-hosted next/font/google", () => {
     }
   }, 15000);
 
+  // Every @font-face rule the page loads: the stylesheets the head links to
+  // (Google fonts and extracted local fonts) plus the inline
+  // `<style data-vinext-fonts>` block.
+  async function loadFontCss(html: string): Promise<string> {
+    const parts = [...html.matchAll(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/g)].map(
+      (m) => m[1],
+    );
+    for (const [, href] of html.matchAll(
+      /<link rel="stylesheet"[^>]*href="(\/_next\/static\/[^"]+\.css[^"]*)"/g,
+    )) {
+      parts.push(await (await fetch(`${baseUrl}${href}`)).text());
+    }
+    return parts.join("\n");
+  }
+
   it("keeps Google and local HTML preload URLs query-free and byte-identical", async () => {
     const res = await fetch(`${baseUrl}/`);
     expect(res.status).toBe(200);
@@ -141,10 +140,14 @@ describe("Pages Router Production server self-hosted next/font/google", () => {
     expect(localFontHref).toBeDefined();
     const styleMatch = html.match(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/);
     expect(styleMatch).not.toBeNull();
-    const localFontFace = styleMatch![1]
+    const fontCss = await loadFontCss(html);
+    const localFontFace = fontCss
       .match(/@font-face\s*\{[^}]*\}/g)
       ?.find((fontFace) => fontFace.includes(localFontHref!));
     expect(localFontFace).toBeDefined();
+    // Byte-identical to the preload, deployment query included, so the
+    // browser reuses the preloaded file.
+    expect(localFontFace).toContain(`url(${localFontHref})`);
     expect(localFontFace).not.toContain("font-weight:");
     // The fixture mirrors #2793's 400/600/700 reproduction. Its omitted
     // local-font weight also matches the equivalent Next.js fixture:
@@ -155,7 +158,7 @@ describe("Pages Router Production server self-hosted next/font/google", () => {
     }
     for (const href of preloadHrefs) {
       expect(href).not.toContain("?");
-      expect(styleMatch![1]).toContain(href);
+      expect(fontCss).toContain(href);
       if (href === googleFontHref) {
         const fontRes = await fetch(`${baseUrl}${href}`);
         expect(fontRes.status, href).toBe(200);
@@ -173,6 +176,7 @@ describe("Pages Router Production server self-hosted next/font/google", () => {
     const html = await res.text();
     const styleMatch = html.match(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/);
     expect(styleMatch).not.toBeNull();
+    const fontCss = await loadFontCss(html);
     const preloadHrefs = [
       ...html.matchAll(/<link rel="preload"[^>]*href="([^"]+)"[^>]*as="font"/g),
     ].map((m) => m[1]);
@@ -182,7 +186,7 @@ describe("Pages Router Production server self-hosted next/font/google", () => {
     expect(linkHrefs.some((href) => !href.includes("/_vinext_fonts/"))).toBe(true);
     for (const href of linkHrefs) {
       expect(href).not.toContain("?");
-      expect(styleMatch![1]).toContain(href);
+      expect(fontCss).toContain(href);
       expect(preloadHrefs).toContain(href);
     }
   });

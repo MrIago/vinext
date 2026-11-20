@@ -84,6 +84,8 @@ export type CacheAdapterBuildOutput = {
   finalizePrerenderOutput?: (output: {
     root: string;
     clientOutDir: string;
+    /** Holds vinext-prerender.json and prerendered-routes/. */
+    serverDir: string;
   }) => Promise<void> | void;
 };
 
@@ -105,6 +107,12 @@ export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<st
   output?: CacheAdapterBuildOutput | VinextMultiStageOutput;
   /** Build-time cache semantics used by shared request protocol code. */
   capabilities?: CdnCacheAdapterCapabilities;
+  /**
+   * The adapter can only be constructed from a platform `env` (e.g. a Workers
+   * binding). Runtimes that supply no env (the Node.js prerender and
+   * production server) keep the default handler without a warning.
+   */
+  requiresEnv?: boolean;
 };
 
 export function hasVerbatimResponseVary(cache?: VinextCacheConfig | null): boolean {
@@ -146,12 +154,15 @@ export function hasCacheAdapterPrerenderOutput(cache?: VinextCacheConfig | null)
 export async function finalizeCacheAdapterPrerenderOutput(
   cache: VinextCacheConfig | null | undefined,
   root: string,
-  output: { clientOutDir?: string } = {},
+  output: { clientOutDir?: string; outDir?: string } = {},
 ): Promise<void> {
+  // Vite's `build.outDir`, "dist" by default.
+  const outDir = path.resolve(root, output.outDir ?? "dist");
   for (const finalize of new Set(prerenderOutputFinalizers(cache))) {
     await finalize({
       root,
-      clientOutDir: path.resolve(root, output.clientOutDir ?? "dist/client"),
+      clientOutDir: path.resolve(root, output.clientOutDir ?? path.join(outDir, "client")),
+      serverDir: path.join(outDir, "server"),
     });
   }
 }
@@ -307,14 +318,17 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
     "}",
     "",
     "let __vinextCacheAdaptersRegistered = false;",
+  );
+  const dataRequiresEnv = Boolean(data?.adapter && data.requiresEnv);
+  if (dataRequiresEnv) lines.push("let __vinextDataCacheAdapterRegistered = false;");
+  lines.push(
     "",
     "export function registerConfiguredCacheAdapters(env) {",
     "  if (typeof process !== 'undefined' && process.env?.__VINEXT_PRERENDER_PATH_DISCOVERY === '1') return;",
-    "  if (__vinextCacheAdaptersRegistered) return;",
-    "  __vinextCacheAdaptersRegistered = true;",
   );
+  const dataLines: string[] = [];
   if (data?.adapter) {
-    lines.push(
+    dataLines.push(
       "  try {",
       `    registerDataCacheHandler(() => instantiateCacheAdapter(__vinextDataAdapterFactory, { env, options: ${inlineOptions(
         data.adapter,
@@ -322,19 +336,36 @@ export function generateCacheAdaptersModule(cache?: VinextCacheConfig): string {
       )} }, "data"));`,
     );
     if (dataProvidesBuildIdentity) {
-      lines.push(
+      dataLines.push(
         "    registerCdnCacheAdapter(() => new DefaultCdnCacheAdapter(",
         "      process.env.__VINEXT_RSC_BUILD_IDENTITY || process.env.__VINEXT_BUILD_ID,",
         "    ));",
       );
     }
-    lines.push(
+    dataLines.push(
       "  } catch (error) {",
       '    console.warn("[vinext] failed to initialize the configured data cache adapter; ' +
         'using the default handler.\\n" + __vinextFormatAdapterError(error));',
       "  }",
     );
   }
+  if (dataRequiresEnv) {
+    // Node.js runs (build prerender, `vinext start`) call without env, where a
+    // binding-backed adapter cannot exist, so they keep the default handler
+    // silently. The slot latches on its own so an env-less call that happens
+    // first does not block the Workers call that supplies env.
+    lines.push(
+      "  if (env != null && !__vinextDataCacheAdapterRegistered) {",
+      "    __vinextDataCacheAdapterRegistered = true;",
+      ...dataLines.map((line) => `  ${line}`),
+      "  }",
+    );
+  }
+  lines.push(
+    "  if (__vinextCacheAdaptersRegistered) return;",
+    "  __vinextCacheAdaptersRegistered = true;",
+  );
+  if (!dataRequiresEnv) lines.push(...dataLines);
   if (cdn?.adapter) {
     lines.push(
       "  try {",

@@ -5,8 +5,9 @@ const BASE_URL = process.env.VINEXT_BASEPATH_E2E_BASE_URL ?? "";
 const imagePath = (endpoint: string, source: string) =>
   `${BASE_URL}${endpoint}?url=${encodeURIComponent(source)}&w=640&q=75`;
 
-// Next.js answers a local source that yields no image with this 400.
-const INVALID_IMAGE = "The requested resource isn't a valid image.";
+// Next.js keeps the status the application answered a source with, 500 in
+// place of a redirect (fetchInternalImage, https://github.com/vercel/next.js/pull/97957).
+const INVALID_INTERNAL = '"url" parameter is valid but internal response is invalid';
 
 test("serves the image endpoint behind basePath only for sources middleware admits", async ({
   request,
@@ -34,7 +35,7 @@ test("serves the image endpoint behind basePath only for sources middleware admi
     imagePath("/docs/_next/image", "/docs/members only/private.png"),
     { headers: { cookie: "members=1" } },
   );
-  expect(protectedImage.status()).toBe(400);
-  expect(await protectedImage.text()).toBe(INVALID_IMAGE);
+  expect(protectedImage.status()).toBe(403);
+  expect(await protectedImage.text()).toBe(INVALID_INTERNAL);
   expect(Buffer.from(await protectedImage.body()).includes(privatePng)).toBe(false);
 });

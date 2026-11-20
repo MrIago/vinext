@@ -584,7 +584,7 @@ describe("ISR (Pages Router)", () => {
   function expectDevCacheHeaders(response: Response): void {
     expect(response.headers.get("x-nextjs-cache")).toBe("HIT");
     expect(response.headers.get("x-vinext-cache")).toBeNull();
-    expect(response.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(response.headers.get("cache-control")).toBe("no-store");
   }
 
   beforeAll(async () => {
@@ -667,7 +667,7 @@ describe("ISR (Pages Router)", () => {
     const res = await fetch(`${baseUrl}/about`);
     expect(res.status).toBe(200);
     expect(res.headers.get("x-vinext-cache")).toBeNull();
-    expect(res.headers.get("cache-control")).toBe("no-cache, must-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 });
 
@@ -694,14 +694,13 @@ describe("ISR (App Router)", () => {
   // covered by Playwright E2E tests. These integration tests verify dev-mode
   // behavior: correct headers emitted, no ISR cache reads/writes.
 
-  it("dev: renders ISR page and emits Cache-Control header", async () => {
+  it("dev: renders ISR page with the development no-store Cache-Control", async () => {
     const res = await fetch(`${baseUrl}/isr-test`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("App Router ISR Test");
     expect(html).toContain("Hello from ISR");
-    expect(res.headers.get("cache-control")).toContain("s-maxage=1");
-    expect(res.headers.get("cache-control")).toContain("stale-while-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 
   it("dev: does NOT write to or read from ISR cache (no X-Vinext-Cache header)", async () => {
@@ -721,8 +720,7 @@ describe("ISR (App Router)", () => {
     // ISR cache reads/writes are prod-only, so no X-Vinext-Cache in dev
     expect(res.headers.get("x-vinext-cache")).toBeNull();
     // Cache-Control IS still emitted for RSC responses on ISR pages
-    expect(res.headers.get("cache-control")).toContain("s-maxage=1");
-    expect(res.headers.get("cache-control")).toContain("stale-while-revalidate");
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 
   it("dev: RSC prefetch requests (Next-Router-Prefetch header) return RSC stream with Cache-Control", async () => {
@@ -732,7 +730,7 @@ describe("ISR (App Router)", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/x-component");
     // Prefetch RSC requests should also get Cache-Control (no X-Vinext-Cache in dev)
-    expect(res.headers.get("cache-control")).toContain("s-maxage=1");
+    expect(res.headers.get("cache-control")).toBe("no-store");
     expect(res.headers.get("x-vinext-cache")).toBeNull();
   });
 
@@ -2001,6 +1999,38 @@ describe("build-time defines (Pages Router)", () => {
   it("Next.js test mode defaults to false", () => {
     expect(server.config.define?.["process.env.__NEXT_TEST_MODE"]).toBe(JSON.stringify(false));
   });
+
+  // Ported from Next.js packages/next/src/build/define-env.ts: an unset
+  // `reactStrictMode` turns StrictMode on for the App Router.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/define-env.ts
+  it("App Router strict mode defaults to true when reactStrictMode is unset", () => {
+    expect(server.config.define?.["process.env.__NEXT_STRICT_MODE_APP"]).toBe(JSON.stringify(true));
+  });
+});
+
+describe("App Router strict mode define", () => {
+  async function defineFor(reactStrictMode: boolean): Promise<unknown> {
+    const server = await createServer({
+      root: PAGES_FIXTURE_DIR,
+      configFile: false,
+      plugins: [vinext({ nextConfig: { reactStrictMode } })],
+      server: { port: 0 },
+      logLevel: "silent",
+    });
+    try {
+      return server.config.define?.["process.env.__NEXT_STRICT_MODE_APP"];
+    } finally {
+      await server.close();
+    }
+  }
+
+  it("follows an explicit reactStrictMode: false", async () => {
+    expect(await defineFor(false)).toBe(JSON.stringify(false));
+  });
+
+  it("follows an explicit reactStrictMode: true", async () => {
+    expect(await defineFor(true)).toBe(JSON.stringify(true));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3017,6 +3047,18 @@ describe("MetadataHead rendering", () => {
     expect(html).toContain('href="/apple.png"');
   });
 
+  // https://github.com/cloudflare/vinext/issues/3066: Next.js resolves an
+  // absolute metadata URL with `new URL()`, which percent-encodes it.
+  it("percent-encodes absolute og:image and twitter:image URLs", () => {
+    const html = renderMetadataToHtml({
+      openGraph: { images: ["https://cdn.example.com/og image.png"] },
+      twitter: { images: ["https://cdn.example.com/tw image.png"] },
+    });
+    expect(html).toContain('content="https://cdn.example.com/og%20image.png"');
+    expect(html).toContain('content="https://cdn.example.com/tw%20image.png"');
+    expect(html).not.toContain("og image.png");
+  });
+
   it("serializes rich metadata for the streaming body outlet", () => {
     const html = renderMetadataToHtml(
       {
@@ -3971,6 +4013,8 @@ describe("fetch cache (extended fetch with next options)", () => {
     const { withFetchCache } = await import("../packages/vinext/src/shims/fetch-cache.js");
     const { setCacheHandler, MemoryCacheHandler } =
       await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
 
     // Fresh cache handler for isolation
     setCacheHandler(new MemoryCacheHandler());
@@ -3983,43 +4027,51 @@ describe("fetch cache (extended fetch with next options)", () => {
 
     const cleanup = withFetchCache();
     try {
-      const resp1 = await fetch(`${mockServerUrl}/swr`, {
-        next: { revalidate: 1 },
-      });
-      const data1 = await resp1.json();
-      expect(data1.count).toBe(1);
-      expect(fetchCallCount).toBe(1);
+      // An ordinary App Router request serves the stale entry and refetches
+      // it in the background, like Next.js's patch-fetch. Outside any request
+      // scope vinext refreshes in the foreground, as the function caches do.
+      await runWithRequestContext(
+        createRequestContext({ unstableCacheRevalidation: "background" }),
+        async () => {
+          const resp1 = await fetch(`${mockServerUrl}/swr`, {
+            next: { revalidate: 1 },
+          });
+          const data1 = await resp1.json();
+          expect(data1.count).toBe(1);
+          expect(fetchCallCount).toBe(1);
 
-      // Advance time past the revalidate window so the entry becomes stale.
-      now += 2000;
+          // Advance time past the revalidate window so the entry becomes stale.
+          now += 2000;
 
-      // Second fetch returns stale cached value but triggers background refetch.
-      const resp2 = await fetch(`${mockServerUrl}/swr`, {
-        next: { revalidate: 1 },
-      });
-      const data2 = await resp2.json();
-      expect(data2.count).toBe(1);
+          // Second fetch returns stale cached value but triggers background refetch.
+          const resp2 = await fetch(`${mockServerUrl}/swr`, {
+            next: { revalidate: 1 },
+          });
+          const data2 = await resp2.json();
+          expect(data2.count).toBe(1);
 
-      // Wait for the background revalidation fetch to hit the network.
-      await new Promise<void>((resolve, reject) => {
-        const start = originalNow();
-        const tick = () => {
-          if (fetchCallCount >= 2) return resolve();
-          if (originalNow() - start > 1000) {
-            return reject(new Error("timed out waiting for background revalidation"));
-          }
-          setTimeout(tick, 10);
-        };
-        tick();
-      });
+          // Wait for the background revalidation fetch to hit the network.
+          await new Promise<void>((resolve, reject) => {
+            const start = originalNow();
+            const tick = () => {
+              if (fetchCallCount >= 2) return resolve();
+              if (originalNow() - start > 1000) {
+                return reject(new Error("timed out waiting for background revalidation"));
+              }
+              setTimeout(tick, 10);
+            };
+            tick();
+          });
 
-      // Third fetch should read the refreshed cache value.
-      const resp3 = await fetch(`${mockServerUrl}/swr`, {
-        next: { revalidate: 1 },
-      });
-      const data3 = await resp3.json();
-      expect(data3.count).toBe(2);
-      expect(fetchCallCount).toBe(2);
+          // Third fetch should read the refreshed cache value.
+          const resp3 = await fetch(`${mockServerUrl}/swr`, {
+            next: { revalidate: 1 },
+          });
+          const data3 = await resp3.json();
+          expect(data3.count).toBe(2);
+          expect(fetchCallCount).toBe(2);
+        },
+      );
     } finally {
       cleanup();
       setCacheHandler(new MemoryCacheHandler());

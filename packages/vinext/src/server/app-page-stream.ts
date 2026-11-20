@@ -11,6 +11,7 @@ import type { InitialNavigationCacheMetadata } from "./app-ssr-stream.js";
 import { markFrameworkLinkHeaders } from "./app-response-header-provenance.js";
 import { getNextErrorDigest } from "./next-error-digest.js";
 import { isAppRenderAbortError } from "./app-render-abort-error.js";
+import { isInsideUnifiedScope } from "vinext/shims/unified-request-context";
 
 export { deferUntilStreamConsumed } from "./defer-until-stream-consumed.js";
 
@@ -39,11 +40,35 @@ export type AppSsrRenderResult = {
    */
   caughtShellError?: unknown;
   /**
+   * A PPR fallback shell's document is a prelude, with React's postponed
+   * state for its holes, null when only its payload has them.
+   */
+  pprShellPrelude?: { postponed: unknown };
+  /**
    * Preload `Link` header value emitted by React during SSR (via `onHeaders`),
    * already capped to `reactMaxHeadersLength`. Empty/undefined when React
    * emitted no preload headers (or emission was disabled with `0`).
    */
   linkHeader?: string;
+};
+
+/** A stored PPR shell a request resumes. */
+export type AppPagePprShellResume = {
+  /** The shell's document up to its holes, for this request. */
+  prelude: string;
+  /** React's postponed state, or null when only the payload has holes. */
+  postponed: unknown;
+  /** The `Link` header the shell's render sent. */
+  linkHeader?: string;
+  /**
+   * The query of the browser's URL, before any rewrite. The shell's head has
+   * the browser read the query from its own URL, so, like Next.js, the holes'
+   * `useSearchParams()` reads that query too. It's null when a Workers Cache
+   * dispatch dropped the query, which the deploy manifest's static
+   * classification allows, so the holes leave it to the browser, as the path's
+   * static render does.
+   */
+  browserSearch: string | null;
 };
 
 export function isAppSsrRenderResult(value: unknown): value is AppSsrRenderResult {
@@ -149,10 +174,19 @@ export type AppPageSsrHandler = {
       capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
       /** Abort signal for a build-time PPR fallback-shell static render. */
       pprFallbackShellSignal?: AbortSignal;
+      /** Whether the fallback shell's payload left holes. */
+      isPprFallbackShellPartial?: () => boolean;
+      /** A stored shell this render resumes. */
+      pprShellResume?: AppPagePprShellResume;
       /** Aborts a streaming render whose document is given up. */
       signal?: AbortSignal;
       /** Route whose client references load before the render; null for none. */
       preloadRoutePattern?: string | null;
+      /**
+       * A boundary's document, which replaces some of the route's files: link
+       * only the stylesheets of the client references it renders.
+       */
+      isBoundaryRender?: boolean;
       /** When true, wait for the full React tree before emitting bytes. */
       waitForAllReady?: boolean;
       /** Render is producing a static/prerendered HTML artifact. */
@@ -215,11 +249,21 @@ type RenderAppPageHtmlStreamOptions = {
   capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
   /** Abort signal for a build-time PPR fallback-shell static render. */
   pprFallbackShellSignal?: AbortSignal;
+  /** Whether the fallback shell's payload left holes. */
+  isPprFallbackShellPartial?: () => boolean;
+  /** A stored shell this render resumes. */
+  pprShellResume?: AppPagePprShellResume;
   /**
    * Route whose client references load before the render, or null for a
    * render without a route. Undefined loads every client reference.
    */
   preloadRoutePattern?: string | null;
+  /**
+   * A boundary's document (not-found, forbidden, unauthorized or error), which
+   * replaces the page and the layouts below the boundary: link only the
+   * stylesheets of the client references it renders, not the route's.
+   */
+  isBoundaryRender?: boolean;
   /** When true, wait for the full React tree before emitting bytes. */
   waitForAllReady?: boolean;
   /** Render is producing a static/prerendered HTML artifact. */
@@ -261,6 +305,7 @@ type AppPageHtmlStreamRecoveryResult = {
   shellErrorRecovered: boolean;
   /** React-emitted preload `Link` header (already capped). */
   linkHeader?: string;
+  pprShellPrelude?: { postponed: unknown };
 };
 
 type RenderAppPageHtmlStreamWithRecoveryOptions<TSpecialError> = {
@@ -300,6 +345,8 @@ type AppPageRscErrorTracker = {
    * loses server-side markers such as generateMetadata()'s.
    */
   getCapturedSpecialErrors: (error: unknown) => readonly unknown[];
+  /** Every special error the RSC render threw, in the order it threw them. */
+  getAllCapturedSpecialErrors: () => readonly unknown[];
   isCapturedError: (error: unknown) => boolean;
   onRenderError: (error: unknown, requestInfo: unknown, errorContext: unknown) => unknown;
 };
@@ -337,7 +384,10 @@ export async function renderAppPageHtmlStream(
     sideStream: options.sideStream,
     capturedRscDataRef: options.capturedRscDataRef,
     pprFallbackShellSignal: options.pprFallbackShellSignal,
+    isPprFallbackShellPartial: options.isPprFallbackShellPartial,
+    pprShellResume: options.pprShellResume,
     preloadRoutePattern: options.preloadRoutePattern,
+    isBoundaryRender: options.isBoundaryRender,
     waitForAllReady: options.waitForAllReady,
     isStaticGeneration: options.isStaticGeneration,
     isForceStatic: options.isForceStatic,
@@ -369,6 +419,37 @@ export async function renderAppPageHtmlResponse(
   return buildAppPageHtmlDocumentResponse(htmlStream, { ...options, reactLinkHeader });
 }
 
+/**
+ * Runs `clearRequestContext` once the HTTP layer has read the document to the
+ * end, or the document errors or is cancelled. `beforeClear` runs first, in
+ * each of those cases.
+ *
+ * A cancelled document keeps its request context when it runs in a unified
+ * request scope. The RSC render isn't stopped by the cancel, so Server
+ * Components that resume afterwards still call `cookies()` and `headers()`.
+ * That scope is a context object of its own for this request, so nothing else
+ * reads what is kept. Outside one, the state is module-level and is cleared.
+ */
+export function deferAppPageRequestContextCleanup(
+  htmlStream: ReadableStream<Uint8Array>,
+  clearRequestContext: () => void,
+  beforeClear?: () => void,
+): ReadableStream<Uint8Array> {
+  let cancelled = false;
+  return deferUntilStreamConsumed(
+    htmlStream,
+    () => {
+      beforeClear?.();
+      if (cancelled && isInsideUnifiedScope()) return;
+      clearRequestContext();
+    },
+    undefined,
+    () => {
+      cancelled = true;
+    },
+  );
+}
+
 export function buildAppPageHtmlDocumentResponse(
   htmlStream: ReadableStream<Uint8Array>,
   options: {
@@ -385,9 +466,9 @@ export function buildAppPageHtmlDocumentResponse(
   // layer. Calling it synchronously here would race the lazy RSC/SSR pipeline:
   // components execute while the stream is being pulled, not when the handle
   // is first returned. See: https://github.com/cloudflare/vinext/issues/660
-  const safeStream = deferUntilStreamConsumed(htmlStream, () => {
-    options.clearRequestContext();
-  });
+  const safeStream = deferAppPageRequestContextCleanup(htmlStream, () =>
+    options.clearRequestContext(),
+  );
 
   const headers = new Headers({
     "Content-Type": "text/html; charset=utf-8",
@@ -427,6 +508,7 @@ export async function renderAppPageHtmlStreamWithRecovery<TSpecialError>(
       linkHeader,
       shellErrorRecovered,
       caughtShellError,
+      pprShellPrelude,
     } = normalizeAppSsrRenderResult(rawResult);
     options.onShellRendered?.();
     const caughtSpecialError =
@@ -452,6 +534,7 @@ export async function renderAppPageHtmlStreamWithRecovery<TSpecialError>(
       capturedRscData,
       shellErrorRecovered: shellErrorRecovered === true,
       linkHeader,
+      ...(pprShellPrelude ? { pprShellPrelude } : {}),
     };
   } catch (error) {
     const specialError = options.resolveSpecialError(error);
@@ -501,6 +584,9 @@ export function createAppPageRscErrorTracker(
     getCapturedSpecialErrors(error) {
       const digest = getNextErrorDigest(error);
       return (digest !== null && specialErrorsByDigest.get(digest)) || [];
+    },
+    getAllCapturedSpecialErrors() {
+      return [...specialErrorsByDigest.values()].flat();
     },
     isCapturedError(error) {
       if (capturedErrors.has(error)) return true;

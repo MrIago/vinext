@@ -60,8 +60,11 @@ const clientBuildFiles: ReadonlySet<string> = new Set(__clientBuildFiles);
 const assetPathPrefix = assetPrefixPathname(__assetPrefix);
 
 // An image source is served only as a public file, so it never renders a page.
-const rejectResponseStage: DispatchAppWorkerResponseStage = () =>
-  Promise.resolve(new Response(null, { status: 404 }));
+// It answers with the status the render would start from, which the image
+// endpoint keeps like Next.js' fetchInternalImage: a page is no image, and a
+// missing route is a 404.
+const rejectResponseStage: DispatchAppWorkerResponseStage = (_request, props) =>
+  Promise.resolve(new Response(null, { status: props.kind === "app-not-found" ? 404 : 200 }));
 
 export function handleRequestStage(
   request: Request,

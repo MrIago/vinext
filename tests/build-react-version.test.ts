@@ -34,7 +34,8 @@ function createAppWithReact(
   {
     declareRsdw = true,
     installRsdw = declareRsdw,
-  }: { declareRsdw?: boolean; installRsdw?: boolean } = {},
+    router = "app",
+  }: { declareRsdw?: boolean; installRsdw?: boolean; router?: "app" | "pages" } = {},
 ): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-build-react-version-"));
   fs.writeFileSync(
@@ -47,15 +48,23 @@ function createAppWithReact(
       ...(declareRsdw && { dependencies: { "react-server-dom-webpack": "^19.3.1" } }),
     }),
   );
-  fs.mkdirSync(path.join(root, "app"));
-  fs.writeFileSync(
-    path.join(root, "app", "layout.tsx"),
-    `export default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }`,
-  );
-  fs.writeFileSync(
-    path.join(root, "app", "page.tsx"),
-    `export default function Home() { return <h1>Home</h1>; }`,
-  );
+  if (router === "pages") {
+    fs.mkdirSync(path.join(root, "pages"));
+    fs.writeFileSync(
+      path.join(root, "pages", "index.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+  } else {
+    fs.mkdirSync(path.join(root, "app"));
+    fs.writeFileSync(
+      path.join(root, "app", "layout.tsx"),
+      `export default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }`,
+    );
+    fs.writeFileSync(
+      path.join(root, "app", "page.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+  }
   // Link every repo dependency except React, which is replaced by a stub at
   // the requested version.
   const nodeModules = path.join(root, "node_modules");
@@ -114,6 +123,15 @@ describe("vinext build React version check", () => {
     expect(
       fs.readFileSync(path.join(root, "node_modules", "react", "package.json"), "utf-8"),
     ).toContain('"version":"19.2.7"');
+  });
+
+  it("fails with the install command for a Pages Router app on old React", async () => {
+    root = createAppWithReact("19.1.5", { declareRsdw: false, router: "pages" });
+
+    await expect(createAppBuilder(root)).rejects.toThrow(
+      "vinext: requires react and react-dom 19.3.1 or later.\n" +
+        "Run: npm install react@latest react-dom@latest",
+    );
   });
 
   it("accepts React at the floor", async () => {

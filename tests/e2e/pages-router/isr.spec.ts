@@ -24,7 +24,7 @@ test.describe("Pages Router getStaticProps in development", () => {
     for (const response of [first, second]) {
       expect(response.headers()["x-nextjs-cache"]).toBe("HIT");
       expect(response.headers()["x-vinext-cache"]).toBeUndefined();
-      expect(response.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+      expect(response.headers()["cache-control"]).toBe("no-store");
     }
   });
 
@@ -52,7 +52,7 @@ for (const scenario of ["short-browser", "long-browser", "no-store", "gssp"]) {
   test(`development browser cache policy: ${scenario}`, async ({ baseURL, request }) => {
     const response = await request.get(`${baseURL}/storage-policy/${scenario}`);
     expect(response.status()).toBe(200);
-    expect(response.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+    expect(response.headers()["cache-control"]).toBe("no-store");
     const html = await response.text();
     const data = JSON.parse(
       html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/)![1],
@@ -62,7 +62,7 @@ for (const scenario of ["short-browser", "long-browser", "no-store", "gssp"]) {
       for (const method of ["GET", "HEAD"]) {
         const result = await request.fetch(url, { method });
         expect(result.status()).toBe(200);
-        expect(result.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+        expect(result.headers()["cache-control"]).toBe("no-store");
       }
     }
   });

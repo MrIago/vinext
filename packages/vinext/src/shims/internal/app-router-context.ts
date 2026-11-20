@@ -10,6 +10,8 @@ import * as React from "react";
 
 export type NavigateOptions = {
   scroll?: boolean;
+  /** View Transition types for the navigation (see `addNavigationTransitionTypes`). */
+  transitionTypes?: string[];
 };
 
 export type PrefetchOptions = {
@@ -30,6 +32,22 @@ export type AppRouterInstance = {
    * Only available when experimental.gestureTransition is enabled.
    */
   experimental_gesturePush?(href: string, options?: NavigateOptions): void;
+  /**
+   * Start a navigation without committing it: its full dynamic request is
+   * sent now, and `push`/`replace` on the result commits the navigation,
+   * reusing that data. Only available when experimental.prepareNavigation is
+   * enabled (vercel/next.js#101050).
+   */
+  experimental_prepare?(href: string): PreparedNavigation;
+};
+
+/**
+ * A navigation started by `router.experimental_prepare()`. A prepared
+ * navigation can only be committed once; later calls have no effect.
+ */
+export type PreparedNavigation = {
+  push(options?: NavigateOptions): void;
+  replace(options?: NavigateOptions): void;
 };
 
 const APP_ROUTER_CONTEXT_KEY = Symbol.for("vinext.appRouterContext");

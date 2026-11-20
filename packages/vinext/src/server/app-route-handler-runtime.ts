@@ -325,11 +325,14 @@ export function createTrackedAppRouteRequest(
   ): void => {
     // A cached function's key does not cover the request it closes over, so
     // the reads Next.js's trackDynamic() tracks are rejected inside
-    // unstable_cache() and "use cache" like cookies()/headers() are. Next.js
-    // hands `force-dynamic` handlers the unproxied request, so that mode
-    // never rejects them. Ported from
+    // unstable_cache() and "use cache" like cookies()/headers() are, and
+    // also inside "use cache: private", which may read cookies()/headers().
+    // Next.js hands `force-dynamic` handlers the unproxied request, so that
+    // mode never rejects them. Ported from
     // packages/next/src/server/route-modules/app-route/module.ts.
-    if (trackedByNext && requestMode !== "force-dynamic") throwIfInsideCacheScope(access);
+    if (trackedByNext && requestMode !== "force-dynamic") {
+      throwIfInsideCacheScope(access, { rejectInPrivateUseCache: true });
+    }
     didAccessDynamicRequest = true;
     options.onDynamicAccess?.(access);
   };

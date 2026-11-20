@@ -6,8 +6,9 @@ const BASE = "http://localhost:4190";
 const imagePath = (source: string) =>
   `${BASE}/docs/_next/image/?url=${encodeURIComponent(source)}&w=64&q=75`;
 
-// Next.js answers a local source that yields no image with this 400.
-const INVALID_IMAGE = "The requested resource isn't a valid image.";
+// Next.js keeps the status the application answered a source with, 500 in
+// place of a redirect (fetchInternalImage, https://github.com/vercel/next.js/pull/97957).
+const INVALID_INTERNAL = '"url" parameter is valid but internal response is invalid';
 
 // Next.js' filesystem lookup returns no item for a path outside basePath
 // (getItem in packages/next/src/server/lib/router-utils/filesystem.ts), so
@@ -41,15 +42,15 @@ test.describe("public files outside basePath", () => {
     expect(admitted.status()).toBe(200);
     expect(admitted.headers()["content-type"]).toBe("image/png");
 
-    for (const source of [
-      "/pixel.png",
-      "/private/photo.png",
+    for (const [source, status] of [
+      ["/pixel.png", 404],
+      ["/private/photo.png", 404],
       // Middleware denies this source under basePath.
-      "/docs/private/photo.png",
-    ]) {
+      ["/docs/private/photo.png", 403],
+    ] as const) {
       const image = await request.get(imagePath(source), { maxRedirects: 0 });
-      expect(image.status(), source).toBe(400);
-      expect(await image.text(), source).toBe(INVALID_IMAGE);
+      expect(image.status(), source).toBe(status);
+      expect(await image.text(), source).toBe(INVALID_INTERNAL);
       expect(image.headers()["content-type"] ?? "", source).not.toContain("image/");
     }
   });

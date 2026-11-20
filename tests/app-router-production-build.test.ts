@@ -63,11 +63,11 @@ function clientChunkFileByName(clientDir: string, match: (name: string) => boole
   return clientChunks(clientDir).find((chunk) => match(chunk.name))?.file;
 }
 
-function readAllJs(dir: string): string {
+function readAllJs(dir: string, skipDirs: readonly string[] = []): string {
   let out = "";
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) out += readAllJs(full);
+    if (entry.isDirectory()) out += skipDirs.includes(entry.name) ? "" : readAllJs(full);
     else if (entry.name.endsWith(".js")) out += fs.readFileSync(full, "utf-8");
   }
   return out;
@@ -157,6 +157,13 @@ describe("App Router Production build", () => {
       expect(clientJs).not.toContain(devOnlyNeedle);
     }
 
+    // A "use cache" module that a Client Component imports reaches the
+    // browser as server references, `.mts` modules included: neither its
+    // function bodies nor its module-scope values are bundled.
+    expect(clientJs).toContain("call-client-imported-mts-cache");
+    expect(clientJs).not.toContain("mts-cache-server-marker");
+    expect(clientJs).not.toContain("client-mts-cache:");
+
     // Ported from the client-reference chunk ownership covered by Next.js:
     // test/e2e/app-dir/client-reference-chunking/client-reference-chunking.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/client-reference-chunking/client-reference-chunking.test.ts
@@ -239,6 +246,16 @@ describe("App Router Production build", () => {
     expect(ssrJs).toMatch(/from\s*["'`]react-dom\/server["'`]/);
     expect(ssrJs).not.toContain("react-dom/server.edge");
     expect(ssrJs).not.toContain("react-dom/static.edge");
+    // The Flight server is its Node build too, so both schedule their work the
+    // same way (#4770), and plugin-rsc's runtime shares it instead of bundling
+    // the edge build beside it.
+    // Every build of the Flight server exports decodeReplyFromAsyncIterable,
+    // and only the Node build exports decodeReplyFromBusboy.
+    const rscJs = readAllJs(path.join(outDir, "server"), ["ssr"]);
+    const flightExports = rscJs.match(/\.decodeReplyFromAsyncIterable\s*=/g)?.length ?? 0;
+    const nodeFlightExports = rscJs.match(/\.decodeReplyFromBusboy\s*=/g)?.length ?? 0;
+    expect(nodeFlightExports).toBeGreaterThan(0);
+    expect(flightExports).toBe(nodeFlightExports);
 
     // Asset manifest should be generated
     expect(fs.existsSync(path.join(outDir, "server", "__vite_rsc_assets_manifest.js"))).toBe(true);
@@ -1346,7 +1363,9 @@ export function GET(request) {
       const externals = JSON.parse(
         fs.readFileSync(path.join(tmpDir, "dist", "server", "vinext-externals.json"), "utf-8"),
       ) as string[];
-      expect(externals).toContain("typescript");
+      expect(externals).toEqual(
+        expect.arrayContaining(["typescript/unstable/sync", "typescript/unstable/fs"]),
+      );
 
       const built: { default?: unknown } = await import(
         `${pathToFileURL(path.join(tmpDir, "dist", "server", "index.js")).href}?t=${Date.now()}`
@@ -1401,6 +1420,88 @@ export function GET(request) {
       await expect(builder.buildApp()).rejects.toThrow(
         'The file "./proxy.ts" must export a function, either as a default export or as a named "proxy" export.',
       );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  // Ported from Next.js:
+  // test/production/app-dir/use-cache-generate-static-params-server-action/use-cache-generate-static-params-server-action.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/production/app-dir/use-cache-generate-static-params-server-action/use-cache-generate-static-params-server-action.test.ts
+  // A Server Action returned from "use cache" must stay callable on the
+  // server, in generateStaticParams() during the prerender and in a render.
+  it('can call a server action returned from "use cache" during generateStaticParams', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-use-cache-gsp-action-"));
+
+    try {
+      fs.writeFileSync(path.join(tmpDir, "package.json"), `{"type":"module"}`);
+      fs.symlinkSync(
+        path.resolve(import.meta.dirname, "../node_modules"),
+        path.join(tmpDir, "node_modules"),
+        "junction",
+      );
+      const pageDir = path.join(tmpDir, "app", "(group)", "static-params", "[slug]");
+      fs.mkdirSync(pageDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "layout.tsx"),
+        `export default function Root({ children }: { children: React.ReactNode }) {
+  return <html><body>{children}</body></html>;
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(pageDir, "actions.ts"),
+        `"use server";
+
+export async function getSlug() {
+  return "known";
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(pageDir, "page.tsx"),
+        `import { getSlug } from "./actions";
+
+async function getCachedAction() {
+  "use cache";
+  return getSlug;
+}
+
+export async function generateStaticParams() {
+  const action = await getCachedAction();
+  return [{ slug: await action() }];
+}
+
+export default async function Page({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  return <p>{slug}</p>;
+}
+`,
+      );
+
+      const builder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+
+      const result = await runPrerender({ root: tmpDir, concurrency: 1 });
+      expect(result?.routes).toContainEqual(
+        expect.objectContaining({ path: "/static-params/known", status: "rendered" }),
+      );
+
+      const built: { default?: unknown } = await import(
+        `${pathToFileURL(path.join(tmpDir, "dist", "server", "index.js")).href}?t=${Date.now()}`
+      );
+      expect(isBuiltAppHandler(built.default)).toBe(true);
+      if (!isBuiltAppHandler(built.default)) return;
+      const response = await built.default(new Request("http://localhost/static-params/known"));
+      expect(response).toBeInstanceOf(Response);
+      if (!(response instanceof Response)) return;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("<p>known</p>");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -1785,16 +1886,27 @@ describe("use cache production argument isolation", () => {
     );
   }
 
-  // Like Next.js (use-cache-wrapper.ts, `encodeFormData`), only a File's bytes
-  // are keyed, so a File differing only in metadata reuses the entry.
+  // Like Next.js (use-cache-wrapper.ts, `encodeFormData`), a File's name and
+  // MIME type are keyed with its bytes, since the cached function observes them.
   it.each([
     ["filename", { name: "public.txt" }],
-    ["timestamp", { time: "333" }],
     ["mime", { type: "application/pdf" }],
-  ] as const)("reuses the entry for a File differing only in %s", async (label, change) => {
+  ] as const)("serves a File differing only in %s its own entry", async (label, change) => {
     const base = { kind: "file", partition: `metadata-${label}` };
     const first = await request(base);
-    expect(await request({ ...base, ...change })).toEqual(first);
+    const second = await request({ ...base, ...change });
+    expect(second.value).not.toEqual(first.value);
+    expect(second.execution).not.toBe(first.execution);
+    expect(await request(base)).toEqual(first);
+    expect(await request({ ...base, ...change })).toEqual(second);
+  });
+
+  // lastModified defaults to the construction time and does not survive a
+  // multipart submission, so Next.js leaves it out of the key.
+  it("reuses the entry for a File differing only in timestamp", async () => {
+    const base = { kind: "file", partition: "metadata-timestamp" };
+    const first = await request(base);
+    expect(await request({ ...base, time: "333" })).toEqual(first);
   });
 
   it("separates equal-size file contents with identical metadata", async () => {

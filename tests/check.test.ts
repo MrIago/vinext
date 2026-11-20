@@ -376,10 +376,7 @@ describe("analyzeConfig", () => {
     const items = analyzeConfig(tmpDir);
     expect(items.find((i) => i.name === "basePath")?.status).toBe("supported");
     expect(items.find((i) => i.name === "trailingSlash")?.status).toBe("supported");
-    // reactStrictMode is enforced for the Pages Router (client root wrapped in
-    // `<React.StrictMode>` when `true`) but the App Router is not yet wrapped,
-    // so the status is `partial`. See `packages/vinext/src/check.ts`.
-    expect(items.find((i) => i.name === "reactStrictMode")?.status).toBe("partial");
+    expect(items.find((i) => i.name === "reactStrictMode")?.status).toBe("supported");
   });
 
   it("detects partially supported webpack config", () => {
@@ -945,7 +942,7 @@ describe("analyzeConfig", () => {
     expect(status("reactCompiler")).toBe("partial");
     expect(status("experimental.reactCompiler")).toBe("partial");
     expect(status("modularizeImports")).toBe("partial");
-    expect(status("typedRoutes")).toBe("partial");
+    expect(status("typedRoutes")).toBe("supported");
     expect(status("compiler.styledComponents")).toBe("partial");
     expect(status("compiler.emotion")).toBe("partial");
     // A parent object without its own entry is not reported.
@@ -1034,6 +1031,38 @@ describe("checkLibraries", () => {
 
     const items = checkLibraries(tmpDir);
     expect(items).toHaveLength(0);
+  });
+
+  it("flags an installed React below the supported minimum", () => {
+    writeFile("package.json", JSON.stringify({ dependencies: { react: "19.1.5" } }));
+    writeFile(
+      "node_modules/react/package.json",
+      JSON.stringify({ name: "react", version: "19.1.5", main: "index.js" }),
+    );
+    writeFile("node_modules/react/index.js", "module.exports = {};");
+    writeFile(
+      "node_modules/react-dom/package.json",
+      JSON.stringify({ name: "react-dom", version: "19.1.5", main: "index.js" }),
+    );
+    writeFile("node_modules/react-dom/index.js", "module.exports = {};");
+
+    const items = checkLibraries(tmpDir);
+    const react = items.find((i) => i.name === "react");
+    expect(react?.status).toBe("unsupported");
+    expect(react?.detail).toContain("react 19.1.5");
+    expect(react?.detail).toContain("react-dom 19.1.5");
+    expect(react?.detail).toContain("19.3.1");
+  });
+
+  it("does not flag an installed React at the supported minimum", () => {
+    writeFile("package.json", JSON.stringify({ dependencies: { react: "19.3.1" } }));
+    writeFile(
+      "node_modules/react/package.json",
+      JSON.stringify({ name: "react", version: "19.3.1", main: "index.js" }),
+    );
+    writeFile("node_modules/react/index.js", "module.exports = {};");
+
+    expect(checkLibraries(tmpDir).find((i) => i.name === "react")).toBeUndefined();
   });
 
   it("detects supported libraries", () => {
@@ -1652,8 +1681,8 @@ describe("checkConventions", () => {
     const items = checkConventions(tmpDir);
     const vt = items.find((i) => i.name.includes("ViewTransition"));
     expect(vt).toBeDefined();
-    expect(vt?.status).toBe("partial");
-    expect(vt?.detail).toContain("passthrough fallback");
+    expect(vt?.status).toBe("supported");
+    expect(vt?.detail).toContain("React 19.3");
     expect(vt?.files).toHaveLength(1);
   });
 

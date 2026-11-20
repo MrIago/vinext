@@ -260,6 +260,37 @@ function backportImageComponent(source) {
   return source.replace(legacyImport, fixedImport).replace(legacyImage, fixedImage);
 }
 
+// Next.js 16.3 added the Partial Prefetching stages to `<Link prefetch>` and
+// `router.prefetch(href, { kind })` (vercel/next.js#94510), which vinext
+// implements. Backport the canary unions until the pinned Next.js ships them:
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/client/app-dir/link.tsx
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/app-router-context.shared-runtime.ts
+// `kind` still takes the vendored PrefetchKind enum, which user code may pass.
+// Each rewrite is a no-op once the pinned Next.js already ships it.
+function backportLinkPrefetchStages(source) {
+  const fixed = "prefetch?: boolean | 'auto' | 'shell' | 'prefetch' | 'navigation' | null;";
+  if (source.includes(fixed)) return source;
+  const legacy = "prefetch?: boolean | 'auto' | null;";
+  if (!source.includes(legacy)) {
+    throw new Error("Unrecognized Link prefetch declaration in link.d.ts");
+  }
+  return source.replace(legacy, fixed);
+}
+
+function backportPrefetchOptionsKind(source) {
+  if (/\bkind\?: [^;]*'navigation'/.test(source)) return source;
+  const legacy = "    kind: PrefetchKind;";
+  if (!source.includes(legacy)) {
+    throw new Error(
+      "Unrecognized PrefetchOptions declaration in app-router-context.shared-runtime.d.ts",
+    );
+  }
+  return source.replace(
+    legacy,
+    "    kind?: PrefetchKind | 'auto' | 'full' | 'shell' | 'prefetch' | 'navigation';",
+  );
+}
+
 function renderVendoredFiles() {
   const files = new Map();
   for (const absolutePath of collectDeclarationClosure()) {
@@ -285,6 +316,12 @@ function renderVendoredFiles() {
     }
     if (relativePath === "dist/client/image-component.d.ts") {
       rewritten = backportImageComponent(rewritten);
+    }
+    if (relativePath === "dist/client/link.d.ts") {
+      rewritten = backportLinkPrefetchStages(rewritten);
+    }
+    if (relativePath === "dist/shared/lib/app-router-context.shared-runtime.d.ts") {
+      rewritten = backportPrefetchOptionsKind(rewritten);
     }
     if (
       relativePath === "dist/styled-jsx/types/css.d.ts" ||

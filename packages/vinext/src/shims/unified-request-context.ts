@@ -60,6 +60,10 @@ export type UnifiedRequestContext = {
   // oxlint-disable-next-line @typescript-eslint/no-explicit-any
   requestCache: WeakMap<(...args: any[]) => any, unknown>;
 
+  // ── server/app-page-route-head-ref.ts ─────────────────────────────
+  /** The page heads this request's route trees render, by the id in their props. */
+  appPageRouteHeads: Map<string, () => unknown>;
+
   // ── next/server after() ───────────────────────────────────────────
   /** Shared lifecycle state for work deferred until the response closes. */
   afterContext: AfterRequestContext;
@@ -88,6 +92,12 @@ export type AfterRequestContext = {
   pendingPromises: number;
   completion: Promise<void> | null;
   resolveCompletion: (() => void) | null;
+  /** Where promise-form `after()` work goes instead of the request's `waitUntil`. */
+  waitUntil?: (promise: Promise<unknown>) => void;
+  /** Reports a failed `after()` task, besides logging it. */
+  onTaskError?: (error: unknown) => void;
+  /** Discards `after()` callbacks registered from now on. */
+  cancelled?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +149,8 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     serverContext: null,
     serverInsertedHTMLCallbacks: [],
     requestScopedCacheLife: null,
+    resumeDataCacheCollector: null,
+    resumeDataCacheSeed: null,
     unstableCacheRevalidation: "foreground",
     _privateCache: null,
     currentRequestTags: [],
@@ -148,13 +160,13 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     currentForceDynamicFetchDefault: false,
     isDraftMode: false,
     dynamicFetchUrls: new Set<string>(),
-    refreshStaleFetchesInForeground: false,
     isFetchDedupeActive: false,
     currentFetchDedupeEntries: new Map(),
     nextFetchId: 1,
     executionContext: _getInheritedExecutionContext(), // inherits from standalone ALS if present
     requestSignal: null,
     requestCache: new WeakMap(),
+    appPageRouteHeads: new Map(),
     draftModeAtHeadersClear: false,
     afterContext: {
       callbacks: [],
@@ -209,6 +221,7 @@ function startAfterCallback(ctx: UnifiedRequestContext, callback: () => unknown)
     .then(callback)
     .catch((error) => {
       console.error("[vinext] after() task failed:", error);
+      state.onTaskError?.(error);
     })
     .finally(() => {
       state.pendingCallbacks -= 1;
@@ -218,6 +231,7 @@ function startAfterCallback(ctx: UnifiedRequestContext, callback: () => unknown)
 
 /** Queue a callback until response close, or start it immediately once closed. */
 export function queueAfterCallback(ctx: UnifiedRequestContext, callback: () => unknown): void {
+  if (ctx.afterContext.cancelled) return;
   ensureAfterCompletion(ctx);
   if (ctx.afterContext.responseClosed) {
     startAfterCallback(ctx, callback);
@@ -397,7 +411,7 @@ export function runWithUnifiedStateMutation<T>(
   // pendingCdnTagInvalidations), Set
   // fields (renderRequestApiUsage, pendingRevalidatedTags, pendingRevalidations,
   // dynamicFetchUrls),
-  // Map fields (_privateCache),
+  // Map fields (_privateCache, appPageRouteHeads),
   // requestCache WeakMap, and object fields (headersContext,
   // i18nContext, serverContext, ssrContext, executionContext,
   // requestScopedCacheLife, renderDynamicLatch) still share references with

@@ -33,7 +33,7 @@ export const MINIMUM_REACT_VERSION: [number, number, number] = [19, 3, 1];
 
 export function getReactUpgradeDeps(
   root: string,
-  options: { fromManifest?: boolean; installing?: boolean } = {},
+  options: { fromManifest?: boolean; installing?: boolean; includeRsdw?: boolean } = {},
 ): string[] {
   if (options.fromManifest) {
     // Config-only init may have no node_modules. Compare the declared lower
@@ -67,11 +67,13 @@ export function getReactUpgradeDeps(
   }
   return getDependencyUpgradeDeps(root, {
     // An installed RSDW below the floor moves with React: RSDW pins its React
-    // peer to its own version.
-    "react-server-dom-webpack": {
-      minimumVersion: MINIMUM_REACT_VERSION,
-      upgrades: ["react@latest", "react-dom@latest", "react-server-dom-webpack@latest"],
-    },
+    // peer to its own version. Only the App Router loads RSDW.
+    ...(options.includeRsdw !== false && {
+      "react-server-dom-webpack": {
+        minimumVersion: MINIMUM_REACT_VERSION,
+        upgrades: ["react@latest", "react-dom@latest", "react-server-dom-webpack@latest"],
+      },
+    }),
     react: {
       minimumVersion: MINIMUM_REACT_VERSION,
       upgrades: ["react@latest", "react-dom@latest"],
@@ -87,9 +89,12 @@ export function reactUpgradeRequiredMessage(
   installCommand: string,
   upgrades: string[],
   pluginRscVersion?: string,
+  appRouter = true,
 ): string {
   return (
-    `vinext: App Router requires react, react-dom, and react-server-dom-webpack ${MINIMUM_REACT_VERSION.join(".")} or later.\n` +
+    (appRouter
+      ? `vinext: App Router requires react, react-dom, and react-server-dom-webpack ${MINIMUM_REACT_VERSION.join(".")} or later.\n`
+      : `vinext: requires react and react-dom ${MINIMUM_REACT_VERSION.join(".")} or later.\n`) +
     (pluginRscVersion
       ? `@vitejs/plugin-rsc ${pluginRscVersion} bundles an older react-server-dom-webpack, so install the latest in your app.\n`
       : "") +

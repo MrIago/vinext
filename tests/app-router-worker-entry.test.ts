@@ -166,6 +166,9 @@ export function registerConfiguredCacheAdapters(env) {
   };
 }
 
+// Each server below loads modules once and never reacts to file changes, so
+// it runs without a watcher. Its root is the repo, and a watcher would crawl
+// every nested checkout (worktrees included) for no benefit.
 describe("App Router Production server worker entry compatibility", () => {
   it("loads the configured data adapter only when request-stage middleware uses it", async () => {
     const globals = globalThis as unknown as Record<PropertyKey, unknown>;
@@ -193,7 +196,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -243,7 +246,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -319,7 +322,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -412,7 +415,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -524,7 +527,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -594,7 +597,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(
@@ -622,8 +625,8 @@ describe("App Router Production server worker entry compatibility", () => {
         );
 
       const denied = await requestImage("/members.png");
-      expect(denied.status).toBe(400);
-      expect(await denied.text()).toBe("The requested resource isn't a valid image.");
+      expect(denied.status).toBe(403);
+      expect(await denied.text()).toBe('"url" parameter is valid but internal response is invalid');
       expect(sourceRequests).toHaveLength(1);
       expect(sourceRequests[0].method).toBe("GET");
       expect(sourceRequests[0].headers.has("cookie")).toBe(false);
@@ -692,7 +695,7 @@ describe("App Router Production server worker entry compatibility", () => {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(import.meta.dirname, "../packages/vinext/src/server/app-router-entry.ts"),
@@ -972,7 +975,7 @@ export default {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const entry = (await server.ssrLoadModule(
         path.resolve(import.meta.dirname, "../packages/vinext/src/server/app-router-entry.ts"),
@@ -1002,19 +1005,22 @@ export default {
 
       const image = await get("/open.png");
       expect(image.status).toBe(200);
-      // Format negotiation reads the request headers after middleware.
-      expect(image.headers.get("content-type")).toBe("image/avif");
+      // Format negotiation reads the request headers after middleware, whose
+      // Accept names no default images.formats entry, so the PNG stays PNG.
+      expect(image.headers.get("content-type")).toBe("image/png");
       expect(fetchedAssetHeaders).toEqual(["1"]);
       expect(image.headers.get("x-mw")).toBe("1");
       expect(image.headers.getSetCookie()).toEqual(["mw=1"]);
       await expect(image.text()).resolves.toBe("/open.png");
 
       const denied = await get("/protected/private.png");
-      expect(denied.status).toBe(400);
+      expect(denied.status).toBe(403);
       expect(denied.headers.get("x-mw")).toBe("1");
       // Only an image replaces the Content-Type middleware or config set.
       expect(denied.headers.get("content-type")).toBe("text/plain");
-      await expect(denied.text()).resolves.toBe("The requested resource isn't a valid image.");
+      await expect(denied.text()).resolves.toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
       expect(fetchedAssets).toEqual(["/open.png"]);
     } finally {
       setImageOptimizer(null);
@@ -1042,7 +1048,7 @@ export default {
             "vinext/shims": path.resolve(import.meta.dirname, "../packages/vinext/src/shims"),
           },
         },
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, watch: null },
       });
       const workerEntry = (await server.ssrLoadModule(
         path.resolve(import.meta.dirname, entryPaths[0]),

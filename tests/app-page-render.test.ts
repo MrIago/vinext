@@ -3049,7 +3049,9 @@ describe("ISR storage of a page's special error", () => {
     await expect(response.text()).resolves.toBe("page:404");
   });
 
-  it("doesn't mark a special error from a speculative prerender", async () => {
+  // As Next.js's build does, a route without segment config writes its
+  // special error too.
+  it("marks a special error from a speculative prerender", async () => {
     const common = createCommonOptions();
 
     const { markers, response } = await recordPrerenderSpecialErrors(() =>
@@ -3064,7 +3066,7 @@ describe("ISR storage of a page's special error", () => {
     );
 
     expect(response.status).toBe(404);
-    expect(markers).toEqual([]);
+    expect(markers).toEqual([{ headers: {}, status: 404 }]);
     await response.text();
   });
 
@@ -3607,7 +3609,9 @@ describe("ISR storage of a page's special error", () => {
       });
     });
 
-    it("stores a special error a Suspense boundary caught as a 200", async () => {
+    // Like Next.js's ISR, the entry keeps the status of a special error a
+    // Suspense boundary caught (vercel/next.js#99078).
+    it("stores the status of a special error a Suspense boundary caught", async () => {
       let cancelled = false;
       const { common, response } = await renderRscMiss({
         flightError: notFoundError,
@@ -3623,7 +3627,7 @@ describe("ISR storage of a page's special error", () => {
       await Promise.all(common.waitUntilPromises);
       expect(cancelled).toBe(true);
       expect(readStoredEntries(common.isrSet)).toEqual({
-        "rsc:/posts/post": { html: "", policy, rsc: "page-flight-with-digest", status: 200 },
+        "rsc:/posts/post": { html: "", policy, rsc: "page-flight-with-digest", status: 404 },
       });
     });
 
@@ -4045,7 +4049,10 @@ describe("outgoing RSC payload metadata", () => {
       return response.headers.get("cache-control");
     };
 
-    expect(await render({ "page:/test": "test-page" })).toContain("s-maxage=60");
+    // These renders run as development, where every whole payload is
+    // `no-store` (#2995, vercel/next.js#97505). The partial payload still
+    // takes the uncacheable path, which sends its own header.
+    expect(await render({ "page:/test": "test-page" })).toBe("no-store");
     expect(
       await render({
         [APP_SKIPPED_LAYOUT_IDS_KEY]: ["layout:/"],

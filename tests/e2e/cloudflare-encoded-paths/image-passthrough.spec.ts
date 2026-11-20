@@ -26,7 +26,8 @@ test.describe("/_next/image without an image optimizer", () => {
     const response = await request.get("/_next/image?url=%2Fmissing.png&w=64&q=75", {
       maxRedirects: 0,
     });
-    expect(response.status()).toBe(400);
-    expect(await response.text()).toBe("The requested resource isn't a valid image.");
+    // Next.js keeps a missing source's 404 (https://github.com/vercel/next.js/pull/97957).
+    expect(response.status()).toBe(404);
+    expect(await response.text()).toBe('"url" parameter is valid but internal response is invalid');
   });
 });

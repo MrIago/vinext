@@ -75,13 +75,18 @@ test.describe("Pages Router on Nitro (node server)", () => {
   test("doesn't serve a public image that proxy guards from the image endpoint", async ({
     request,
   }) => {
-    for (const url of [
-      "/blocked.png",
-      "/_next/static/..%5C..%5Cblocked.png",
-      "/_next/static/.%09./.%09./blocked.png",
-    ]) {
+    // Next.js keeps the status the source was answered with: proxy's denial,
+    // or a missing static file's 404 (https://github.com/vercel/next.js/pull/97957).
+    for (const [url, status] of [
+      ["/blocked.png", 403],
+      ["/_next/static/..%5C..%5Cblocked.png", 404],
+      ["/_next/static/.%09./.%09./blocked.png", 404],
+    ] as const) {
       const response = await request.get(`/_next/image?url=${encodeURIComponent(url)}&w=64&q=75`);
-      expect(response.status(), url).toBe(400);
+      expect(response.status(), url).toBe(status);
+      expect(await response.text(), url).toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
     }
   });
 

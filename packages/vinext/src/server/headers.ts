@@ -70,6 +70,9 @@ export {
 /** Internal endpoint used to evaluate App Router generateStaticParams exports. */
 export const VINEXT_PRERENDER_STATIC_PARAMS_PATH = "/__vinext/prerender/static-params";
 
+/** Internal endpoint used to resolve App Router parameter matching policies. */
+export const VINEXT_PRERENDER_PARAM_MATCHING_PATH = "/__vinext/prerender/param-matching";
+
 /** Internal endpoint used to evaluate Pages Router getStaticPaths exports. */
 export const VINEXT_PRERENDER_PAGES_STATIC_PATHS_PATH = "/__vinext/prerender/pages-static-paths";
 
@@ -110,6 +113,13 @@ export const VINEXT_RSC_COMPLETION_METADATA_HEADER = "X-Vinext-Rsc-Completion-Me
  */
 export const VINEXT_SPECIAL_ERROR_STATUS_HEADER = "x-vinext-special-error-status";
 
+/**
+ * Marks an App page response that rendered a routing-level not-found (a
+ * `dynamicParams = false` miss). The request stage strips it and sends the
+ * unmatched route's never-cache 404 policy.
+ */
+export const VINEXT_ROUTE_MISS_HEADER = "x-vinext-route-miss";
+
 /** URL-encoded rendered path and search after middleware/config rewrites. */
 export const VINEXT_RENDERED_PATH_AND_SEARCH_HEADER = "X-Vinext-Rendered-Path-And-Search";
 
@@ -121,6 +131,13 @@ export const VINEXT_PRERENDER_REWRITTEN_HEADER = "x-vinext-prerender-rewritten";
 
 /** Marks a local prerender-server 500 that originated from a thrown render error. */
 export const VINEXT_PRERENDER_RENDER_ERROR_HEADER = "x-vinext-prerender-render-error";
+
+/**
+ * Set by the prerender step on its request for the 404 page, which is a route
+ * miss even where a top-level dynamic route would match its path. Honored only
+ * while prerendering.
+ */
+export const VINEXT_PRERENDER_NOT_FOUND_HEADER = "x-vinext-prerender-not-found";
 
 /**
  * Prerender-only marker: the response's 401, 403, 404 or redirect is its page's

@@ -6,7 +6,7 @@ import {
   finalizeAppPageHtmlCacheResponse,
   finalizeAppPageRscCacheResponse,
   readAppPageCacheResponse,
-  readAppPageFallbackShellCacheResponse,
+  serveAppPageFallbackShellCacheEntry,
   scheduleAppPageRscCacheWrite,
 } from "../packages/vinext/src/server/app-page-cache.js";
 import {
@@ -1342,57 +1342,60 @@ describe("app page cache helpers", () => {
     });
   }
 
-  it("serves stale static fallback shells without regenerating the shared shell key", async () => {
+  it("serves a stale static fallback shell and regenerates it", async () => {
     const debugCalls: Array<[string, string]> = [];
+    const scheduleRegeneration = vi.fn();
 
-    const response = await readAppPageFallbackShellCacheResponse({
+    const response = await serveAppPageFallbackShellCacheEntry({
       clearRequestContext() {},
-      async isrGet() {
-        return buildISRCacheEntry(
-          buildCachedAppPageValue("<html><head></head><body>stale shell</body></html>"),
-          true,
-          { revalidate: 60, expire: 300 },
-        );
-      },
+      cached: buildISRCacheEntry(
+        buildCachedAppPageValue("<html><head></head><body>stale shell</body></html>"),
+        true,
+        { revalidate: 60, expire: 300 },
+      ),
       isrDebug(event, detail) {
         debugCalls.push([event, detail]);
-      },
-      isrFallbackShellHtmlKey(pathname) {
-        return "html:" + pathname;
       },
       fallbackPathname: "/en/blog/[slug]",
       expireSeconds: 300,
       middlewareHeaders: new Headers({ "X-From-Middleware": "yes" }),
       revalidateSeconds: 60,
+      resumeDynamicShell() {
+        throw new Error("a static shell is not resumed");
+      },
+      scheduleRegeneration,
       rewriteHtml(html) {
         return html.replace("stale shell", "rewritten stale shell");
       },
     });
 
-    expect(response?.headers.get("x-vinext-cache")).toBe("STALE");
-    expect(response?.headers.get("x-from-middleware")).toBe("yes");
-    await expect(response?.text()).resolves.toContain("rewritten stale shell");
+    expect(response).toBeInstanceOf(Response);
+    const served = response as Response;
+    expect(served.headers.get("x-vinext-cache")).toBe("STALE");
+    expect(served.headers.get("x-from-middleware")).toBe("yes");
+    await expect(served.text()).resolves.toContain("rewritten stale shell");
     expect(debugCalls).toContainEqual(["STALE (fallback shell)", "/en/blog/[slug]"]);
+    expect(scheduleRegeneration).toHaveBeenCalledOnce();
   });
 
   it("does not serve a hard-expired static fallback shell", async () => {
+    const scheduleRegeneration = vi.fn();
     const clearRequestContext = vi.fn();
-    const response = await readAppPageFallbackShellCacheResponse({
+    const response = await serveAppPageFallbackShellCacheEntry({
       clearRequestContext,
-      async isrGet() {
-        return {
-          ...buildISRCacheEntry(
-            buildCachedAppPageValue("<html><head></head><body>expired shell</body></html>"),
-            true,
-          ),
-          isExpired: true,
-        };
-      },
-      isrFallbackShellHtmlKey(pathname) {
-        return `html:${pathname}`;
+      cached: {
+        ...buildISRCacheEntry(
+          buildCachedAppPageValue("<html><head></head><body>expired shell</body></html>"),
+          true,
+        ),
+        isExpired: true,
       },
       fallbackPathname: "/en/blog/[slug]",
+      resumeDynamicShell() {
+        throw new Error("a static shell is not resumed");
+      },
       revalidateSeconds: 60,
+      scheduleRegeneration,
       rewriteHtml(html) {
         return html;
       },
@@ -1402,40 +1405,183 @@ describe("app page cache helpers", () => {
     expect(clearRequestContext).not.toHaveBeenCalled();
   });
 
-  it("falls through when a cached fallback shell requires request-time resume", async () => {
+  it("falls through when a cached dynamic fallback shell has no resume data cache", async () => {
+    const scheduleRegeneration = vi.fn();
     const debugCalls: Array<[string, string]> = [];
+    const resumeDynamicShell = vi.fn(() => ({ isResumed: false, resume: null }));
 
-    const response = await readAppPageFallbackShellCacheResponse({
+    const response = await serveAppPageFallbackShellCacheEntry({
       clearRequestContext() {
         throw new Error("should not clear request context when falling through");
       },
-      async isrGet() {
-        return buildISRCacheEntry(
-          buildCachedAppPageValue(
-            markAppPprDynamicFallbackShellHtml(
-              "<html><head></head><body>dynamic shell</body></html>",
-            ),
+      cached: buildISRCacheEntry(
+        buildCachedAppPageValue(
+          markAppPprDynamicFallbackShellHtml(
+            "<html><head></head><body>dynamic shell</body></html>",
           ),
-        );
-      },
+        ),
+      ),
       isrDebug(event, detail) {
         debugCalls.push([event, detail]);
       },
-      isrFallbackShellHtmlKey(pathname) {
-        return "html:" + pathname;
-      },
       fallbackPathname: "/en/blog/[slug]",
+      resumeDynamicShell,
       revalidateSeconds: 60,
+      scheduleRegeneration,
       rewriteHtml(html) {
         return html;
       },
     });
 
     expect(response).toBeNull();
+    // A shell without a document prelude is empty, so its route renders blocking.
+    expect(resumeDynamicShell).toHaveBeenCalledWith(
+      expect.objectContaining({ postponed: undefined }),
+      false,
+    );
     expect(debugCalls).toContainEqual([
-      "MISS (dynamic fallback shell requires resume)",
+      "MISS (dynamic fallback shell without resume data cache)",
       "/en/blog/[slug]",
     ]);
+  });
+
+  it("resumes a cached dynamic fallback shell without a debug logger", async () => {
+    const scheduleRegeneration = vi.fn();
+    const resumeDynamicShell = vi.fn(() => ({ isResumed: true, resume: null }));
+
+    const response = await serveAppPageFallbackShellCacheEntry({
+      clearRequestContext() {
+        throw new Error("should not clear request context when resuming");
+      },
+      cached: buildISRCacheEntry({
+        ...buildCachedAppPageValue(
+          markAppPprDynamicFallbackShellHtml(
+            "<!DOCTYPE html><html><head></head><body>dynamic shell</body></html>",
+          ),
+        ),
+        postponed: '{"cache":{},"fetch":{}}',
+      }),
+      fallbackPathname: "/en/blog/[slug]",
+      resumeDynamicShell,
+      revalidateSeconds: 60,
+      scheduleRegeneration,
+      rewriteHtml(html) {
+        return html;
+      },
+    });
+
+    expect(response).toBeNull();
+    expect(resumeDynamicShell).toHaveBeenCalledWith(
+      expect.objectContaining({ postponed: '{"cache":{},"fetch":{}}' }),
+      true,
+    );
+  });
+
+  it("returns the prelude a dynamic fallback shell resumes from", async () => {
+    const debugCalls: Array<[string, string]> = [];
+    const resume = {
+      prelude: "<!DOCTYPE html><html><head></head><body>",
+      postponed: {},
+      browserSearch: "",
+    };
+    const response = await serveAppPageFallbackShellCacheEntry({
+      clearRequestContext() {
+        throw new Error("should not clear request context when resuming");
+      },
+      cached: buildISRCacheEntry({
+        ...buildCachedAppPageValue(
+          markAppPprDynamicFallbackShellHtml("<!DOCTYPE html><html><head></head><body>"),
+        ),
+        postponed: "2:{}",
+      }),
+      isrDebug(event, detail) {
+        debugCalls.push([event, detail]);
+      },
+      fallbackPathname: "/en/blog/[slug]",
+      resumeDynamicShell: () => ({ isResumed: true, resume }),
+      revalidateSeconds: 60,
+      scheduleRegeneration() {},
+      rewriteHtml(html) {
+        return html;
+      },
+    });
+
+    expect(response).toBe(resume);
+    expect(debugCalls).toContainEqual([
+      "RESUME (dynamic fallback shell prelude)",
+      "/en/blog/[slug]",
+    ]);
+  });
+
+  it("resumes a stale dynamic fallback shell and regenerates it", async () => {
+    const resumeDynamicShell = vi.fn(() => ({ isResumed: true, resume: null }));
+    const scheduleRegeneration = vi.fn();
+
+    const response = await serveAppPageFallbackShellCacheEntry({
+      clearRequestContext() {},
+      cached: buildISRCacheEntry(
+        {
+          ...buildCachedAppPageValue(
+            markAppPprDynamicFallbackShellHtml(
+              "<!DOCTYPE html><html><head></head><body>dynamic shell</body></html>",
+            ),
+          ),
+          postponed: '{"cache":{},"fetch":{}}',
+        },
+        true,
+      ),
+      fallbackPathname: "/en/blog/[slug]",
+      resumeDynamicShell,
+      revalidateSeconds: 60,
+      scheduleRegeneration,
+      rewriteHtml(html) {
+        return html;
+      },
+    });
+
+    expect(response).toBeNull();
+    expect(resumeDynamicShell).toHaveBeenCalledWith(
+      expect.objectContaining({ postponed: '{"cache":{},"fetch":{}}' }),
+      true,
+    );
+    expect(scheduleRegeneration).toHaveBeenCalledOnce();
+  });
+
+  it("does not resume a hard-expired dynamic fallback shell", async () => {
+    const scheduleRegeneration = vi.fn();
+    const debugCalls: Array<[string, string]> = [];
+    const resumeDynamicShell = vi.fn(() => ({ isResumed: true, resume: null }));
+
+    const response = await serveAppPageFallbackShellCacheEntry({
+      clearRequestContext() {
+        throw new Error("should not clear request context for an expired shell");
+      },
+      isrDebug(event, detail) {
+        debugCalls.push([event, detail]);
+      },
+      cached: {
+        ...buildISRCacheEntry({
+          ...buildCachedAppPageValue(
+            markAppPprDynamicFallbackShellHtml(
+              "<!DOCTYPE html><html><head></head><body>dynamic shell</body></html>",
+            ),
+          ),
+          postponed: '{"cache":{},"fetch":{}}',
+        }),
+        isExpired: true,
+      },
+      fallbackPathname: "/en/blog/[slug]",
+      resumeDynamicShell,
+      revalidateSeconds: 60,
+      scheduleRegeneration,
+      rewriteHtml(html) {
+        return html;
+      },
+    });
+
+    expect(response).toBeNull();
+    expect(resumeDynamicShell).not.toHaveBeenCalled();
+    expect(debugCalls).toContainEqual(["MISS (expired dynamic fallback shell)", "/en/blog/[slug]"]);
   });
 
   it("still schedules stale regeneration when the stale payload is unusable for this request", async () => {

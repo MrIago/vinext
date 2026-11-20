@@ -34,6 +34,8 @@ function sourceOptions(overrides: Partial<WorkerImageSourceOptions> = {}) {
   return { options, assets, fetchPublicFile };
 }
 
+const INTERNAL = '"url" parameter is valid but internal response is invalid';
+
 describe("fetchWorkerImageSource", () => {
   it("fetches build output from the asset binding without the caller's headers", async () => {
     const { options, assets, fetchPublicFile } = sourceOptions();
@@ -144,16 +146,34 @@ describe("fetchWorkerImageSource", () => {
     expect(Reflect.get(fetchPublicFile.mock.calls[0][0], "cf")).toBe(cf);
   });
 
-  it("answers 400 when the pipeline selects no public file or a non-2xx or no-body outcome", async () => {
+  it("answers 400 when the pipeline selects no public file", async () => {
+    const { options } = sourceOptions({ fetchPublicFile: async () => null });
+
+    const response = await fetchWorkerImageSource("/a.png", callerRequest(), options);
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("The requested resource isn't a valid image.");
+  });
+
+  // Like Next.js' fetchInternalImage (https://github.com/vercel/next.js/pull/97957),
+  // a source answered without a file keeps its status, 500 below 400.
+  it("keeps the status of a non-2xx or no-body outcome", async () => {
     const cancel = vi.fn();
     const denied = new Response(new ReadableStream({ cancel }), { status: 403 });
-    for (const result of [null, denied, new Response(null, { status: 204 })]) {
+    for (const [result, status] of [
+      [denied, 403],
+      [new Response(null, { status: 404 }), 404],
+      [new Response(null, { status: 307, headers: { Location: "/b.png" } }), 500],
+      [new Response(null, { status: 204 }), 400],
+    ] as const) {
       const { options } = sourceOptions({ fetchPublicFile: async () => result });
 
       const response = await fetchWorkerImageSource("/a.png", callerRequest(), options);
 
-      expect(response.status).toBe(400);
-      expect(await response.text()).toBe("The requested resource isn't a valid image.");
+      expect(response.status).toBe(status);
+      expect(await response.text()).toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
     }
     expect(cancel).toHaveBeenCalledOnce();
   });
@@ -241,16 +261,18 @@ describe("fetchSignalledPublicFile", () => {
     expect([...assetRequest.headers]).toEqual([["x-from-middleware", "1"]]);
   });
 
-  it("returns null for a non-2xx or no-body signal or a response that is not a signal", async () => {
+  it("answers with the pipeline's status for a non-2xx or no-body signal or a response that is not a signal", async () => {
     const assets = { fetch: vi.fn(async (_request: Request) => new Response("file")) };
     const sourceRequest = new Request("https://example.com/a.png");
 
-    for (const response of [
-      createStaticFileSignal("/a.png", { headers: null, status: 404 }),
-      createStaticFileSignal("/a.png", { headers: null, status: 204 }),
-      new Response("rendered by middleware"),
-    ]) {
-      expect(fetchSignalledPublicFile(response, sourceRequest, assets)).toBeNull();
+    for (const [response, status, body] of [
+      [createStaticFileSignal("/a.png", { headers: null, status: 404 }), 404, INTERNAL],
+      [createStaticFileSignal("/a.png", { headers: null, status: 204 }), 400, INTERNAL],
+      [new Response("rendered by middleware"), 400, "The requested resource isn't a valid image."],
+    ] as const) {
+      const answer = await fetchSignalledPublicFile(response, sourceRequest, assets);
+      expect(answer.status).toBe(status);
+      expect(await answer.text()).toBe(body);
     }
     expect(assets.fetch).not.toHaveBeenCalled();
   });

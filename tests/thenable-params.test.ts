@@ -6,6 +6,10 @@ import {
 } from "../packages/vinext/src/shims/ppr-fallback-shell.js";
 import { makeThenableParams } from "../packages/vinext/src/shims/thenable-params.js";
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe("makeThenableParams", () => {
   it("is awaitable even when params contain then", async () => {
     // eslint-disable-next-line unicorn/no-thenable
@@ -259,47 +263,53 @@ describe("makeThenableParams", () => {
     expect(typeof (thrown as Promise<unknown>).then).toBe("function");
   });
 
-  it("awaited params object suspends on fallback param access", async () => {
-    const state = createPprFallbackShellState({
-      fallbackParamNames: ["slug"],
-      routePattern: "/:locale/blog/:slug",
-    });
-
-    await runWithPprFallbackShellState(state, async () => {
-      const params = makeThenableParams({ locale: "en", slug: "[slug]" });
-
-      const result = await params;
-      expect(result.locale).toBe("en");
-
-      expect(() => Reflect.get(result, "slug")).toThrow();
-      expect(state.hasDynamicBoundary).toBe(true);
-    });
-
-    state.abortController.abort();
-  });
-
-  it("awaiting params during fallback-shell prerender observes only accessed known params", async () => {
+  it("never resolves awaited params that hold a fallback param, like Next.js", async () => {
     const observedKeys: string[][] = [];
     const state = createPprFallbackShellState({
       fallbackParamNames: ["slug"],
       routePattern: "/:locale/blog/:slug",
     });
+    let settled = false;
 
-    await runWithPprFallbackShellState(state, async () => {
+    runWithPprFallbackShellState(state, () => {
       const params = makeThenableParams(
         { locale: "en", slug: "[slug]" },
         { observeParamAccess: (keys) => observedKeys.push([...keys]) },
       );
-
-      const resolved = await params;
-      expect(resolved.locale).toBe("en");
-      // Known-param access must not convert the shell into a
-      // dynamic-boundary shell — only actual fallback-param access does.
-      expect(state.hasDynamicBoundary).toBe(false);
+      void params.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      expect(state.hasDynamicBoundary).toBe(true);
     });
 
-    expect(observedKeys).toEqual([["locale"]]);
+    await delay(5);
+    expect(settled).toBe(false);
+    expect(observedKeys).toEqual([]);
     state.abortController.abort();
+  });
+
+  it("keeps continuations of fallback params pending after the shell aborts", async () => {
+    const state = createPprFallbackShellState({
+      fallbackParamNames: ["slug"],
+      routePattern: "/:locale/blog/:slug",
+    });
+    let settled = false;
+
+    runWithPprFallbackShellState(state, () => {
+      const params = makeThenableParams({ locale: "en", slug: "[slug]" });
+      // Nothing listens to the derived promise, so a rejection on abort would
+      // surface as an unhandled rejection.
+      void params
+        .then((resolved) => resolved.slug)
+        .finally(() => {
+          settled = true;
+        });
+    });
+
+    state.abortController.abort();
+    await delay(5);
+    expect(settled).toBe(false);
   });
 
   it("does not mark dynamic boundary until a fallback param is actually accessed", () => {
@@ -402,14 +412,16 @@ describe("makeThenableParams", () => {
     expect(finalPromise).toBeDefined();
     expect(finalPromise).not.toBe(warmupPromise);
 
-    // Aborting the live controller rejects the final-phase suspension.
-    const rejectedAssertion = expect(finalPromise).rejects.toThrow();
+    // Aborting the live controller leaves the final-phase suspension pending
+    // instead of rejecting it.
+    let isFinalSettled = false;
+    void finalPromise?.finally(() => {
+      isFinalSettled = true;
+    });
     state.abortController.abort();
-    await rejectedAssertion;
-
-    // Settle the warmup promise too so it does not leak as unhandled.
     warmupController.abort();
-    await (warmupPromise as Promise<unknown>).catch(() => {});
+    await delay(5);
+    expect(isFinalSettled).toBe(false);
   });
 
   it("Object.keys(params) does not mark dynamic boundary before fallback param access", () => {
@@ -425,5 +437,100 @@ describe("makeThenableParams", () => {
     });
 
     state.abortController.abort();
+  });
+
+  it("leaves a document shell's search params to a hole, like Next.js", async () => {
+    const observedKeys: string[][] = [];
+    const state = createPprFallbackShellState({ fallbackParamNames: [], routePattern: "/search" });
+    let settled = false;
+
+    runWithPprFallbackShellState(state, () => {
+      const searchParams = makeThenableParams(
+        {},
+        { observeParamAccess: (keys) => observedKeys.push([...keys]) },
+        { isSearchParams: true },
+      );
+      expect(state.hasDynamicBoundary).toBe(false);
+      void searchParams.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      expect(state.hasDynamicBoundary).toBe(true);
+      let thrown: unknown;
+      try {
+        Reflect.get(searchParams, "q");
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Promise);
+    });
+
+    await delay(5);
+    expect(settled).toBe(false);
+    // A hole, not a dynamic read of the shell.
+    expect(observedKeys).toEqual([]);
+    state.abortController.abort();
+  });
+
+  it("renders a runtime prefetch's search params", async () => {
+    const state = createPprFallbackShellState({
+      fallbackParamNames: [],
+      isRuntimePrefetch: true,
+      routePattern: "/search",
+    });
+
+    const searchParams = runWithPprFallbackShellState(state, () =>
+      makeThenableParams({ q: "1" }, undefined, { isSearchParams: true }),
+    );
+
+    await expect(searchParams).resolves.toEqual({ q: "1" });
+  });
+});
+
+describe("vary params", () => {
+  function recordVaryParams(routePattern: string, read: () => unknown): Promise<string[]> {
+    const varyParams = new Set<string>();
+    const state = createPprFallbackShellState({ fallbackParamNames: [], routePattern, varyParams });
+    return Promise.resolve(runWithPprFallbackShellState(state, read)).then(() => [...varyParams]);
+  }
+
+  // Like Next.js's `createVaryingParams`, a render varies on the params it reads.
+  it("records the params a render reads, synchronously or awaited", async () => {
+    await expect(
+      recordVaryParams("/shop/:category/:item", () => {
+        const params = makeThenableParams({ category: "a", item: "b" });
+        return params.category;
+      }),
+    ).resolves.toEqual(["category"]);
+    await expect(
+      recordVaryParams("/shop/:category/:item", async () => {
+        const params = await makeThenableParams({ category: "a", item: "b" });
+        return "item" in params;
+      }),
+    ).resolves.toEqual(["item"]);
+    await expect(
+      recordVaryParams("/shop/:category/:item", async () => {
+        await makeThenableParams({ category: "a", item: "b" });
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("records every param, and an absent optional catch-all, when a render enumerates them", async () => {
+    await expect(
+      recordVaryParams("/docs/:section/:slug*", async () => {
+        Object.keys(await makeThenableParams({ section: "a" }));
+      }),
+    ).resolves.toEqual(["section", "slug"]);
+  });
+
+  it("records search params as `?`", async () => {
+    await expect(
+      recordVaryParams("/search", async () => {
+        const searchParams = await makeThenableParams({ q: "1" }, undefined, {
+          isSearchParams: true,
+        });
+        return Reflect.get(searchParams, "missing");
+      }),
+    ).resolves.toEqual(["?"]);
   });
 });

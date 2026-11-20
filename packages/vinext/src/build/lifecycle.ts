@@ -20,7 +20,7 @@ import {
 import type { ResolvedNextConfig } from "../config/next-config.js";
 import { flattenPluginOptions } from "../utils/plugin-options.js";
 import { resolveVinextPackageRoot } from "../utils/vinext-root.js";
-import { cleanBuildOutput } from "./clean-output.js";
+import { cleanBuildOutput, type ProtectedSourceDirs } from "./clean-output.js";
 import { PAGES_CLIENT_ASSETS_MODULE } from "./pages-client-assets-module.js";
 import { runWithPreviewBuildCredentials } from "./preview-credentials.js";
 
@@ -41,6 +41,8 @@ export type BuildLifecycleContext = {
   prerenderConfig: ResolvedVinextPrerenderConfig | null;
   prerenderConcurrency?: number;
   prerenderSecret: string;
+  /** Source directories the build output may not overlap. */
+  protectedDirs?: ProtectedSourceDirs;
   previewBuildCredentials?: Parameters<typeof runWithPreviewBuildCredentials>[1];
   revalidateSecret: string;
   root: string;
@@ -135,6 +137,11 @@ async function loadHybridUserConfig(
   };
 }
 
+/** Root of the build output: Vite's `build.outDir`, "dist" by default. */
+function resolveBuildOutDir(context: BuildLifecycleContext): string {
+  return path.resolve(context.root, context.routeRootConfig?.outDir ?? "dist");
+}
+
 async function buildHybridPagesBundle(
   builder: ViteBuilder,
   context: BuildLifecycleContext,
@@ -153,9 +160,10 @@ async function buildHybridPagesBundle(
   const { build: _userSsrBuild, ...pagesEnvironment } = userSsrEnvironment ?? {};
   const mergedBuild = vite.mergeConfig(userConfig.build ?? {}, userSsrEnvironment?.build ?? {});
   const userOutput = mergedBuild.rolldownOptions?.output;
+  const serverOutDir = path.join(resolveBuildOutDir(context), "server");
   const appAssetsPath = path.resolve(
     context.root,
-    builder.environments.rsc?.config.build.outDir ?? "dist/server",
+    builder.environments.rsc?.config.build.outDir ?? serverOutDir,
     PAGES_CLIENT_ASSETS_MODULE,
   );
   const pagesClientAssetsModule = fs.existsSync(appAssetsPath)
@@ -163,7 +171,7 @@ async function buildHybridPagesBundle(
     : null;
   const pagesBuild = {
     ...mergedBuild,
-    outDir: "dist/server",
+    outDir: serverOutDir,
     emptyOutDir: false,
     // The primary App build owns the shared server manifest. Emitting another
     // one here would replace its RSC entries with the auxiliary Pages graph.
@@ -184,6 +192,21 @@ async function buildHybridPagesBundle(
     plugins: [
       ...(userConfig.plugins ?? []),
       ...context.createPagesOnlyPlugins(pagesClientAssetsModule),
+      {
+        // The replayed user hooks may set build.outDir or emptyOutDir (e.g. a
+        // plugin returning `{ build: { outDir } }`). Listed last and ordered
+        // post, this runs after them, so the Pages server stays in
+        // <outDir>/server and the App Router output already there is kept.
+        name: "vinext:hybrid-pages-outdir",
+        enforce: "post",
+        configEnvironment: {
+          order: "post",
+          handler(name) {
+            if (name !== "ssr") return;
+            return { build: { outDir: serverOutDir, emptyOutDir: false } };
+          },
+        },
+      },
     ],
     builder: {
       ...userConfig.builder,
@@ -238,9 +261,29 @@ export function prepareBuildOutput(
 
   cleanBuildOutput({
     root: context.root,
-    outDir: path.resolve(context.root, "dist"),
+    outDir: resolveBuildOutDir(context),
     emptyOutDir,
+    protectedDirs: context.protectedDirs,
   });
+}
+
+/** Remove `dir` except files at the same path under `keepDir`. */
+function removeBuildMetadata(dir: string, keepDir: string | null): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const file = path.join(dir, entry.name);
+    const keepFile = keepDir && path.join(keepDir, entry.name);
+    if (entry.isDirectory()) removeBuildMetadata(file, keepFile);
+    else if (!keepFile || !fs.existsSync(keepFile)) fs.rmSync(file, { force: true });
+  }
+  try {
+    fs.rmdirSync(dir);
+  } catch {}
 }
 
 async function finalizeBuild(builder: ViteBuilder, context: BuildLifecycleContext): Promise<void> {
@@ -293,10 +336,12 @@ async function finalizeBuild(builder: ViteBuilder, context: BuildLifecycleContex
       concurrency: context.prerenderConcurrency,
       nextConfig: context.nextConfig,
       routeRootConfig: buildOutput,
+      publicDir: builder.environments.client?.config.publicDir || null,
     });
     if (context.nextConfig.output !== "export") {
       await finalizeCacheAdapterPrerenderOutput(context.cacheConfig, context.root, {
         clientOutDir: buildOutput.clientOutDir,
+        outDir: buildOutput.outDir,
       });
     }
     await emitPrerenderPathManifest({
@@ -313,6 +358,19 @@ async function finalizeBuild(builder: ViteBuilder, context: BuildLifecycleContex
     });
   }
 
+  // A static export deploys the client output as is, with no server to keep
+  // the build metadata in `.vite/` private, and Next.js's `out/` has no such
+  // files. Nothing reads them once the build is done. Files `public/.vite/`
+  // copied in stay, as Next.js copies all of public/.
+  if (context.nextConfig.output === "export") {
+    const clientOutDir = buildOutput.clientOutDir ?? path.join("dist", "client");
+    const publicDir = builder.environments.client?.config.publicDir;
+    removeBuildMetadata(
+      path.resolve(context.root, clientOutDir, ".vite"),
+      publicDir ? path.join(publicDir, ".vite") : null,
+    );
+  }
+
   // Next.js runs writeStandaloneDirectory after static generation and passes it
   // the collected staticPages, so the standalone tree contains the prerendered
   // output. Emit standalone after the prerender phase so dist/standalone ships
@@ -321,12 +379,18 @@ async function finalizeBuild(builder: ViteBuilder, context: BuildLifecycleContex
     const { emitStandaloneOutput } = await import("./standalone.js");
     const standalone = emitStandaloneOutput({
       root: context.root,
-      outDir: path.resolve(context.root, "dist"),
+      outDir: resolveBuildOutDir(context),
     });
-    console.log(
-      `  Generated standalone output in ${path.relative(context.root, standalone.standaloneDir)}/`,
-    );
-    console.log("  Start it with: node dist/standalone/server.js\n");
+    const standaloneDir = path.relative(context.root, standalone.standaloneDir);
+    console.log(`  Generated standalone output in ${standaloneDir}/`);
+    const scriptPath = path.join(standaloneDir, "server.js");
+    // node would read a leading "-" as an option.
+    const serverScript = scriptPath.startsWith("-") ? `./${scriptPath}` : scriptPath;
+    // Single-quote any path a POSIX shell would split or expand.
+    const serverArg = /^[\w@%+=:,./-]+$/.test(serverScript)
+      ? serverScript
+      : `'${serverScript.replaceAll("'", "'\\''")}'`;
+    console.log(`  Start it with: node ${serverArg}\n`);
     return;
   }
 
@@ -385,7 +449,12 @@ export function createBuildLifecyclePlugins(options: {
         handler(config) {
           if (outputPrepared || !options.shouldPrepare(config)) return;
           const context = createContext();
-          if (config.build.emptyOutDir === false) context.emptyOutDir = false;
+          context.protectedDirs = { ...context.protectedDirs, public: config.publicDir };
+          // A raw `emptyOutDir: false` stays the escape hatch; otherwise follow
+          // the resolved value, which later config hooks may have set.
+          if (context.emptyOutDir !== false && typeof config.build.emptyOutDir === "boolean") {
+            context.emptyOutDir = config.build.emptyOutDir;
+          }
           // Report a missing standalone prerequisite before onPrepare runs its checks.
           checkStandaloneBuildPrerequisite(context);
           options.onPrepare?.();

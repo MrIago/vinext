@@ -7,6 +7,10 @@ import {
   collectRscActionReachability,
   resolveClientReferenceImportIds,
 } from "../packages/vinext/src/build/action-owner-manifest.js";
+import {
+  ACTION_OWNER_MANIFEST_ID,
+  createActionOwnerManifestPlugin,
+} from "../packages/vinext/src/plugins/action-owner-manifest.js";
 
 function route(pattern: string, pagePath: string) {
   return {
@@ -342,5 +346,29 @@ describe("server action owner manifest", () => {
       "/app/(.)modal/unauthorized.tsx",
       "/app/(.)modal/outer-not-found.tsx",
     ]);
+  });
+});
+
+describe("action owner manifest plugin", () => {
+  it("returns a sourcemap when it points chunks at the emitted manifest", () => {
+    const plugin = createActionOwnerManifestPlugin({
+      canonicalizeModuleId: (id) => id,
+      getManager: async () => undefined,
+      getRoutes: () => [],
+      getSharedRoots: () => [],
+    });
+    const renderChunk = plugin.renderChunk as (
+      code: string,
+      chunk: { fileName: string },
+    ) => { code: string; map?: { mappings: string } } | undefined;
+    const code = `const a = 1;\nimport manifest from "${ACTION_OWNER_MANIFEST_ID}";\n`;
+
+    const result = renderChunk(code, { fileName: "server/chunks/page.js" });
+
+    expect(result?.code).toBe(
+      `const a = 1;\nimport manifest from "../../__vinext_action_owner_manifest.js";\n`,
+    );
+    // Rolldown reports SOURCEMAP_BROKEN for a renderChunk result without a map.
+    expect(result?.map?.mappings).toBeTruthy();
   });
 });

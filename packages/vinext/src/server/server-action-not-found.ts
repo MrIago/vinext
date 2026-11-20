@@ -3,7 +3,41 @@ import { UnrecognizedActionError } from "vinext/shims/unrecognized-action-error"
 
 const SERVER_ACTION_NOT_FOUND_DOCS =
   "https://nextjs.org/docs/messages/failed-to-find-server-action";
-const SERVER_ACTION_NOT_FOUND_BODY = "Server action not found.";
+
+/**
+ * Like Next.js (vercel/next.js#98123), an unrecognized Server Action is a
+ * client error: a malformed id is `400 Invalid Server Action request.`, and a
+ * well-formed id this deployment doesn't have (deployment skew) is
+ * `409 Server Action unavailable.`.
+ *
+ * Next.js recognizes an id by its fixed length (`mightBeServerReferenceId`).
+ * Every id vinext emits is `<referenceKey>#<exportName>`, as @vitejs/plugin-rsc
+ * builds it for `createServerReference`, so the equivalent structural check is
+ * a non-empty reference key, one `#`, and an export name that is a JavaScript
+ * identifier, with no whitespace or control character in the key.
+ */
+const MAX_SERVER_ACTION_ID_LENGTH = 4096;
+const SERVER_ACTION_EXPORT_NAME_RE = /^[A-Za-z_$][\w$]*$/;
+
+export function isMalformedServerActionId(actionId: string | null): boolean {
+  if (actionId === null) return false;
+  if (actionId.length > MAX_SERVER_ACTION_ID_LENGTH) return true;
+  const hashIndex = actionId.lastIndexOf("#");
+  if (hashIndex <= 0) return true;
+  const referenceKey = actionId.slice(0, hashIndex);
+  const exportName = actionId.slice(hashIndex + 1);
+  // oxlint-disable-next-line no-control-regex -- control characters make an id malformed
+  if (/[\s\u0000-\u001f\u007f]/.test(referenceKey)) return true;
+  return !SERVER_ACTION_EXPORT_NAME_RE.test(exportName);
+}
+
+function getUnrecognizedActionStatusCode(actionId: string | null): 400 | 409 {
+  return isMalformedServerActionId(actionId) ? 400 : 409;
+}
+
+function getUnrecognizedActionResponseBody(statusCode: 400 | 409): string {
+  return statusCode === 400 ? "Invalid Server Action request." : "Server Action unavailable.";
+}
 
 function getServerActionNotFoundPrefix(actionId: string | null): string {
   return `Failed to find Server Action${actionId ? ` "${actionId}"` : ""}.`;
@@ -44,7 +78,7 @@ export function isServerActionNotFoundError(error: unknown, actionId: string | n
   // `@vitejs/plugin-rsc` raises two different "no such server reference"
   // errors depending on the build mode. Both mean the same thing — the
   // referenced server action id isn't in the runtime manifest — and must
-  // surface as Next.js' 404 + action-not-found header rather than a generic
+  // surface as Next.js' 409 (or 400 for a malformed id) + action-not-found header rather than a generic
   // 500. The progressive (no-JS) path also hits this in `decodeAction(body)`
   // before it has any actionId in hand, so match these patterns whether or
   // not the caller has resolved an action id from request headers.
@@ -90,14 +124,28 @@ export function isServerActionNotFoundError(error: unknown, actionId: string | n
   );
 }
 
-export function createServerActionNotFoundResponse(): Response {
-  return new Response(SERVER_ACTION_NOT_FOUND_BODY, {
-    status: 404,
+export function createServerActionNotFoundResponse(actionId: string | null = null): Response {
+  const status = getUnrecognizedActionStatusCode(actionId);
+  return new Response(getUnrecognizedActionResponseBody(status), {
+    status,
     headers: {
       [SERVER_ACTION_NOT_FOUND_HEADER]: "1",
       "content-type": "text/plain",
     },
   });
+}
+
+/**
+ * Log the unknown action id, clear the request context, and build the 400/409.
+ * Shared by action forwarding, action execution, and the RSC handler.
+ */
+export function respondServerActionNotFound(
+  actionId: string | null,
+  clearRequestContext: () => void,
+): Response {
+  console.warn(getServerActionNotFoundMessage(actionId));
+  clearRequestContext();
+  return createServerActionNotFoundResponse(actionId);
 }
 
 function isServerActionNotFoundResponse(response: Pick<Response, "headers">): boolean {

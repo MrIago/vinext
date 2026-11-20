@@ -14,6 +14,7 @@ import {
   createOptimisticRouteTemplateStore,
   getOptimisticPrefetchSourceKey,
   getOptimisticRouteTemplateKey,
+  createShellMetadataKeeper,
   keepOptimisticStreamingMetadata,
   matchOptimisticRouteManifestRoute,
   resolveOptimisticNavigationParamsForHref,
@@ -141,9 +142,9 @@ function createBlogElements(): AppElements {
   };
 }
 
-function createBlogLoadingShellElements(): AppElements {
-  const routeId = AppElementsWire.encodeRouteId("/blog/post-1", null);
-  const pageId = AppElementsWire.encodePageId("/blog/post-1", null);
+function createBlogLoadingShellElements(renderedPath = "/blog/post-1"): AppElements {
+  const routeId = AppElementsWire.encodeRouteId(renderedPath, null);
+  const pageId = AppElementsWire.encodePageId(renderedPath, null);
   return {
     ...AppElementsWire.createMetadataEntries({
       interceptionContext: null,
@@ -467,7 +468,7 @@ describe("App Router optimistic routing", () => {
         },
       ],
     );
-    const elements = createBlogLoadingShellElements();
+    const elements = createBlogLoadingShellElements("/vercel/sub/folder");
     const template = createOptimisticRouteTemplate({
       allowLoadingShell: true,
       basePath: "",
@@ -559,6 +560,168 @@ describe("App Router optimistic routing", () => {
     expect(createOptimisticRouteElements(template!)[childrenSlotId]).not.toBe(
       elements[childrenSlotId],
     );
+  });
+
+  it("does not learn a template from a payload a rewrite rendered for another route", () => {
+    // app/[locale]/[...rest], app/[locale]/datasets/[id] and
+    // app/[locale]/accounts/[id]/reports, with middleware rewriting `/x` to
+    // `/ja/x`. Next.js learns no pattern from a URL that doesn't match the
+    // route tree it rendered (discoverKnownRoutePart in
+    // segment-cache/optimistic-routes.ts).
+    const routeManifest = manifest([
+      route({
+        id: "route:/:locale/:rest+",
+        isDynamic: true,
+        paramNames: ["locale", "rest"],
+        pattern: "/:locale/:rest+",
+        patternParts: [":locale", ":rest+"],
+      }),
+      route({
+        id: "route:/:locale/datasets/:id",
+        isDynamic: true,
+        paramNames: ["locale", "id"],
+        pattern: "/:locale/datasets/:id",
+        patternParts: [":locale", "datasets", ":id"],
+      }),
+      route({
+        id: "route:/:locale/accounts/:id/reports",
+        isDynamic: true,
+        paramNames: ["locale", "id"],
+        pattern: "/:locale/accounts/:id/reports",
+        patternParts: [":locale", "accounts", ":id", "reports"],
+      }),
+    ]);
+    // `/datasets/x` reads as `[locale]=datasets` + `[...rest]`, but the server
+    // rendered `/ja/datasets/x`.
+    const learn = (elements: AppElements, allowLoadingShell: boolean) =>
+      createOptimisticRouteTemplate({
+        allowLoadingShell,
+        basePath: "",
+        elements,
+        href: "/datasets/x",
+        interceptionContext: null,
+        mountedSlotsHeader: null,
+        routeManifest,
+      });
+    const renderedRouteId = AppElementsWire.encodeRouteId("/ja/datasets/x", null);
+    const metadata = AppElementsWire.createMetadataEntries({
+      interceptionContext: null,
+      layoutIds: ["layout:/"],
+      rootLayoutTreePath: "/",
+      routeId: renderedRouteId,
+    });
+    const pageId = AppElementsWire.encodePageId("/ja/datasets/x", null);
+
+    const loadingShell = learn(
+      {
+        ...metadata,
+        [APP_PREFETCH_LOADING_SHELL_MARKER_KEY]: "LoadingBoundary",
+        [pageId]: null,
+        [renderedRouteId]: createElement("p", null, "Loading dataset..."),
+      },
+      true,
+    );
+    const fullPrefetch = learn(
+      {
+        ...metadata,
+        [pageId]: createElement("article", null, "Dataset x"),
+        [renderedRouteId]: createElement(
+          Suspense,
+          { fallback: createElement("p", null, "Loading dataset...") },
+          createElement("main", null, "Page slot"),
+        ),
+      },
+      false,
+    );
+    expect(loadingShell?.routeId ?? null).toBeNull();
+    expect(fullPrefetch?.routeId ?? null).toBeNull();
+
+    // So a navigation to `/accounts/a/reports`, which also reads as
+    // `[...rest]`, gets no shell.
+    const templates = new Map<string, OptimisticRouteTemplate>();
+    for (const template of [loadingShell, fullPrefetch]) {
+      if (template === null) continue;
+      templates.set(
+        getOptimisticRouteTemplateKey({
+          interceptionContext: null,
+          mountedSlotsHeader: null,
+          routeId: template.routeId,
+        }),
+        template,
+      );
+    }
+    expect(
+      resolveOptimisticNavigationPayload({
+        basePath: "",
+        href: "/accounts/a/reports",
+        interceptionContext: null,
+        mountedSlotsHeader: null,
+        routeManifest,
+        templates,
+      })?.template.routeId ?? null,
+    ).toBeNull();
+  });
+
+  it("learns a template from a payload a rewrite rendered for the same route", () => {
+    // Next.js checks only static segments against the URL, so a rewrite to
+    // other params of the same route still teaches its pattern.
+    const template = createOptimisticRouteTemplate({
+      allowLoadingShell: true,
+      basePath: "/docs",
+      elements: createBlogLoadingShellElements("/blog/post-2"),
+      href: "/docs/blog/post-1?_rsc=abc",
+      interceptionContext: null,
+      mountedSlotsHeader: null,
+      routeManifest: blogManifest(),
+    });
+
+    expect(template?.routeId).toBe("route:/blog/:slug");
+    expect(template?.params).toEqual({ slug: "post-1" });
+  });
+
+  it("matches a rewritten payload's route like the server, past a static dead end", () => {
+    // The server renders `/dashboard/settings/profile` with the catch-all, as
+    // it falls back from the static `settings` branch.
+    const template = createOptimisticRouteTemplate({
+      allowLoadingShell: true,
+      basePath: "",
+      elements: createBlogLoadingShellElements("/dashboard/settings/profile"),
+      href: "/dashboard/foo",
+      interceptionContext: null,
+      mountedSlotsHeader: null,
+      routeManifest: dashboardManifestWithoutProfile(),
+    });
+
+    expect(template?.routeId).toBe("route:/dashboard/:catchall+");
+    expect(template?.params).toEqual({ catchall: ["foo"] });
+  });
+
+  it("does not decode a rewritten payload's route path again", () => {
+    const routeManifest = manifest([
+      route({ id: "route:/a", isDynamic: false, pattern: "/a", patternParts: ["a"] }),
+      route({
+        id: "route:/:slug",
+        isDynamic: true,
+        paramNames: ["slug"],
+        pattern: "/:slug",
+        patternParts: [":slug"],
+      }),
+    ]);
+    // `/[slug]` serves `/%2561`, whose route path the server decoded once to
+    // `/%61`. That is not the static `/a`.
+    const learn = (href: string) =>
+      createOptimisticRouteTemplate({
+        allowLoadingShell: true,
+        basePath: "",
+        elements: createBlogLoadingShellElements("/%61"),
+        href,
+        interceptionContext: null,
+        mountedSlotsHeader: null,
+        routeManifest,
+      });
+
+    expect(learn("/b")?.routeId).toBe("route:/:slug");
+    expect(learn("/a")?.routeId ?? null).toBeNull();
   });
 
   it("does not learn routes without a loading boundary", () => {
@@ -1487,6 +1650,11 @@ describe("optimistic route template store", () => {
 
 describe("keepOptimisticStreamingMetadata", () => {
   const metadataId = `${APP_STREAMING_METADATA_BODY_ID_PREFIX}route:/blog/post-2`;
+  const shellMetadataOf = (boundary: unknown): unknown => {
+    if (!isValidElement<{ fallback: unknown }>(boundary)) return undefined;
+    const fallback = boundary.props.fallback;
+    return isValidElement<{ children: unknown }>(fallback) ? fallback.props.children : undefined;
+  };
 
   it("renders the payload's streamed metadata with the shell's as its fallback", () => {
     const shellMetadata = createElement("title", null, "Prefetched");
@@ -1501,7 +1669,27 @@ describe("keepOptimisticStreamingMetadata", () => {
     if (!isValidElement(boundary)) throw new Error("expected a Suspense element");
     expect(boundary.type).toBe(Suspense);
     expect(boundary.key).toBe("7");
-    expect(boundary.props).toEqual({ fallback: shellMetadata, children: payloadMetadata });
+    expect(boundary.props).toMatchObject({ children: payloadMetadata });
+    expect(shellMetadataOf(boundary)).toBe(shellMetadata);
+  });
+
+  it("shows nothing in place of a shell's metadata that is still streaming", () => {
+    const kept = keepOptimisticStreamingMetadata(
+      { [metadataId]: createElement("title", null, "Streamed") },
+      { [metadataId]: createElement("title", null, "Prefetched") },
+      "7",
+    );
+
+    const boundary = kept[metadataId];
+    if (!isValidElement<{ fallback: unknown }>(boundary)) {
+      throw new Error("expected a Suspense element");
+    }
+    const fallback = boundary.props.fallback;
+    if (!isValidElement<{ fallback: unknown }>(fallback)) {
+      throw new Error("expected a Suspense fallback");
+    }
+    expect(fallback.type).toBe(Suspense);
+    expect(fallback.props.fallback).toBeNull();
   });
 
   it("pairs a shell learned for other params with the payload's metadata", () => {
@@ -1514,11 +1702,7 @@ describe("keepOptimisticStreamingMetadata", () => {
       "8",
     );
 
-    const boundary = kept[metadataId];
-    if (!isValidElement<{ fallback: unknown }>(boundary)) {
-      throw new Error("expected a Suspense element");
-    }
-    expect(boundary.props.fallback).toBe(shellMetadata);
+    expect(shellMetadataOf(kept[metadataId])).toBe(shellMetadata);
   });
 
   it("remounts the boundary for each navigation", () => {
@@ -1532,6 +1716,27 @@ describe("keepOptimisticStreamingMetadata", () => {
       throw new Error("expected Suspense elements");
     }
     expect(first.key).not.toBe(second.key);
+  });
+
+  it("keeps a static shell's metadata once it decodes, after the page's payload was handed over", async () => {
+    const shellMetadata = createElement("title", null, "Prefetched");
+    let resolveShell!: (elements: AppElements) => void;
+    const keeper = createShellMetadataKeeper("3");
+    keeper.trackShell(new Promise<AppElements>((resolve) => (resolveShell = resolve)));
+    let resolvePayload!: (elements: AppElements) => void;
+    const kept = keeper.keep(new Promise<AppElements>((resolve) => (resolvePayload = resolve)));
+
+    resolveShell({ [metadataId]: shellMetadata });
+    await Promise.resolve();
+    resolvePayload({ [metadataId]: createElement("title", null, "Streamed") });
+
+    expect(shellMetadataOf((await kept)[metadataId])).toBe(shellMetadata);
+  });
+
+  it("hands the page's payload over as is without a shell", () => {
+    const payload = Promise.resolve<AppElements>({});
+
+    expect(createShellMetadataKeeper("1").keep(payload)).toBe(payload);
   });
 
   it("keeps the payload when the shell streamed no metadata", () => {

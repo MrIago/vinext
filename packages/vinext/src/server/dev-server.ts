@@ -8,6 +8,7 @@ import { importModule, reportRequestError } from "./instrumentation.js";
 import type { NextI18nConfig } from "../config/next-config.js";
 import { NEXTJS_CACHE_HEADER, NEXTJS_DEPLOYMENT_ID_HEADER } from "./headers.js";
 import { buildMissIsrCacheControl, ISR_NEVER_CACHE_CONTROL } from "./isr-decision.js";
+import { DEV_DOCUMENT_CACHE_CONTROL } from "./cache-control.js";
 import {
   PRERENDER_REVALIDATE_HEADER,
   PRERENDER_REVALIDATE_ONLY_GENERATED_HEADER,
@@ -46,7 +47,12 @@ import { getScriptNonceFromNodeHeaderSources } from "./csp.js";
 import { mergeRouteParamsIntoQuery, parseQueryString as parseQuery } from "../utils/query.js";
 import { stripViteModuleQuery } from "../utils/path.js";
 import React from "react";
-import { renderToReadableStream } from "react-dom/server";
+// Default import on purpose: vite.config.ts imports vinext, which imports this
+// module, so it loads while Vite loads the config. React below 19.3 has no
+// named `renderToReadableStream` in the Node build of react-dom/server, and a
+// named import fails to link there with a bare SyntaxError before the build's
+// React version check can name the fix. The CommonJS default always links.
+import ReactDOMServer from "react-dom/server";
 import { logRequest, now } from "./request-log.js";
 import {
   createValidFileMatcher,
@@ -117,7 +123,7 @@ import { logRequestError } from "./request-error-log.js";
  * Used for _document rendering and error pages (small, non-streaming).
  */
 async function renderToStringAsync(element: React.ReactElement): Promise<string> {
-  const stream = await renderToReadableStream(element);
+  const stream = await ReactDOMServer.renderToReadableStream(element);
   await stream.allReady;
   return new Response(stream).text();
 }
@@ -157,7 +163,11 @@ function applyDevPagesPreviewResponse(res: ServerResponse, preview: PagesPreview
   for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
 }
 
-const DEV_PAGES_CACHE_CONTROL = "no-cache, must-revalidate";
+// Documents and data responses must not be stored in development: a browser
+// reuses a stored response for a history navigation without revalidating it,
+// so going back would restore a page from before the latest edit. Mirrors
+// pages-handler.ts from vercel/next.js#97505.
+const DEV_PAGES_CACHE_CONTROL = DEV_DOCUMENT_CACHE_CONTROL;
 const PAGES_CACHE_ONE_YEAR_SECONDS = 31_536_000;
 
 function applyDevPagesCacheHeaders(
@@ -382,7 +392,7 @@ async function streamPageToResponseImpl(
     const documentRenderPage = await runDocumentRenderPage({
       DocumentComponent,
       enhancePageElement,
-      renderToReadableStream,
+      renderToReadableStream: ReactDOMServer.renderToReadableStream,
       renderStylesToString: renderToStringAsync,
       scriptNonce,
       context: documentContext,
@@ -401,7 +411,7 @@ async function streamPageToResponseImpl(
     } else {
       // Start the body render before collecting its head state, then let the
       // tracing adapter keep the span alive without delaying the response.
-      bodyStream = await renderToReadableStream(element);
+      bodyStream = await ReactDOMServer.renderToReadableStream(element);
     }
 
     if (documentRenderPage.status === "skipped") {
@@ -843,6 +853,13 @@ export function createSSRHandler(
     }
 
     const { route, params } = match;
+    // Like Next.js base-server.ts, a direct /404 or /500 page request answers
+    // with that status. Next exempts only /404 data requests. As in the prod
+    // handler, a middleware rewrite status wins.
+    if (statusCode === undefined) {
+      if (route.pattern === "/404" && !isDataReq) res.statusCode = 404;
+      else if (route.pattern === "/500") res.statusCode = 500;
+    }
     // Implements the Next.js `req.url` contract: data-fetching methods observe
     // the original request URL. For ordinary page requests this defaults to
     // `url`, so the assignment is a no-op.
@@ -1514,8 +1531,9 @@ export function createSSRHandler(
         // expect the full Pages props object as JSON. We have renderProps; skip the React
         // tree render and the _document shell entirely. Headers set on `res`
         // by getServerSideProps (cookies, status codes, etc.) are preserved
-        // because we already let gSSP mutate `res` above.
-        if (isDataReq) {
+        // because we already let gSSP mutate `res` above. `/500` answers its
+        // HTML document instead, as in Next.js.
+        if (isDataReq && route.pattern !== "/500") {
           const dataHeaders: Record<string, string | string[] | number> = {
             "Content-Type": "application/json",
           };
@@ -1537,10 +1555,9 @@ export function createSSRHandler(
           // Mirror Next.js pages-handler.ts: set x-nextjs-deployment-id on
           // every _next/data response so the client router can detect a new
           // deployment and trigger a hard navigation (deployment-skew
-          // protection). Next.js skips the success path for /_error and /500
-          // (`!isErrorPage && !is500Page`). Fixes #1829.
-          const dataRoutePattern = patternToNextFormat(route.pattern);
-          if (dataRoutePattern !== "/_error" && dataRoutePattern !== "/500") {
+          // protection). Next.js skips the success path for /_error, and
+          // renders /500 as HTML (`!isErrorPage && !is500Page`). Fixes #1829.
+          if (patternToNextFormat(route.pattern) !== "/_error") {
             const deploymentId =
               process.env.__VINEXT_DEPLOYMENT_ID || process.env.NEXT_DEPLOYMENT_ID;
             if (deploymentId) {

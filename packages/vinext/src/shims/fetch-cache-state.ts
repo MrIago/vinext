@@ -35,7 +35,6 @@ export type FetchCacheState = {
    */
   isDraftMode: boolean;
   dynamicFetchUrls: Set<string>;
-  refreshStaleFetchesInForeground: boolean;
   isFetchDedupeActive: boolean;
   currentFetchDedupeEntries: Map<string, FetchDedupeEntry[]>;
   nextFetchId: number;
@@ -62,7 +61,6 @@ function createFetchCacheState(): FetchCacheState {
     currentForceDynamicFetchDefault: false,
     isDraftMode: false,
     dynamicFetchUrls: new Set<string>(),
-    refreshStaleFetchesInForeground: false,
     isFetchDedupeActive: false,
     currentFetchDedupeEntries: new Map(),
     nextFetchId: 1,

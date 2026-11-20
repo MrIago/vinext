@@ -4,8 +4,11 @@ import type { RootParams } from "vinext/shims/root-params";
 import { isRenderDynamicLatched } from "vinext/shims/headers";
 import {
   buildAppPageFontLinkHeader,
+  preferAppPageHttpError,
   resolveAppPageShellSpecialError,
+  resolveAppPageSpecialError,
   resolveAppPageSpecialErrorStoredHeaders,
+  type AppPageSpecialError,
 } from "./app-page-execution.js";
 import {
   buildAppPageLinkHeader,
@@ -18,8 +21,9 @@ import { readStreamAsText } from "../utils/text-stream.js";
 
 /**
  * The status of a finished RSC render, as Next.js's static generation decides
- * it from the document's shell. A special error that rejects the shell sets
- * it. One inside a Suspense boundary leaves the render a 200.
+ * it. A special error that rejects the shell sets it, and so does one a
+ * Suspense boundary caught, whose document keeps the page's layout and the
+ * boundary's fallback.
  */
 export type AppPageRscRenderStatus =
   | {
@@ -27,7 +31,16 @@ export type AppPageRscRenderStatus =
       /** The page's document, when the resolver rendered one to store. */
       document?: CdnAppPageDocument;
     }
-  | { kind: "special-error"; status: number; headers?: Record<string, string> }
+  | {
+      kind: "special-error";
+      status: number;
+      headers?: Record<string, string>;
+      /**
+       * The page's document, when a Suspense boundary caught the error and the
+       * resolver rendered one to store.
+       */
+      document?: CdnAppPageDocument;
+    }
   /**
    * A render not stored: another error rejected the shell, or
    * generateMetadata()'s special error, whose document an RSC miss can't write.
@@ -59,6 +72,8 @@ type CreateAppPageRscRenderStatusResolverOptions = {
   document?: AppPageRscRenderDocumentOptions;
   getCapturedSpecialError: () => unknown;
   getCapturedSpecialErrors: (error: unknown) => readonly unknown[];
+  /** Every special error the RSC render threw, in the order it threw them. */
+  getAllCapturedSpecialErrors?: () => readonly unknown[];
   isForceStatic: boolean;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   navigationContext: NavigationContext | null;
@@ -184,6 +199,15 @@ async function renderAppPageRscRenderStatus(
     documentOptions?.clientTraceMetadata && documentOptions.clientTraceMetadata.length > 0
       ? crypto.randomUUID()
       : undefined;
+  // The document's own errors, which include a client component's that the
+  // Flight render never saw.
+  let documentHttpError: AppPageSpecialError | null = null;
+  const captureDocumentHttpError = (error: unknown): void => {
+    documentHttpError = preferAppPageHttpError(
+      documentHttpError,
+      resolveAppPageSpecialError(error),
+    );
+  };
   let rendered: Awaited<ReturnType<AppPageSsrHandler["handleSsr"]>> | null;
   try {
     rendered = await unlessExpired(
@@ -200,7 +224,10 @@ async function renderAppPageRscRenderStatus(
               getInitialNavigationCacheMetadata: documentOptions.getInitialNavigationCacheMetadata,
               isCacheCandidate: true,
               mirrorNextFlight: documentOptions.mirrorNextFlight,
-              onSsrError: documentOptions.onSsrError,
+              onSsrError: (error: unknown) => {
+                captureDocumentHttpError(error);
+                return documentOptions.onSsrError(error);
+              },
               reactMaxHeadersLength: documentOptions.reactMaxHeadersLength,
               signal,
             }
@@ -208,7 +235,10 @@ async function renderAppPageRscRenderStatus(
               isStaticGeneration: true,
               // The RSC render already reported its errors, and this document
               // is discarded.
-              onSsrError: () => undefined,
+              onSsrError: (error: unknown) => {
+                captureDocumentHttpError(error);
+                return undefined;
+              },
             }),
       }),
       signal,
@@ -240,20 +270,29 @@ async function renderAppPageRscRenderStatus(
   const htmlStream = isAppSsrRenderResult(rendered) ? rendered.htmlStream : rendered;
   if (!documentOptions) {
     void htmlStream.cancel().catch(() => {});
-    return PAGE_STATUS;
+    // The document stops at its shell, so the Flight render's errors stand in
+    // for the ones its boundaries would catch.
+    return (
+      resolveCaughtHttpErrorStatus(
+        options,
+        documentHttpError,
+        options.getAllCapturedSpecialErrors?.(),
+      ) ?? PAGE_STATUS
+    );
   }
   let html: string | null;
+  const caughtStatus = () => resolveCaughtHttpErrorStatus(options, documentHttpError);
   try {
     html = await readDocumentHtml(htmlStream, signal);
   } catch {
     // A document that fails after its shell isn't stored, as an HTML
     // request's isn't.
-    return PAGE_STATUS;
+    return caughtStatus() ?? PAGE_STATUS;
   }
   if (html === null) return expiredDocumentStatus(options);
   // A client page that read its searchParams while the document rendered
   // makes the document dynamic, as it does an HTML request's.
-  if (isRenderDynamicLatched()) return PAGE_STATUS;
+  if (isRenderDynamicLatched()) return caughtStatus() ?? PAGE_STATUS;
   const linkHeader = buildAppPageLinkHeader(
     isAppSsrRenderResult(rendered) ? rendered.linkHeader : undefined,
     buildAppPageFontLinkHeader(fontData.preloads),
@@ -263,7 +302,31 @@ async function renderAppPageRscRenderStatus(
     const { stripClientTraceMetadataBlock } = await import("./client-trace-metadata.js");
     html = stripClientTraceMetadataBlock(html, clientTraceMetadataMarker);
   }
-  return { kind: "page", document: { html, ...(linkHeader ? { linkHeader } : {}) } };
+  const document = { html, ...(linkHeader ? { linkHeader } : {}) };
+  const caught = caughtStatus();
+  if (caught) return { ...caught, document };
+  return { kind: "page", document };
+}
+
+/**
+ * A special error a Suspense boundary caught still sets the render's status,
+ * and a redirect its `location`: a redirect wins over an access fallback, and
+ * otherwise the first one thrown does.
+ * Ported from Next.js: packages/next/src/server/app-render/app-render.tsx
+ * (setHTTPAccessFallbackOrRedirectStatus)
+ */
+function resolveCaughtHttpErrorStatus(
+  options: CreateAppPageRscRenderStatusResolverOptions,
+  documentHttpError: AppPageSpecialError | null,
+  flightErrors: readonly unknown[] = [],
+): Extract<AppPageRscRenderStatus, { kind: "special-error" }> | null {
+  let httpError = documentHttpError;
+  for (const error of flightErrors) {
+    httpError = preferAppPageHttpError(httpError, resolveAppPageSpecialError(error));
+  }
+  if (httpError === null) return null;
+  const headers = resolveAppPageSpecialErrorStoredHeaders(httpError, options.basePath);
+  return { kind: "special-error", status: httpError.statusCode, ...(headers ? { headers } : {}) };
 }
 
 /**

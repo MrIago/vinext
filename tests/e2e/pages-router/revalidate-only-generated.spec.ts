@@ -16,7 +16,7 @@ test("only-generated revalidation leaves an unseen blocking fallback path ungene
   expect(firstPage.status()).toBe(200);
   expect(firstPage.headers()["x-nextjs-cache"]).toBe("HIT");
   expect(firstPage.headers()["x-vinext-cache"]).toBeUndefined();
-  expect(firstPage.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+  expect(firstPage.headers()["cache-control"]).toBe("no-store");
   const firstPageHtml = await firstPage.text();
   expect(firstPageHtml).toContain("Generated");
   expect(firstPageHtml).toContain(slug);
@@ -25,7 +25,7 @@ test("only-generated revalidation leaves an unseen blocking fallback path ungene
   const repeatedPage = await request.get(pathname);
   expect(repeatedPage.headers()["x-nextjs-cache"]).toBe("HIT");
   expect(repeatedPage.headers()["x-vinext-cache"]).toBeUndefined();
-  expect(repeatedPage.headers()["cache-control"]).toBe("no-cache, must-revalidate");
+  expect(repeatedPage.headers()["cache-control"]).toBe("no-store");
   expect(await repeatedPage.text()).toContain('data-testid="generation">2</span>');
 });
 

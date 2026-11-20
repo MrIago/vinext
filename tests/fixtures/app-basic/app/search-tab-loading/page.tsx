@@ -3,6 +3,10 @@ import Link from "next/link";
 // The header and tab strip live in the page itself, below the route's
 // loading boundary. A search-only navigation keeps them mounted in Next.js
 // until the new page commits.
+//
+// The third tab gives each tab another search string's shell to reuse, so
+// hovering one prefetches the route's loading shell: a repeat prefetch of a
+// URL that only has its own shell dedupes against it.
 export default async function Page({
   searchParams,
 }: {
@@ -18,6 +22,9 @@ export default async function Page({
         </Link>{" "}
         <Link id="tab-b" href="/search-tab-loading?tab=b">
           Tab b
+        </Link>{" "}
+        <Link id="tab-c" href="/search-tab-loading?tab=c">
+          Tab c
         </Link>
       </nav>
       <p id="tab-body">tab {tab}</p>

@@ -23,14 +23,16 @@ import {
   isInsideUnifiedScope,
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
-import { createPprFallbackShellSuspensePromise } from "./ppr-fallback-shell.js";
+import { createPprFallbackShellRequestDataSuspensePromise } from "./ppr-fallback-shell.js";
 import type { RenderRequestApiKind } from "../server/cache-proof.js";
 import type { ReadonlyRequestCookies } from "@vinext/types/next/upstream/dist/server/web/spec-extension/adapters/request-cookies";
 import type { ResponseCookie } from "@vinext/types/next/upstream/dist/compiled/@edge-runtime/cookies/index";
+import { headersProxyTarget } from "./internal/headers-proxy-target.js";
 import {
   createRenderDynamicLatch,
   getHeadersShimState as _getState,
   headersShimAls as _als,
+  isInsideAnyCacheScope,
   markDynamicUsage,
   markRenderRequestApiUsage,
   throwIfInsideCacheScope,
@@ -63,6 +65,12 @@ export type HeadersContext = {
   headers: Headers;
   cookies: Map<string, string>;
   accessError?: Error;
+  /**
+   * The route whose `generateStaticParams` runs. There is no HTTP request, so
+   * `connection()` and `draftMode()` reject with `accessError` too, and
+   * revalidation throws, also from a cached function the generator calls.
+   */
+  staticParamsRoute?: string;
   draftModeEnabled?: boolean;
   forceStatic?: boolean;
   mutableCookies?: RequestCookies;
@@ -183,6 +191,23 @@ export async function runWithDetachedDynamicUsage<T>(fn: () => T | Promise<T>): 
     renderRequestApiUsage: new Set(),
   };
   return await _als.run(childState, fn);
+}
+
+/**
+ * Run a `dynamicParams` check's `generateStaticParams` apart from the request,
+ * as Next.js runs it in a work store of its own. Unlike a layout probe, it
+ * also memoizes its own fetches, so the render that follows fetches anew, and
+ * reads cached data even during an on-demand revalidation.
+ */
+export async function runStaticParamsCheckDetached<T>(fn: () => Promise<T>): Promise<T> {
+  return await runWithDetachedDynamicUsage(() => {
+    if (!isInsideUnifiedScope()) return fn();
+    return runWithUnifiedStateMutation((context) => {
+      context.currentFetchDedupeEntries = new Map();
+      context.nextFetchId = 1;
+      context.isOnDemandRevalidate = false;
+    }, fn);
+  });
 }
 
 export async function runWithConnectionProbe<T>(
@@ -672,16 +697,19 @@ function _decorateSuspendingRequestApiPromise<T extends object>(
 }
 
 function _sealHeaders(headers: Headers): Headers {
-  return new Proxy(headers, {
-    get(target, prop) {
-      if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
-        throw new ReadonlyHeadersError();
-      }
+  return new Proxy(
+    headersProxyTarget(() => headers),
+    {
+      get(_target, prop) {
+        if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
+          throw new ReadonlyHeadersError();
+        }
 
-      const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
+        const value = Reflect.get(headers, prop, headers);
+        return typeof value === "function" ? value.bind(headers) : value;
+      },
     },
-  }) as Headers;
+  );
 }
 
 function _wrapMutableCookies(cookies: RequestCookies): RequestCookies {
@@ -784,28 +812,32 @@ export function headersContextFromRequest(
   // `_mutable` holds the materialised copy once a write is needed.
   let _mutable: Headers | null = null;
 
-  const headersProxy = new Proxy(request.headers, {
-    get(target, prop: string | symbol) {
-      // Route to the materialised copy if it exists.
-      const src = _mutable ?? target;
+  const target = request.headers;
+  const headersProxy = new Proxy(
+    headersProxyTarget(() => _mutable ?? target),
+    {
+      get(_target, prop: string | symbol) {
+        // Route to the materialised copy if it exists.
+        const src = _mutable ?? target;
 
-      // Intercept mutating methods: materialise on first write.
-      if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
-        return (...args: unknown[]) => {
-          if (!_mutable) {
-            _mutable = new Headers(target);
-          }
-          return (_mutable[prop as "set" | "delete" | "append"] as (...a: unknown[]) => unknown)(
-            ...args,
-          );
-        };
-      }
+        // Intercept mutating methods: materialise on first write.
+        if (typeof prop === "string" && _HEADERS_MUTATING_METHODS.has(prop)) {
+          return (...args: unknown[]) => {
+            if (!_mutable) {
+              _mutable = new Headers(target);
+            }
+            return (_mutable[prop as "set" | "delete" | "append"] as (...a: unknown[]) => unknown)(
+              ...args,
+            );
+          };
+        }
 
-      // Non-mutating method or property: bind to current source.
-      const value = Reflect.get(src, prop, src);
-      return typeof value === "function" ? value.bind(src) : value;
+        // Non-mutating method or property: bind to current source.
+        const value = Reflect.get(src, prop, src);
+        return typeof value === "function" ? value.bind(src) : value;
+      },
     },
-  }) as Headers;
+  );
 
   // ---------------------------------------------------------------------------
   // Lazy cookie map
@@ -865,11 +897,14 @@ export function headers(): Promise<Headers> & Headers {
     return _decorateRejectedRequestApiPromise<Headers>(state.headersContext.accessError);
   }
 
-  markDynamicUsage();
-  const fallbackShellPromise = createPprFallbackShellSuspensePromise<Headers>("`headers()`");
+  const fallbackShellPromise =
+    createPprFallbackShellRequestDataSuspensePromise<Headers>("`headers()`");
   if (fallbackShellPromise) {
+    // The shell leaves the read to a hole each request resumes, so the read
+    // doesn't make the shell itself dynamic.
     return _decorateSuspendingRequestApiPromise(fallbackShellPromise);
   }
+  markDynamicUsage();
 
   const readonlyHeaders = _getReadonlyHeaders(state.headersContext);
   return _getOrCreateDecoratedRequestApiPromise(_decoratedHeadersPromises, readonlyHeaders);
@@ -900,11 +935,14 @@ function cookiesImpl(): Promise<RequestCookies> & RequestCookies {
     return _decorateRejectedRequestApiPromise<RequestCookies>(state.headersContext.accessError);
   }
 
-  markDynamicUsage();
-  const fallbackShellPromise = createPprFallbackShellSuspensePromise<RequestCookies>("`cookies()`");
+  const fallbackShellPromise =
+    createPprFallbackShellRequestDataSuspensePromise<RequestCookies>("`cookies()`");
   if (fallbackShellPromise) {
+    // The shell leaves the read to a hole each request resumes, so the read
+    // doesn't make the shell itself dynamic.
     return _decorateSuspendingRequestApiPromise(fallbackShellPromise);
   }
+  markDynamicUsage();
 
   const cookieStore = _areCookiesMutableInCurrentPhase()
     ? _getMutableCookies(state.headersContext)
@@ -958,6 +996,11 @@ export function getDraftModeCookieHeader(): string | null {
   const header = state.draftModeCookieHeader;
   state.draftModeCookieHeader = null;
   return header;
+}
+
+/** Put back a draft-mode `Set-Cookie` header a dispatch took for a response it won't send. */
+export function restoreDraftModeCookieHeader(header: string): void {
+  _getState().draftModeCookieHeader = header;
 }
 
 function validateDraftModeSecret(secret: string): string {
@@ -1073,6 +1116,10 @@ export async function draftMode(): Promise<DraftModeResult> {
   const context = state.headersContext;
   if (!context) {
     throw createDraftModeScopeError("draftMode()");
+  }
+  // A cache scope reads disabled draft mode, even in generateStaticParams.
+  if (context.staticParamsRoute !== undefined && context.accessError && !isInsideAnyCacheScope()) {
+    throw context.accessError;
   }
   // Reading `draftMode()` itself is not dynamic — `isEnabled` is a plain
   // getter and merely calling `draftMode()` does not require bailing out
