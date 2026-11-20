@@ -1038,6 +1038,7 @@ ${
     : ""
 }
 import {
+  isAppPageStaticParamsOnly as __isAppPageStaticParamsOnly,
   resolveAppPageGenerateStaticParamsSources as __resolveAppPageGenerateStaticParamsSources,
   validateAppPageRouteDynamicParams as __validateAppPageRouteDynamicParams,
 } from ${JSON.stringify(appPageRequestPath)};
@@ -1507,10 +1508,12 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   basePath: __basePath,
   buildId: process.env.__VINEXT_BUILD_ID ?? null,
   ensureRouteLoaded: __ensureRouteLoaded,
-  async isDynamicParamsMiss(route, params) {
+  async isDynamicParamsMiss(route, params, pathname) {
     if (!route.isDynamic) return false;
     const __segmentConfig = __resolveRouteSegmentConfig(route, __resolveRouteSegmentConfigBranches(route));
-    if (__segmentConfig.dynamicParamsConfig !== false) return false;
+    if (!__isAppPageStaticParamsOnly(__segmentConfig.dynamicParamsConfig, process.env.NODE_ENV === "production")) {
+      return false;
+    }
     return (await __validateAppPageRouteDynamicParams({
       dynamicConfig: __segmentConfig.dynamicConfig,
       dynamicParamsConfig: __segmentConfig.dynamicParamsConfig,
@@ -1519,6 +1522,8 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       isDynamicRoute: route.isDynamic,
       isProduction: process.env.NODE_ENV === "production",
       params,
+      pathname,
+      routePattern: route.pattern,
       routeSegments: route.routeSegments,
     })) !== null;
   },
@@ -2105,10 +2110,14 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   ${hasPagesDir ? `loadPrerenderPagesRoutes: __loadPrerenderPagesRoutes,` : ""}
   ${
     (metadataRoutes?.length ?? 0) > 0
-      ? `async getPrerenderMetadataRoutePaths() {
-    const { getPrerenderableMetadataRoutePaths: __getPrerenderableMetadataRoutePaths } =
-      await __loadMetadataRouteResponse();
-    return __getPrerenderableMetadataRoutePaths(metadataRoutes);
+      ? `async getPrerenderMetadataRoutePaths(request) {
+    const {
+      getPrerenderableMetadataRoutePaths: __getPrerenderableMetadataRoutePaths,
+      getWarmableMetadataRoutes: __getWarmableMetadataRoutes,
+    } = await __loadMetadataRouteResponse();
+    return request.warm
+      ? __getWarmableMetadataRoutes(metadataRoutes, request)
+      : __getPrerenderableMetadataRoutePaths(metadataRoutes);
   },`
       : ""
   }

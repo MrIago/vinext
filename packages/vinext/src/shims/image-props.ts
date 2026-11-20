@@ -196,6 +196,15 @@ export function isRemoteUrl(src: string): boolean {
   return src.startsWith("http://") || src.startsWith("https://") || src.startsWith("//");
 }
 
+/**
+ * `data:` and `blob:` sources are served as-is and never lazy, matching
+ * Next.js `get-img-props.js`:
+ * `if (!src || src.startsWith('data:') || src.startsWith('blob:')) { unoptimized = true; isLazy = false; }`
+ */
+export function isDataOrBlobUrl(src: string): boolean {
+  return src.startsWith("data:") || src.startsWith("blob:");
+}
+
 export function isSvgUrl(src: string): boolean {
   try {
     return new URL(src, "http://vinext.local").pathname.toLowerCase().endsWith(".svg");
@@ -576,9 +585,12 @@ export function withConfiguredLoader(props: ImageProps): ImageProps {
   return loader === props.loader ? props : { ...props, loader };
 }
 
-/** Sources Next.js always treats as unoptimized (empty, data: and blob:). */
-export function isInlineSrc(src: string): boolean {
-  return !src || src.startsWith("data:") || src.startsWith("blob:");
+/**
+ * Sources Next.js always treats as unoptimized: data: and blob: URLs, and an
+ * empty src (getImgProps), so neither a custom loader nor /_next/image sees them.
+ */
+export function isAlwaysUnoptimizedSrc(src: string): boolean {
+  return !src || isDataOrBlobUrl(src);
 }
 
 /**
@@ -620,8 +632,9 @@ export function getImageProps(imagePropsInput: ImageProps): { props: ImgProps } 
     blurHeight,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL: blurDataURLProp });
   const shouldPreload = _preload === true || priority === true;
+  const isInlineSrc = isDataOrBlobUrl(src);
 
-  if (_unoptimized === true || __globallyUnoptimized || isInlineSrc(src)) {
+  if (_unoptimized === true || __globallyUnoptimized || isAlwaysUnoptimizedSrc(src)) {
     // As in the component path, unoptimized images never reach the server-side
     // optimizer, so remote URL validation is intentionally unnecessary.
     const renderedSrc = overrideSrc || src;
@@ -639,13 +652,14 @@ export function getImageProps(imagePropsInput: ImageProps): { props: ImgProps } 
       alt,
       width: fill ? undefined : imgWidth,
       height: fill ? undefined : imgHeight,
-      loading: priority ? "eager" : shouldPreload ? loading : (loading ?? "lazy"),
+      loading: priority ? "eager" : shouldPreload || isInlineSrc ? loading : (loading ?? "lazy"),
       fetchPriority: priority ? ("high" as const) : undefined,
       decoding: "async" as const,
       className,
       style: fill ? getFillStyle(style, blurStyle) : { ...blurStyle, ...style },
       ...rest,
-      sizes: sizes ?? (fill ? "100vw" : undefined),
+      // Next.js generateImgAttrs() returns `sizes: undefined` for inline sources.
+      sizes: isInlineSrc ? undefined : (sizes ?? (fill ? "100vw" : undefined)),
       srcSet: undefined,
     };
     return { props: Object.assign(imageProps, { "data-nimg": fill ? "fill" : "1" }) };

@@ -35,7 +35,8 @@ import {
   generateLoaderAttributes,
   getFillStyle,
   imageOptimizationUrl,
-  isInlineSrc,
+  isAlwaysUnoptimizedSrc,
+  isDataOrBlobUrl,
   isRemoteUrl,
   isServerOptimizedRemoteUrl,
   isSvgUrl,
@@ -202,12 +203,18 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
   // build a URL. next/image rejects a missing loader earlier, regardless of
   // `unoptimized` (shims/image-external.tsx).
   const unoptimizedProp = _unoptimized === true || __globallyUnoptimized;
-  if (!loader && __customImageLoader && !unoptimizedProp && !isInlineSrc(src)) {
+  if (!loader && __customImageLoader && !unoptimizedProp && !isAlwaysUnoptimizedSrc(src)) {
     throw missingLoaderError(src);
   }
   const shouldPreload = preload === true || priority === true;
   const priorityFetchPriority = priority ? "high" : undefined;
-  const imageLoading = priority ? "eager" : shouldPreload ? loading : (loading ?? "lazy");
+  // data: and blob: sources are served as-is and never lazy by default (Next.js parity).
+  const isInlineSrc = isDataOrBlobUrl(src);
+  const imageLoading = priority
+    ? "eager"
+    : shouldPreload || isInlineSrc
+      ? loading
+      : (loading ?? "lazy");
 
   const [completedBlurSrc, setCompletedBlurSrc] = useState<string | undefined>(undefined);
   const blurComplete = completedBlurSrc === src;
@@ -309,7 +316,7 @@ const ImageImpl = forwardRef<HTMLImageElement, ImageProps>(function Image(
 
   // Next.js (getImgProps and next/legacy/image) treats empty, data: and blob:
   // sources as unoptimized, so neither a custom loader nor /_next/image sees them.
-  const unoptimized = unoptimizedProp || isInlineSrc(src);
+  const unoptimized = unoptimizedProp || isAlwaysUnoptimizedSrc(src);
   if (unoptimized || loader) {
     // Unoptimized images are fetched directly by the browser, so intentionally
     // skip remote URL validation: there is no server-side optimizer fetch and

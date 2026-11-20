@@ -63,6 +63,7 @@ async function deployCommand(): Promise<void> {
     prerenderConcurrency: parsed.prerenderConcurrency,
     warmCdnCache: parsed.warmCdnCache,
     warmCdnTarget: parsed.warmCdnTarget,
+    warmCdnHeaders: parsed.warmCdnHeaders,
     warmCdnConcurrency: parsed.warmCdnConcurrency,
     warmCdnTimeout: parsed.warmCdnTimeout,
     warmCdnRetries: parsed.warmCdnRetries,

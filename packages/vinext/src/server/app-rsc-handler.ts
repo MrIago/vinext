@@ -51,6 +51,7 @@ import {
   VINEXT_ROUTE_MISS_HEADER,
   VINEXT_SPECIAL_ERROR_STATUS_HEADER,
 } from "./headers.js";
+import { isPrerenderNotFoundPathname, isPrerenderNotFoundRequest } from "./prerender-not-found.js";
 import type { ReactFormState } from "react-dom/client";
 import {
   getRequestExecutionContext,
@@ -80,6 +81,7 @@ import {
 } from "./middleware-response-headers.js";
 import { normalizeInterceptionContextHeader } from "./app-interception-context-header.js";
 import type {
+  AppPrerenderMetadataRoutePathsRequest,
   AppPrerenderRootParamNamesMap,
   AppPrerenderStaticParamsMap,
 } from "./app-prerender-endpoints.js";
@@ -788,7 +790,11 @@ export type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
    * Absent in the request-only stage, which has no route modules and sends
    * route tree prefetches to the full graph.
    */
-  isDynamicParamsMiss?: (route: TRoute, params: AppPageParams) => Promise<boolean>;
+  isDynamicParamsMiss?: (
+    route: TRoute,
+    params: AppPageParams,
+    pathname: string,
+  ) => Promise<boolean>;
   ensureInstrumentation?: (ctx: ExecutionContextLike | null) => Promise<void>;
   /**
    * Register cache adapters configured via the vinext() `cache` option. Wired
@@ -807,7 +813,9 @@ export type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
     routePathname: string,
   ) => Promise<Response | null>;
   isMetadataRoutePath?: (cleanPathname: string) => boolean | Promise<boolean>;
-  getPrerenderMetadataRoutePaths?: () => Promise<unknown>;
+  getPrerenderMetadataRoutePaths?: (
+    request: AppPrerenderMetadataRoutePathsRequest,
+  ) => Promise<unknown>;
   createPprFallbackShells?: (
     route: Pick<AppRscHandlerRoute, "params" | "pattern" | "rootParamNames">,
     params: AppPageParams,
@@ -886,6 +894,8 @@ async function applyRewrite(
     rewrites: NextRewrite[];
     /** Raw pathname identity used for config source matching and capture substitution. */
     paramsPathname?: string;
+    /** Whether a staged response stage exists, so an external proxy answers in the uncached request stage. */
+    staged: boolean;
     validateExternalRewriteRequest: () => Promise<Response | null>;
   },
   cleanPathname: string,
@@ -919,12 +929,15 @@ async function applyRewrite(
     // Next.js proxies a next.config external rewrite without the config and
     // middleware headers it staged, though its Set-Cookie patch still puts
     // middleware's cookies ahead of the upstream's.
+    const response = withExternalRewriteResponseHeaders(
+      await configMatchers.proxyExternalRequest(proxyRequest, rewritten),
+      new Headers(),
+      options.middlewareContext.headers?.getSetCookie() ?? [],
+    );
+    // The proxied response is answered in the uncached request stage, so a
+    // staged response stage and its shared cache never see this request.
     return markAppRscResponseConfigHeadersApplied(
-      withExternalRewriteResponseHeaders(
-        await configMatchers.proxyExternalRequest(proxyRequest, rewritten),
-        new Headers(),
-        options.middlewareContext.headers?.getSetCookie() ?? [],
-      ),
+      options.staged ? withRequestStageBypassCacheState(response) : response,
     );
   }
 
@@ -1183,10 +1196,22 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
 
   const basePathState = { basePath: options.basePath, hadBasePath };
   let cleanPathnameIsRequestPathname = true;
+  // The prerender step's request for the 404 page is a route miss, as in
+  // Next.js, even where a top-level dynamic or catch-all route would match it.
+  // The path binds the marker to that request: a same-origin subrequest that
+  // forwards the incoming headers still matches its own route. A rewrite that
+  // keeps the path (a same-path or query-only one) leaves it a miss, while one
+  // to another path matches that path's route.
+  const isUnrewrittenPrerenderNotFound = () =>
+    isPrerenderNotFoundRequest(request) &&
+    isPrerenderNotFoundPathname(pathname) &&
+    isPrerenderNotFoundPathname(cleanPathname);
   const matchCleanPathname = () =>
-    cleanPathnameIsRequestPathname && options.matchRequestRoute
-      ? options.matchRequestRoute(requestPathname)
-      : options.matchRoute(cleanPathname);
+    isUnrewrittenPrerenderNotFound()
+      ? null
+      : cleanPathnameIsRequestPathname && options.matchRequestRoute
+        ? options.matchRequestRoute(requestPathname)
+        : options.matchRoute(cleanPathname);
 
   if (
     interceptionIdHeader !== null &&
@@ -1350,10 +1375,13 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
               redirect.destinationQuery,
             ),
           );
-    return new Response(null, {
+    const response = new Response(null, {
       status: redirect.statusCode,
       headers: { Location: location },
     });
+    // As for a middleware answer, a staged response stage and its shared
+    // cache never see this request.
+    return dispatchResponseStage ? withRequestStageBypassCacheState(response) : response;
   }
 
   const rscCacheBustingRedirect =
@@ -1807,6 +1835,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
           cleanPathnameIsRequestPathname ? requestPathname : cleanPathname,
         ),
         rewrites: [rewrite],
+        staged: dispatchResponseStage !== undefined,
         validateExternalRewriteRequest: () => validateClaimedOutsideBasePathRsc(true),
       },
       matchPathname(cleanPathname),
@@ -2477,7 +2506,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   const renderPagesForMatchKind = async (
     matchKind: "dynamic" | "static",
   ): Promise<Response | null> => {
-    if (!filesystemRouteEligible) return null;
+    if (!filesystemRouteEligible || isUnrewrittenPrerenderNotFound()) return null;
     // Pages routes match the raw request pathname, as in the Pages-only
     // pipeline and Next.js: static segments keep their encoded identity, so
     // `/%66r/...` is not the `fr` locale and `/%61bout` is not `/about`, and the
@@ -2665,6 +2694,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
             cleanPathnameIsRequestPathname ? requestPathname : cleanPathname,
           ),
           rewrites: [rewrite],
+          staged: dispatchResponseStage !== undefined,
           validateExternalRewriteRequest: () => validateClaimedOutsideBasePathRsc(true),
         },
         matchPathname(cleanPathname),
@@ -2757,6 +2787,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
               cleanPathnameIsRequestPathname ? requestPathname : cleanPathname,
             ),
             rewrites: [rewrite],
+            staged: dispatchResponseStage !== undefined,
             validateExternalRewriteRequest: () => validateClaimedOutsideBasePathRsc(true),
           },
           matchPathname(cleanPathname),
@@ -3020,7 +3051,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       canResumeRoutingAfterMiss() &&
       !isActiveDraftMode() &&
       options.isDynamicParamsMiss &&
-      (await runStaticParamsCheckDetached(() => options.isDynamicParamsMiss!(route, params)))
+      (await runStaticParamsCheckDetached(() =>
+        options.isDynamicParamsMiss!(route, params, cleanPathname),
+      ))
     ) {
       // The rejected match seeded its root params before routing finished.
       setRootParams(null);

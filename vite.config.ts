@@ -195,6 +195,8 @@ export default defineConfig({
             // dirs and use per-worker optimizer caches in their own project.
             // When adding a test that calls startFixtureServer() or createServer(),
             // move it here.
+            "tests/app-cancelled-document-cookies.test.ts",
+            "tests/app-cjs-package-scope.test.ts",
             "tests/app-layout-not-found-route-group.test.ts",
             "tests/app-multiple-root-layouts-not-found.test.ts",
             "tests/app-route-client-preloads-production.test.ts",
@@ -223,6 +225,7 @@ export default defineConfig({
             "tests/api-handler.test.ts",
             "tests/cjs-globals-runtime.test.ts",
             "tests/cjs.test.ts",
+            "tests/cf-static-export-not-found-worker.test.ts",
             "tests/client-global-define.test.ts",
             "tests/cloudflare-pages-asset-names.test.ts",
             "tests/connection-probe-worker.test.ts",
@@ -256,6 +259,7 @@ export default defineConfig({
             "tests/pages-server-only-use-server.test.ts",
             "tests/process-browser-define.test.ts",
             "tests/postcss-resolve.test.ts",
+            "tests/prerender-404-dynamic-root.test.ts",
             "tests/prerender.test.ts",
             "tests/sass-tsconfig-paths.test.ts",
             "tests/standalone-workspace-versions.test.ts",
@@ -294,6 +298,8 @@ export default defineConfig({
           // test needs to mock an external fetch, wire MSW per-file with
           // `setupServer` rather than reverting this exclusion.
           include: [
+            "tests/app-cancelled-document-cookies.test.ts",
+            "tests/app-cjs-package-scope.test.ts",
             "tests/app-layout-not-found-route-group.test.ts",
             "tests/app-multiple-root-layouts-not-found.test.ts",
             "tests/app-route-client-preloads-production.test.ts",
@@ -322,6 +328,7 @@ export default defineConfig({
             "tests/api-handler.test.ts",
             "tests/cjs-globals-runtime.test.ts",
             "tests/cjs.test.ts",
+            "tests/cf-static-export-not-found-worker.test.ts",
             "tests/client-global-define.test.ts",
             "tests/cloudflare-pages-asset-names.test.ts",
             "tests/connection-probe-worker.test.ts",
@@ -357,6 +364,7 @@ export default defineConfig({
             "tests/pages-server-only-use-server.test.ts",
             "tests/process-browser-define.test.ts",
             "tests/postcss-resolve.test.ts",
+            "tests/prerender-404-dynamic-root.test.ts",
             "tests/prerender.test.ts",
             "tests/sass-tsconfig-paths.test.ts",
             "tests/standalone-workspace-versions.test.ts",

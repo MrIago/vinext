@@ -2246,9 +2246,10 @@ describe("app browser entry state helpers", () => {
     expect(decision.disposition).toBe("dispatch");
   });
 
-  it("stays stale after a refresh commit that started under an older navigation", async () => {
-    // A server action revalidation commits on the refresh lane under the
-    // navigation id it started with; it is not a superseded navigation.
+  it("commits over a refresh commit that started under an older navigation", async () => {
+    // A server action revalidates, then its caller runs router.back(). React
+    // renders the action's refresh-lane commit after the traversal started;
+    // the traversal still wins.
     const decision = await resolveTestPendingNavigationCommitDispositionDecision({
       activeNavigationId: 2,
       currentActiveOperation: {
@@ -2266,8 +2267,7 @@ describe("app browser entry state helpers", () => {
       startedVisibleCommitVersion: 0,
     });
 
-    expect(decision.disposition).toBe("skip");
-    expect(decision.trace.entries[0]?.code).toBe(NavigationTraceReasonCodes.staleOperation);
+    expect(decision.disposition).toBe("dispatch");
   });
 
   it("stays stale for an operation without a navigation id that compares a render id", async () => {
@@ -6738,12 +6738,68 @@ describe("app browser entry previousNextUrl helpers", () => {
       ["/detail-page#stale"],
       ["/detail-page\\stale"],
       ["/detail-page\0stale"],
+      // A URL parser drops a tab, so this would name //other-origin.example.
+      ["/\t/other-origin.example/detail-page"],
       ["/detail-page", 42],
     ]) {
       expect(
         readHistoryStateActiveRoutePaths({ __vinext_activeRoutePaths: activeRoutePaths }),
       ).toBeNull();
     }
+  });
+
+  // Next.js refetches a reused segment at the URL of the route it came from:
+  // packages/next/src/client/components/router-reducer/ppr-navigations.ts
+  it("records the committed URL on the slots a navigation response rendered", async () => {
+    const nextElements = createResolvedElements(
+      "route:/v1/p/caf%C3%A9",
+      "/",
+      null,
+      { "slot:info:/": "info", "slot:aside:/": "kept" },
+      [AppElementsWire.encodeLayoutId("/")],
+      [
+        {
+          activeRouteId: "route:/v1/p/caf%C3%A9",
+          ownerLayoutId: "layout:/",
+          slotId: "slot:info:/",
+          state: "active",
+        },
+        {
+          activeRouteId: "route:/feed",
+          ownerLayoutId: "layout:/",
+          refreshPathname: "/feed",
+          slotId: "slot:aside:/",
+          state: "active",
+        },
+        { ownerLayoutId: "layout:/", slotId: "slot:modal:/", state: "default" },
+      ],
+    );
+    const pending = await createPendingNavigationCommit({
+      currentState: createState(),
+      navigationSnapshot: createClientNavigationRenderSnapshot(
+        "https://example.com/p/caf%C3%A9?tab=new",
+        {},
+      ),
+      nextElements: Promise.resolve(nextElements),
+      operationLane: "navigation",
+      payloadOrigin: FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
+      renderId: 1,
+      type: "navigate",
+    });
+
+    const expected = [
+      expect.objectContaining({ slotId: "slot:aside:/", refreshPathname: "/feed" }),
+      expect.objectContaining({ slotId: "slot:info:/", refreshPathname: "/p/caf%C3%A9" }),
+      expect.not.objectContaining({ refreshPathname: expect.anything() }),
+    ];
+    expect(pending.action.slotBindings).toEqual(expected);
+    expect(AppElementsWire.readMetadata(pending.action.elements).slotBindings).toEqual(expected);
+    // The response may be a cached payload, so it keeps no URL of its own.
+    expect(
+      AppElementsWire.readMetadata(nextElements).slotBindings.find(
+        (binding) => binding.slotId === "slot:info:/",
+      ),
+    ).not.toHaveProperty("refreshPathname");
   });
 
   it("resolves back, forward, and unknown traversal intent from history state", () => {
