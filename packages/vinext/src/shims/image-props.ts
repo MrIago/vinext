@@ -213,6 +213,10 @@ export function isSvgUrl(src: string): boolean {
   }
 }
 
+/**
+ * Inline style for `fill` images. Like Next.js `get-img-props.js` (`imgStyle`),
+ * it sets no `object-fit`: the caller's `style` or stylesheet decides it.
+ */
 export function getFillStyle(
   style?: React.CSSProperties,
   backgroundStyle?: React.CSSProperties,
@@ -222,8 +226,6 @@ export function getFillStyle(
     inset: 0,
     width: "100%",
     height: "100%",
-    // Next.js leaves object-fit unset unless the caller provides one, allowing
-    // stylesheet rules to apply.
     ...backgroundStyle,
     ...style,
   };
