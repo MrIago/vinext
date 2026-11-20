@@ -15,6 +15,7 @@ import {
   unwrapExpression,
 } from "../plugins/ast-utils.js";
 import { packageNameFromSpecifier } from "../utils/package-name.js";
+import { assertOutputDirIsSafe } from "./clean-output.js";
 import { readJsonFile } from "../utils/safe-json-file.js";
 import { resolveVinextPackageRoot } from "../utils/vinext-root.js";
 
@@ -738,6 +739,9 @@ export function emitStandaloneOutput(options: StandaloneBuildOptions): Standalon
   }
 
   const standaloneDir = path.join(outDir, "standalone");
+  // The standalone directory is deleted and rebuilt; with a `build.outDir`
+  // above the project root it could be the project itself.
+  assertOutputDirIsSafe("standalone output directory", standaloneDir, { root });
   const standaloneDistDir = path.join(standaloneDir, "dist");
   const standaloneNodeModulesDir = path.join(standaloneDir, "node_modules");
 
